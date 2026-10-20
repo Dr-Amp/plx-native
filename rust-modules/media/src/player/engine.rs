@@ -1582,17 +1582,19 @@ fn start_bufferfeed_inner(
             // path and is false here for every streamed HEVC playback (device-measured 2026-09-03:
             // three HEVC cells declared FHD before this read the right flag).
             sink_env = sink_envelope_now(ps, lv);
-            stream_payload = build_av_payload(ps, lv.payload_name(), ac, sink_env);
-            if ac == "OPUS" {
+            let av = build_av_payload(ps, lv.payload_name(), ac, sink_env);
+            stream_payload = if ac == "OPUS" {
                 let channels = crate::route::stream_achannels(ps);
-                let Some(p) = with_opus_info(&stream_payload, channels) else {
+                let Some(p) = with_opus_info(&av, channels) else {
                     log(&format!("start_bufferfeed: no Opus layout for {channels} channel(s); refusing the Load"));
                     SHARED.demux_failed.store(true, Ordering::Release);
                     return Err(crate::route::RouteStartResult::StartFailed);
                 };
                 log(&format!("start_bufferfeed: opusInfo channels={channels}"));
-                stream_payload = p;
-            }
+                p
+            } else {
+                av
+            };
             &stream_payload
         }
     } else if is_h265 {
