@@ -1,0 +1,75 @@
+name: diego build
+
+# Personal build of this fork for one television. It is NOT a release: no telemetry credentials,
+# no Sentry upload, no Homebrew manifest, nothing published. It installs beside the stable app as
+# the nightly identity (`com.beb.plxnative.nightly`, "PlxNative Nightly"), so the stock install
+# stays untouched as a fallback. The package is a short-lived workflow artifact only.
+#
+# The ARM steps mirror build-package.yml (toolchain, NDK, caches, `make` + `make ipk`); its
+# telemetry and symbol gates are left out because this fork has no credentials to assert.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [diego]
+
+concurrency:
+  group: diego-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the pinned Rust and the armv7 target
+        uses: ./.github/actions/rust-toolchain
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: rust-modules
+          key: armv7
+
+      - name: Cache the pinned downloads
+        uses: ./.github/actions/deps-cache
+
+      - id: ndk
+        uses: ./.github/actions/webos-ndk
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            vendor/ffmpeg-prefix
+            vendor/ffmpeg-build
+          key: ffmpeg-${{ runner.arch }}-${{ hashFiles('ci/build-ffmpeg.sh', 'ci/deps.py', 'ci/dependencies.json') }}
+
+      - name: Build + package
+        env:
+          WEBOS_SDK: ${{ steps.ndk.outputs.sdk-dir }}
+          RELEASE: "1"
+          FLAVOR: nightly
+        run: |
+          set -euo pipefail
+          export PLX_NIGHTLY_DATE="$(date -u +%Y%m%d)"
+          make -j"$(nproc)"
+          make ipk
+          grep -q -- '--no-default-features' pkg/.build-config \
+            || { echo "::error::RELEASE=1 did not take — pkg/.build-config says [$(cat pkg/.build-config)]"; exit 1; }
+          ls -l pkg/*.ipk
+          sha256sum pkg/*.ipk | tee pkg/SHA256SUMS
+          git rev-parse HEAD > pkg/COMMIT
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plxnative-diego-${{ github.sha }}
+          path: |
+            pkg/*.ipk
+            pkg/SHA256SUMS
+            pkg/COMMIT
+          retention-days: 3
+          if-no-files-found: error
