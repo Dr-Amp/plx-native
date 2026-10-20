@@ -271,7 +271,8 @@ fn profile_for_delivery(caps: &plx_platform::devcaps::Caps, delivery: TranscodeD
     }
     let dp_audio = &caps.audio;
     // ac3 first — the preferred ENCODE target — then the rest of the caps subset as copy lanes.
-    let target_audio = ["ac3", "eac3", "aac", "dts"]
+    // opus is only ever a copy lane: last, so it can never be the encode head.
+    let target_audio = ["ac3", "eac3", "aac", "dts", "opus"]
         .into_iter()
         .filter(|c| caps.audio_has(c))
         .collect::<Vec<_>>()
@@ -1283,7 +1284,7 @@ mod tests {
     #[test]
     fn force_profile_advertises_engine_formats_without_device_limits_or_transcode() {
         let p = super::forced_direct_profile();
-        assert_eq!(list_of(&p, "audioCodec="), ["aac", "ac3", "eac3", "dts"]);
+        assert_eq!(list_of(&p, "audioCodec="), ["aac", "ac3", "eac3", "dts", "opus"]);
         assert_eq!(list_of(&p, "videoCodec="), ["h264", "hevc"]);
         assert!(!p.contains("add-limitation"));
         assert!(!p.contains("transcode-target"));
