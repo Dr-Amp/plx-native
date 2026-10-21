@@ -173,6 +173,15 @@ pub struct LivePlay {
     pub acodec: String,
 }
 
+/// The session's own playlist for one playback, the shape every measured part had.
+pub fn session_playlist(session: &LiveSession, playback: &str) -> Option<LivePlay> {
+    is_path_id(playback).then(|| LivePlay {
+        part: format!("{}/{playback}/index.m3u8?offset=-1.000000", session.key),
+        vcodec: RECORDED_VCODEC.to_owned(),
+        acodec: RECORDED_ACODEC.to_owned(),
+    })
+}
+
 /// The codecs of every measured recording (`docs/pms-api.md` §10), for a decision that names none.
 const RECORDED_VCODEC: &str = "h264";
 const RECORDED_ACODEC: &str = "aac";
@@ -306,20 +315,30 @@ impl Client {
     }
 
     /// The playlist this client reads for `session`: the decision's part, or — when the decision
-    /// answered but named none — the shape every measured one had, `{key}/{client}/index.m3u8`.
-    /// shortcut: the fallback trusts one measured server version; drop it once a decision without a
-    /// part has been seen to mean "do not play".
+    /// was refused or named none — the session's own playlist for this playback,
+    /// `{key}/{playback}/index.m3u8`: PMS names the recording's consumer after the session id the
+    /// tune carried (`Grabber/{channel}-{playback}` in its log, 2026-10-21).
+    ///
+    /// The decision asks with the `Generic` profile and this device's HLS profile, as every
+    /// library decision does: with neither, PMS answers 400 "unable to find a matching profile"
+    /// (measured on the TV the same day).
     pub fn live_part(&self, _off: &plx_base::task::OffFrame, session: &LiveSession, playback: &str) -> Option<LivePlay> {
         let header = format!("X-Plex-Session-Identifier: {playback}");
-        let path = self.playback_identity(QueryBuilder::new(live_decision_path(session, playback))).build();
-        let decision = self.get_json_with_headers(&path, &[&header])?;
-        live_part_of(session, &decision).or_else(|| {
-            is_path_id(&self.client_id).then(|| LivePlay {
-                part: format!("{}/{}/index.m3u8?offset=-1.000000", session.key, self.client_id),
-                vcodec: RECORDED_VCODEC.to_owned(),
-                acodec: RECORDED_ACODEC.to_owned(),
-            })
-        })
+        let q = QueryBuilder::new(live_decision_path(session, playback))
+            .str("X-Plex-Client-Profile-Name", "Generic")
+            .str(
+                "X-Plex-Client-Profile-Extra",
+                &super::transcoder::profile_extra(super::params::TranscodeDelivery::FixedHls { seconds_per_segment: 1 }),
+            );
+        let decision = self.get_json_with_headers(&self.playback_identity(q).build(), &[&header]);
+        if let Some(play) = decision.as_ref().and_then(|d| live_part_of(session, d)) {
+            return Some(play);
+        }
+        plx_base::eventlog::log(&format!(
+            "livetv: the decision named no playlist (answered={}); reading the session's own",
+            decision.is_some() as i32
+        ));
+        session_playlist(session, playback)
     }
 
     /// `POST /:/timeline` for a live session: `time`/`duration` stay 0 as the official client sends
@@ -493,6 +512,20 @@ mod tests {
         assert_eq!(shape_of(&body, 3), "{MediaContainer:{Item:[{…}],size,title}}");
         assert_eq!(shape_of(&body, 4), "{MediaContainer:{Item:[{key,n}],size,title}}");
         assert!(!shape_of(&body, 9).contains("secret"));
+    }
+
+    #[test]
+    fn without_a_usable_decision_the_session_s_own_playlist_is_read_under_the_playback_id() {
+        assert_eq!(
+            session_playlist(&session(), "d1f32c49-d8f8-4621-9075-f3d80792824a"),
+            Some(LivePlay {
+                part: "/livetv/sessions/9b9fe727-0000-46db-b94c-ef512e3e61d2/d1f32c49-d8f8-4621-9075-f3d80792824a/index.m3u8?offset=-1.000000".into(),
+                vcodec: "h264".into(),
+                acodec: "aac".into(),
+            })
+        );
+        assert_eq!(session_playlist(&session(), "../x"), None);
+        assert_eq!(session_playlist(&session(), ""), None);
     }
 
     fn session() -> LiveSession {

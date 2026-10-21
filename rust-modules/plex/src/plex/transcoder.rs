@@ -317,8 +317,9 @@ fn profile_for(caps: &plx_platform::devcaps::Caps) -> String {
     profile_for_delivery(caps, TranscodeDelivery::ProgressiveMkv)
 }
 
-/// The profile for THIS device — [`profile_for`] over the boot-probed caps snapshot.
-fn profile_extra(delivery: TranscodeDelivery) -> String {
+/// The profile for THIS device — [`profile_for`] over the boot-probed caps snapshot. The Live TV
+/// decision (`livetv::Client::live_part`) asks with the HLS one.
+pub(super) fn profile_extra(delivery: TranscodeDelivery) -> String {
     profile_for_delivery(plx_platform::devcaps::caps(), delivery)
 }
 

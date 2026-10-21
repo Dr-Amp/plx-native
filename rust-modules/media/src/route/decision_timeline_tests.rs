@@ -578,7 +578,7 @@ const LIVE_DECIDED: &[u8] = br#"{"MediaContainer":{"Metadata":[{"Media":[{"video
 
 /// A loopback PMS for the live sequence: answers the tune and the decision with their shapes and
 /// everything else with an empty container, handing each request line down the channel.
-fn live_pms() -> (i32, std::sync::mpsc::Receiver<String>) {
+fn live_pms(decision_refused: bool) -> (i32, std::sync::mpsc::Receiver<String>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port() as i32;
@@ -589,14 +589,20 @@ fn live_pms() -> (i32, std::sync::mpsc::Receiver<String>) {
             match plx_base::testnet::accept(&listener) {
                 Ok((mut socket, _)) => {
                     let first = drain_http(&mut socket);
-                    let body = if first.starts_with("POST /livetv/dvrs/7/channels/C101.242.ersatztv.org/tune") {
-                        LIVE_TUNED
-                    } else if first.starts_with("GET /video/:/transcode/universal/decision?") {
-                        LIVE_DECIDED
+                    let decision = first.starts_with("GET /video/:/transcode/universal/decision?");
+                    if decision && decision_refused {
+                        // PMS 1.43.3 on the TV, 2026-10-21: "unable to find a matching profile".
+                        write_status(&mut socket, 400);
                     } else {
-                        EMPTY_MC
-                    };
-                    write_json(&mut socket, body);
+                        let body = if first.starts_with("POST /livetv/dvrs/7/channels/C101.242.ersatztv.org/tune") {
+                            LIVE_TUNED
+                        } else if decision {
+                            LIVE_DECIDED
+                        } else {
+                            EMPTY_MC
+                        };
+                        write_json(&mut socket, body);
+                    }
                     if tx.send(first).is_err() {
                         return;
                     }
@@ -613,7 +619,7 @@ fn a_live_channel_tunes_then_reports_under_its_session_and_its_stop_frees_the_tu
     use std::time::Duration;
     let mut ps = crate::route::PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
-    let (port, rx) = live_pms();
+    let (port, rx) = live_pms(false);
     let sid = plx_plex::plex::register_for_test("route-live", "127.0.0.1", port, "tok-live", "cid-live");
     let env = ResolveEnv {
         sid,
@@ -634,6 +640,8 @@ fn a_live_channel_tunes_then_reports_under_its_session_and_its_stop_frees_the_tu
     let decision = next();
     assert_eq!(query_param(&decision, "path"), Some("%2Flivetv%2Fsessions%2F9b9fe727-0000-46db-b94c-ef512e3e61d2"));
     assert_eq!(query_param(&decision, "directPlay"), Some("1"));
+    assert_eq!(query_param(&decision, "X-Plex-Client-Profile-Name"), Some("Generic"), "PMS 400s a profile-less decision");
+    assert!(query_param(&decision, "X-Plex-Client-Profile-Extra").is_some_and(|p| p.contains("mpegts")));
     assert_eq!(query_param(&decision, "session"), Some(plan.sess.as_str()), "the decision and the URL share one session");
 
     let live = plan.live.clone().expect("the plan names the recording");
@@ -657,6 +665,28 @@ fn a_live_channel_tunes_then_reports_under_its_session_and_its_stop_frees_the_tu
     assert_eq!(query_param(&stopped, "state"), Some("stopped"));
     assert_eq!(query_param(&stopped, "continuing"), Some("0"));
     assert!(!is_live(&ps) && !live_playback(), "the stop retires the session");
+}
+
+#[test]
+fn a_refused_live_decision_still_plays_the_session_s_own_playlist() {
+    use std::time::Duration;
+    let mut ps = crate::route::PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let (port, rx) = live_pms(true);
+    let sid = plx_plex::plex::register_for_test("route-live-400", "127.0.0.1", port, "tok-live", "cid-live");
+    let env = ResolveEnv {
+        sid,
+        live: Some(LiveTune { dvr: "7".into(), channel: "C101.242.ersatztv.org".into() }),
+        ..Default::default()
+    };
+    let plan = build_stream(&plx_base::task::OffFrame::for_test(), "", "", "", "", &env);
+    for _ in 0..2 {
+        rx.recv_timeout(Duration::from_secs(5)).expect("the tune, then the refused decision");
+    }
+    assert!(plan.live.is_some(), "the recording is still the plan's to stop");
+    let own = format!("/livetv/sessions/9b9fe727-0000-46db-b94c-ef512e3e61d2/{}/index.m3u8?offset=-1.000000&", plan.sess);
+    assert!(plan.url.contains(&own), "the consumer is named after the tune's session id: {}", plan.url);
+    assert_eq!((plan.vcodec.as_str(), plan.acodec.as_str()), ("h264", "aac"));
 }
 
 #[test]
