@@ -5196,6 +5196,34 @@ struct HlsCursor {
     ended: bool,
     target_duration_secs: u64,
     start_applied: bool,
+    /// A Live TV session's playlist (the entry was already a media playlist): it starts
+    /// [`LIVE_START_CUSHION_NS`] behind its edge and is polled every [`LIVE_POLL`].
+    live: bool,
+}
+
+/// How far behind a live recording's edge playback starts. Measured on the TV 2026-10-21: started
+/// on the first one-second segment, the play rate held 1000‰ for 11 s and then swung between 667‰
+/// and 1400‰ with 400-600 ms video gaps — every late segment was a stall, because the whole buffer
+/// was the one segment in hand. Three seconds of recording absorb that jitter; the start costs the
+/// same three seconds once.
+const LIVE_START_CUSHION_NS: i64 = 3_000_000_000;
+
+/// A live playlist grows by one segment a second; polled at the VOD cadence (a full second for
+/// these) each new segment was found up to a second late, a second the cushion then has to pay.
+const LIVE_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether a live playlist holding `total_ns` of recording may start delivering segments.
+fn live_start_ready(live: bool, start_applied: bool, total_ns: i64) -> bool {
+    !live || start_applied || total_ns >= LIVE_START_CUSHION_NS
+}
+
+/// The wait before re-reading a playlist that had nothing new.
+fn playlist_poll(live: bool, target_duration_secs: u64) -> std::time::Duration {
+    if live {
+        LIVE_POLL
+    } else {
+        std::time::Duration::from_millis(target_duration_secs.saturating_mul(500).clamp(250, 1_000))
+    }
 }
 
 fn hls_cursor_open(
@@ -5228,6 +5256,7 @@ fn hls_cursor_open(
             ended: false,
             target_duration_secs: 1,
             start_applied: false,
+            live: true,
         });
     }
     let master = crate::hls::parse_master(&master_landed, &master_text).map_err(|e| {
@@ -5248,6 +5277,7 @@ fn hls_cursor_open(
         ended: false,
         target_duration_secs: 1,
         start_applied: false,
+        live: false,
     })
 }
 
@@ -5285,44 +5315,47 @@ fn hls_cursor_next(
         if cursor.publishes_duration {
             SHARED.duration_ns.store(total_ns, Ordering::Relaxed);
         }
-        let mut refresh = cursor.tracker.apply(&media).map_err(|e| {
-            crate::player::log(&format!("hls: refresh rejected: {e}"));
-            HlsExit::Failed("HLS media refresh rejected")
-        })?;
-        let mut skipped = 0usize;
-        if !cursor.start_applied {
-            let first_sequence = media
-                .segments
-                .get(start_index)
-                .map(|segment| segment.sequence)
-                .unwrap_or_else(|| {
-                    media
-                        .media_sequence
-                        .saturating_add(media.segments.len() as u64)
-                });
-            let before = refresh.new_segments.len();
-            refresh
-                .new_segments
-                .retain(|segment| segment.sequence >= first_sequence);
-            skipped = before.saturating_sub(refresh.new_segments.len());
-            cursor.start_applied = true;
+        // Not one segment of a live recording leaves before the cushion exists; the tracker is left
+        // untouched, so the read that has it delivers every segment from the first.
+        let holding = !live_start_ready(cursor.live, cursor.start_applied, total_ns);
+        if holding {
+            crate::player::log(&format!("hls: live start holds for its cushion total_ms={}", total_ns / 1_000_000));
         }
-        crate::player::log(&format!(
-            "hls: refresh new={} skipped={} total_ms={} end={} fetch_ms={media_ms}",
-            refresh.new_segments.len(),
-            skipped,
-            total_ns / 1_000_000,
-            refresh.end_list
-        ));
-        cursor.pending.extend(refresh.new_segments);
-        cursor.ended = refresh.end_list;
+        if !holding {
+            let mut refresh = cursor.tracker.apply(&media).map_err(|e| {
+                crate::player::log(&format!("hls: refresh rejected: {e}"));
+                HlsExit::Failed("HLS media refresh rejected")
+            })?;
+            let mut skipped = 0usize;
+            if !cursor.start_applied {
+                let first_sequence = media
+                    .segments
+                    .get(start_index)
+                    .map(|segment| segment.sequence)
+                    .unwrap_or_else(|| {
+                        media
+                            .media_sequence
+                            .saturating_add(media.segments.len() as u64)
+                    });
+                let before = refresh.new_segments.len();
+                refresh
+                    .new_segments
+                    .retain(|segment| segment.sequence >= first_sequence);
+                skipped = before.saturating_sub(refresh.new_segments.len());
+                cursor.start_applied = true;
+            }
+            crate::player::log(&format!(
+                "hls: refresh new={} skipped={} total_ms={} end={} fetch_ms={media_ms}",
+                refresh.new_segments.len(),
+                skipped,
+                total_ns / 1_000_000,
+                refresh.end_list
+            ));
+            cursor.pending.extend(refresh.new_segments);
+            cursor.ended = refresh.end_list;
+        }
         if cursor.pending.is_empty() && !cursor.ended {
-            let poll = std::time::Duration::from_millis(
-                cursor
-                    .target_duration_secs
-                    .saturating_mul(500)
-                    .clamp(250, 1_000),
-            );
+            let poll = playlist_poll(cursor.live, cursor.target_duration_secs);
             let reserve_snapshot = reserve
                 .as_deref_mut()
                 .and_then(|reserve| reserve.active(false));

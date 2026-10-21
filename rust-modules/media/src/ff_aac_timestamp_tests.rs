@@ -127,6 +127,21 @@ fn a_live_segment_without_parameter_sets_inherits_them_from_its_own_playlist_onl
     assert!(out.starts_with(&[0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 2]));
 }
 
+/// A live recording starts three seconds behind its edge and is polled twice a second (measured
+/// on the TV 2026-10-21: started on its first segment it stalled at every late one); a PMS
+/// transcode's playlist keeps the VOD cadence and starts at once.
+#[test]
+fn a_live_playlist_starts_behind_its_edge_and_is_polled_faster() {
+    assert!(!live_start_ready(true, false, 760_000_000), "one segment is no cushion");
+    assert!(!live_start_ready(true, false, 2_760_000_000));
+    assert!(live_start_ready(true, false, 3_760_000_000));
+    assert!(live_start_ready(true, true, 0), "once started, every segment goes as it lands");
+    assert!(live_start_ready(false, false, 0), "a PMS transcode is never held");
+    assert_eq!(playlist_poll(true, 3), std::time::Duration::from_millis(500));
+    assert_eq!(playlist_poll(false, 3), std::time::Duration::from_millis(1_000));
+    assert_eq!(playlist_poll(false, 0), std::time::Duration::from_millis(250));
+}
+
 #[test]
 fn a_ts_idr_without_any_parameter_sets_is_rejected() {
     let mut sets = H264ParamSets::default();
