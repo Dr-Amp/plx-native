@@ -1565,21 +1565,25 @@ impl Src {
 struct HlsNet {
     hs: *mut HttpStream,
     curl: Option<Box<crate::curlio::CurlSource>>,
-    /// The decode state the last segment left, for a next one that carries none in band. Rides
-    /// here because this is the one value every segment fetch of the session is lent.
+    /// `Some` only for a Live TV session (armed by `hls_cursor_open` when the entry is a media
+    /// playlist): the stream state one segment leaves for the next. Rides here because this is the
+    /// one value every segment fetch of the session is lent.
     carry: Option<SegmentCarry>,
 }
 
-/// The H.264 parameter sets and raster one segment of a playlist delivered, for the next segment
-/// of the SAME playlist when it carries no SPS/PPS: a Live TV recording is the tuner's stream
-/// copied and cut every second, and only its first segment repeats them (measured on the TV
-/// 2026-10-21: segment 1 probed `0x0`). PMS's own transcodes repeat them in every segment, so for
-/// those this is never read. Scoped to the playlist's directory: a candidate rendition must never
-/// inherit another rendition's raster.
+/// What a Live TV segment hands the next one of the SAME playlist. A recording is the tuner's
+/// stream copied and cut every second whatever the GOP (measured on the TV 2026-10-21: segment 1
+/// probed `0x0` and opened mid-GOP), so its segments are cuts of ONE stream, not independently
+/// decodable pieces: a later one may carry no SPS/PPS, begin without an IDR, and time B-frames
+/// before its first packet. PMS's own transcodes are independent segments and never arm this.
+/// Scoped to the playlist's directory, so nothing crosses into another playlist.
+#[derive(Default)]
 struct SegmentCarry {
+    /// Empty until the first segment lands: armed, nothing to continue yet.
     scope: String,
     params: H264ParamSets,
     raster: (i32, i32),
+    anchors: (Option<crate::hls::StreamAnchor>, Option<crate::hls::StreamAnchor>),
 }
 
 /// The directory a segment's playlist lives in — the scope of a [`SegmentCarry`].
@@ -4702,11 +4706,13 @@ unsafe fn hls_demux_segment(
         .request_path(&segment.resource)
         .map_err(|_| HlsExit::Failed("segment credential rejected"))?;
     let scope = carry_scope(segment).to_owned();
+    let live = net.carry.is_some();
     let carried = net
         .carry
         .as_ref()
-        .filter(|c| c.scope == scope)
-        .map(|c| (c.params.clone(), c.raster));
+        .filter(|c| c.scope == scope && c.raster.0 > 0 && c.raster.1 > 0)
+        .map(|c| (c.params.clone(), c.raster, c.anchors));
+    let continuing = carried.is_some();
     let request_started = runtime.request_started();
     let audio_expected =
         || SHARED.hls_audio_expected.load(Ordering::Acquire) && FEED_AUDIO.load(Ordering::Relaxed);
@@ -4864,7 +4870,10 @@ unsafe fn hls_demux_segment(
     };
 
     let (mut video_width, mut video_height) = ((*vcp).width, (*vcp).height);
-    let (mut params, carried_raster) = carried.unwrap_or_default();
+    let (mut params, carried_raster, anchors) = carried.unwrap_or_default();
+    if continuing {
+        clock.continue_stream(anchors);
+    }
     if video_width <= 0 || video_height <= 0 {
         // No SPS in this segment for the probe to read: the previous segment of this playlist
         // named the raster, and its parameter sets go in front of this one's IDR.
@@ -4916,7 +4925,8 @@ unsafe fn hls_demux_segment(
                 &mut aubuf,
             )
             .map_err(HlsExit::Failed)?;
-            if video_packets == 0 && !is_key {
+            // A continued live segment is a cut of the stream the decoder is already inside.
+            if video_packets == 0 && !is_key && !continuing {
                 av_packet_unref(input.pkt);
                 return Err(HlsExit::Failed("HLS segment does not begin with an IDR"));
             }
@@ -5058,7 +5068,14 @@ unsafe fn hls_demux_segment(
     if let Some(cs) = input.state.src.take_curl() {
         net.curl = Some(cs);
     }
-    net.carry = Some(SegmentCarry { scope, params, raster: (video_width, video_height) });
+    if live {
+        net.carry = Some(SegmentCarry {
+            scope,
+            params,
+            raster: (video_width, video_height),
+            anchors: clock.stream_anchors(),
+        });
+    }
     Ok(HlsSegmentOutput {
         aus,
         transfer,
@@ -5200,6 +5217,7 @@ fn hls_cursor_open(
         // A Live TV session: the URL is the media playlist itself, read again by the first
         // `hls_cursor_next` like any variant's. No declared rate exists for it.
         crate::player::log(&format!("hls: entry is a media playlist fetch_ms={master_ms}"));
+        net.carry = Some(SegmentCarry::default());
         return Ok(HlsCursor {
             publishes_duration,
             declared_bps: 0,
