@@ -1565,6 +1565,27 @@ impl Src {
 struct HlsNet {
     hs: *mut HttpStream,
     curl: Option<Box<crate::curlio::CurlSource>>,
+    /// The decode state the last segment left, for a next one that carries none in band. Rides
+    /// here because this is the one value every segment fetch of the session is lent.
+    carry: Option<SegmentCarry>,
+}
+
+/// The H.264 parameter sets and raster one segment of a playlist delivered, for the next segment
+/// of the SAME playlist when it carries no SPS/PPS: a Live TV recording is the tuner's stream
+/// copied and cut every second, and only its first segment repeats them (measured on the TV
+/// 2026-10-21: segment 1 probed `0x0`). PMS's own transcodes repeat them in every segment, so for
+/// those this is never read. Scoped to the playlist's directory: a candidate rendition must never
+/// inherit another rendition's raster.
+struct SegmentCarry {
+    scope: String,
+    params: H264ParamSets,
+    raster: (i32, i32),
+}
+
+/// The directory a segment's playlist lives in — the scope of a [`SegmentCarry`].
+fn carry_scope(segment: &crate::hls::Segment) -> &str {
+    let path = segment.resource.path.split_once('?').map_or(segment.resource.path.as_str(), |(p, _)| p);
+    path.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
 
 /// **The live-transfer terminal rule.** A partial response is right-censored evidence.  PMS may
@@ -3760,7 +3781,7 @@ fn adts_header(freq_idx: u8, chan_cfg: u8, payload_len: usize) -> [u8; 7] {
     ]
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct H264ParamSets {
     sps: Vec<u8>,
     pps: Vec<u8>,
@@ -4680,6 +4701,12 @@ unsafe fn hls_demux_segment(
     let path = auth
         .request_path(&segment.resource)
         .map_err(|_| HlsExit::Failed("segment credential rejected"))?;
+    let scope = carry_scope(segment).to_owned();
+    let carried = net
+        .carry
+        .as_ref()
+        .filter(|c| c.scope == scope)
+        .map(|c| (c.params.clone(), c.raster));
     let request_started = runtime.request_started();
     let audio_expected =
         || SHARED.hls_audio_expected.load(Ordering::Acquire) && FEED_AUDIO.load(Ordering::Relaxed);
@@ -4836,12 +4863,21 @@ unsafe fn hls_demux_segment(
         None
     };
 
-    let video_width = (*vcp).width;
-    let video_height = (*vcp).height;
+    let (mut video_width, mut video_height) = ((*vcp).width, (*vcp).height);
+    let (mut params, carried_raster) = carried.unwrap_or_default();
     if video_width <= 0 || video_height <= 0 {
-        return Err(HlsExit::Failed("HLS segment has invalid video dimensions"));
+        // No SPS in this segment for the probe to read: the previous segment of this playlist
+        // named the raster, and its parameter sets go in front of this one's IDR.
+        let (w, h) = carried_raster;
+        if w <= 0 || h <= 0 {
+            return Err(HlsExit::Failed("HLS segment has invalid video dimensions"));
+        }
+        (video_width, video_height) = (w, h);
+        crate::player::log(&format!(
+            "hls: segment={} carries no SPS; raster {w}x{h} and parameter sets from the previous segment",
+            segment.sequence
+        ));
     }
-    let mut params = H264ParamSets::default();
     let mut aubuf = Vec::with_capacity(4 * 1024 * 1024);
     let mut video_packets = 0usize;
     let mut audio_packets = 0usize;
@@ -5022,6 +5058,7 @@ unsafe fn hls_demux_segment(
     if let Some(cs) = input.state.src.take_curl() {
         net.curl = Some(cs);
     }
+    net.carry = Some(SegmentCarry { scope, params, raster: (video_width, video_height) });
     Ok(HlsSegmentOutput {
         aus,
         transfer,
@@ -6601,7 +6638,7 @@ fn hls_demux(
         SHARED.dg_abr_target_kbps.store(0, Ordering::Relaxed);
         SHARED.dg_abr_unsafe_deficit_ms.store(0, Ordering::Relaxed);
     }
-    let mut net = HlsNet { hs, curl: None };
+    let mut net = HlsNet { hs, curl: None, carry: None };
     let mut cursor = hls_cursor_open(origin, path, aq, &mut net, true, None)?;
     if abr.is_some() {
         SHARED.dg_abr_declared_kbps.store(
