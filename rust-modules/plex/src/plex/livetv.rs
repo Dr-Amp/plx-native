@@ -187,10 +187,13 @@ pub struct LivePlay {
 pub const LIVE_PROFILE_EXTRA: &str = "add-transcode-target(type=videoProfile&context=all&protocol=hls\
     &container=mpegts&videoCodec=h264,hevc&audioCodec=aac,ac3,eac3)";
 
+/// The query the official client reads a live playlist with: completed segments only.
+const LIVE_EDGE: &str = "?offset=-1.000000";
+
 /// The session's own playlist for one playback, the shape every measured part had.
 pub fn session_playlist(session: &LiveSession, playback: &str) -> Option<LivePlay> {
     is_path_id(playback).then(|| LivePlay {
-        part: format!("{}/{playback}/index.m3u8?offset=-1.000000", session.key),
+        part: format!("{}/{playback}/index.m3u8{LIVE_EDGE}", session.key),
         vcodec: RECORDED_VCODEC.to_owned(),
         acodec: RECORDED_ACODEC.to_owned(),
     })
@@ -206,6 +209,10 @@ fn or_recorded(codec: &str, recorded: &str) -> String {
 
 /// The playlist a decision named for this session: under the session's own key and an `.m3u8`,
 /// with its Media's codecs (the decision OUTPUT is what the Load must describe).
+///
+/// The part's query is replaced by the official client's `offset=-1.000000`. The decision's own
+/// (`offset={first}&X-Plex-Incomplete-Segments=1`, measured on the TV 2026-10-21) lists the segment
+/// still being written with `#EXTINF:0`, which `hls::parse_media` refuses as a whole playlist.
 pub fn live_part_of(session: &LiveSession, decision: &super::MediaContainer) -> Option<LivePlay> {
     let prefix = format!("{}/", session.key);
     decision.metadata.iter().flat_map(|m| &m.media).find_map(|media| {
@@ -219,7 +226,7 @@ pub fn live_part_of(session: &LiveSession, decision: &super::MediaContainer) -> 
                     && k.split_once('?').map_or(*k, |(path, _)| path).ends_with(".m3u8")
             })
             .map(|part| LivePlay {
-                part: part.to_owned(),
+                part: format!("{}{LIVE_EDGE}", part.split_once('?').map_or(part, |(path, _)| path)),
                 vcodec: or_recorded(&media.video_codec, RECORDED_VCODEC),
                 acodec: or_recorded(&media.audio_codec, RECORDED_ACODEC),
             })
@@ -571,6 +578,12 @@ mod tests {
             live_part_of(&session(), &decided(measured)),
             Some(LivePlay { part: measured.into(), vcodec: "hevc".into(), acodec: "aac".into() }),
             "the decision's codecs, the recording's where it names none"
+        );
+        let incomplete = "/livetv/sessions/9b9fe727-0000-46db-b94c-ef512e3e61d2/clientid/index.m3u8?offset=0.021333&X-Plex-Incomplete-Segments=1";
+        assert_eq!(
+            live_part_of(&session(), &decided(incomplete)).map(|p| p.part).as_deref(),
+            Some(measured),
+            "the in-progress segment (#EXTINF:0) is not asked for"
         );
         for wrong in [
             "/livetv/sessions/other/clientid/index.m3u8",
