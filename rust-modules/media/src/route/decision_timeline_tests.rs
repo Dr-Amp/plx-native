@@ -640,6 +640,8 @@ fn a_live_channel_tunes_then_reports_under_its_session_and_its_stop_frees_the_tu
     let decision = next();
     assert_eq!(query_param(&decision, "path"), Some("%2Flivetv%2Fsessions%2F9b9fe727-0000-46db-b94c-ef512e3e61d2"));
     assert_eq!(query_param(&decision, "directPlay"), Some("1"));
+    assert_eq!(query_param(&decision, "hasMDE"), Some("1"), "the client's own decision is what PMS calls a direct play");
+    assert_eq!(query_param(&decision, "subtitles"), Some("none"));
     assert_eq!(query_param(&decision, "X-Plex-Client-Profile-Name"), Some("Generic"), "PMS 400s a profile-less decision");
     let profile = query_param(&decision, "X-Plex-Client-Profile-Extra").expect("a profile augmentation");
     assert!(profile.contains("mpegts") && !profile.contains("direct-play"),

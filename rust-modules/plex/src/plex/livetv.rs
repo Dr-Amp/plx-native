@@ -151,16 +151,23 @@ pub fn shape_of(v: &serde_json::Value, depth: usize) -> String {
 }
 
 /// `GET /video/:/transcode/universal/decision` for a live session — the official client's
-/// direct-play ask, minus its profile augmentation: the recording is already H.264/AAC in MPEG-TS.
+/// direct-play ask (its profile augmentation is added by the caller). `hasMDE=1` is the part that
+/// makes it a direct play: the client vouches for its own decode, and PMS answers "MDE=1000, Direct
+/// play OK" without matching a direct-play profile — which `Generic` has none of for HLS/MPEG-TS
+/// (without it: "No direct play video profile exists for protocol hls", measured on the TV
+/// 2026-10-21). `subtitles=none` as on every `hasMDE` ask this app sends: PMS 400s `hasMDE` +
+/// `directPlay` with the default `auto` when a subtitle is selected.
 pub fn live_decision_path(session: &LiveSession, playback: &str) -> String {
     QueryBuilder::new("/video/:/transcode/universal/decision")
         .str("path", &session.key)
         .int("mediaIndex", 0)
         .int("partIndex", 0)
         .str("protocol", "hls")
+        .int("hasMDE", 1)
         .int("directPlay", 1)
         .int("directStream", 1)
         .int("directStreamAudio", 1)
+        .str("subtitles", "none")
         .str("session", playback)
         .build()
 }
@@ -554,7 +561,7 @@ mod tests {
         assert_eq!(
             live_decision_path(&session(), "pb1"),
             "/video/:/transcode/universal/decision?path=%2Flivetv%2Fsessions%2F9b9fe727-0000-46db-b94c-ef512e3e61d2\
-             &mediaIndex=0&partIndex=0&protocol=hls&directPlay=1&directStream=1&directStreamAudio=1&session=pb1"
+             &mediaIndex=0&partIndex=0&protocol=hls&hasMDE=1&directPlay=1&directStream=1&directStreamAudio=1&subtitles=none&session=pb1"
         );
         let decided = |key: &str| {
             page(format!(r#"{{"MediaContainer":{{"Metadata":[{{"Media":[{{"videoCodec":"hevc","Part":[{{"key":"{key}","decision":"directplay"}}]}}]}}]}}}}"#).as_bytes())
