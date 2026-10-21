@@ -2647,7 +2647,7 @@ fn build_live_stream(off: &plx_base::task::OffFrame, tune: &LiveTune, env: &Reso
     };
     let session = new_sess("");
     plan.sess = session.clone();
-    let Some(live) = client.tune(off, &tune.dvr, &tune.channel) else {
+    let Some(live) = client.tune(off, &tune.dvr, &tune.channel, &session) else {
         crate::player::log(&format!("livetv: tune of {} on dvr {} failed", tune.channel, tune.dvr));
         return;
     };

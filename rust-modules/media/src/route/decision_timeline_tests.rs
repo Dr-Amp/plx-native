@@ -624,7 +624,13 @@ fn a_live_channel_tunes_then_reports_under_its_session_and_its_stop_frees_the_tu
     let next = || rx.recv_timeout(Duration::from_secs(5)).expect("a request");
 
     let tune = next();
-    assert!(tune.starts_with("POST /livetv/dvrs/7/channels/C101.242.ersatztv.org/tune"), "{tune}");
+    assert!(tune.starts_with("POST /livetv/dvrs/7/channels/C101.242.ersatztv.org/tune?"), "{tune}");
+    assert_eq!(
+        query_param(&tune, "X-Plex-Session-Identifier"),
+        Some(plan.sess.as_str()),
+        "PMS refuses a tune without a session id (400), and it is the one the playback reports under"
+    );
+    assert_eq!(query_param(&tune, "X-Plex-Client-Identifier"), Some("cid-live"));
     let decision = next();
     assert_eq!(query_param(&decision, "path"), Some("%2Flivetv%2Fsessions%2F9b9fe727-0000-46db-b94c-ef512e3e61d2"));
     assert_eq!(query_param(&decision, "directPlay"), Some("1"));

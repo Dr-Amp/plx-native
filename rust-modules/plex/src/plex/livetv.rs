@@ -126,6 +126,30 @@ pub fn session_of(body: &serde_json::Value) -> Option<LiveSession> {
     }
 }
 
+/// The key names of a JSON tree to `depth` levels, no values: `{MediaContainer:{size,Hub:[{…}]}}`.
+/// What a log line may say about a body whose contents it must not repeat.
+pub fn shape_of(v: &serde_json::Value, depth: usize) -> String {
+    use serde_json::Value;
+    match v {
+        Value::Object(map) if depth > 0 => {
+            let inner: Vec<String> = map
+                .iter()
+                .map(|(k, v)| match v {
+                    Value::Object(_) | Value::Array(_) => format!("{k}:{}", shape_of(v, depth - 1)),
+                    _ => k.clone(),
+                })
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+        Value::Array(items) if depth > 0 => {
+            format!("[{}]", items.first().map_or_else(String::new, |v| shape_of(v, depth - 1)))
+        }
+        Value::Object(_) => "{…}".into(),
+        Value::Array(_) => "[…]".into(),
+        _ => "_".into(),
+    }
+}
+
 /// `GET /video/:/transcode/universal/decision` for a live session — the official client's
 /// direct-play ask, minus its profile augmentation: the recording is already H.264/AAC in MPEG-TS.
 pub fn live_decision_path(session: &LiveSession, playback: &str) -> String {
@@ -267,10 +291,18 @@ impl Client {
     }
 
     /// `POST …/tune` — the server starts recording the channel and answers once it streams (4.8 s
-    /// measured). `None` when it refused, failed, or answered without a session.
-    pub fn tune(&self, _off: &plx_base::task::OffFrame, dvr: &str, channel: &str) -> Option<LiveSession> {
-        let path = tune_path(dvr, channel)?;
-        session_of(&self.post_value(&path)?)
+    /// measured). `None` when it refused, failed, or answered without a session. The playback
+    /// session id is required: without one PMS answers 400 "A session identifier is required for
+    /// this request" before it looks at the channel (measured on the TV, 2026-10-21).
+    pub fn tune(&self, _off: &plx_base::task::OffFrame, dvr: &str, channel: &str, playback: &str) -> Option<LiveSession> {
+        let q = QueryBuilder::new(tune_path(dvr, channel)?).str("X-Plex-Session-Identifier", playback);
+        let body = self.post_value(&self.playback_identity(q).build())?;
+        let session = session_of(&body);
+        if session.is_none() {
+            // The tune's body has never been captured: say what it held, names only, no values.
+            plx_base::eventlog::log(&format!("livetv: tune answered without a session; shape {}", shape_of(&body, 3)));
+        }
+        session
     }
 
     /// The playlist this client reads for `session`: the decision's part, or — when the decision
@@ -279,7 +311,8 @@ impl Client {
     /// part has been seen to mean "do not play".
     pub fn live_part(&self, _off: &plx_base::task::OffFrame, session: &LiveSession, playback: &str) -> Option<LivePlay> {
         let header = format!("X-Plex-Session-Identifier: {playback}");
-        let decision = self.get_json_with_headers(&live_decision_path(session, playback), &[&header])?;
+        let path = self.playback_identity(QueryBuilder::new(live_decision_path(session, playback))).build();
+        let decision = self.get_json_with_headers(&path, &[&header])?;
         live_part_of(session, &decision).or_else(|| {
             is_path_id(&self.client_id).then(|| LivePlay {
                 part: format!("{}/{}/index.m3u8?offset=-1.000000", session.key, self.client_id),
@@ -450,6 +483,16 @@ mod tests {
         ] {
             assert_eq!(session_of(&serde_json::from_str(odd).unwrap()), None, "{odd}");
         }
+    }
+
+    #[test]
+    fn a_body_s_shape_names_its_keys_and_never_its_values() {
+        let body: serde_json::Value =
+            serde_json::from_str(r#"{"MediaContainer":{"size":1,"title":"secret","Item":[{"key":"/x","n":2}]}}"#).unwrap();
+        // serde_json's map is ordered by key here, so the names come sorted
+        assert_eq!(shape_of(&body, 3), "{MediaContainer:{Item:[{…}],size,title}}");
+        assert_eq!(shape_of(&body, 4), "{MediaContainer:{Item:[{key,n}],size,title}}");
+        assert!(!shape_of(&body, 9).contains("secret"));
     }
 
     fn session() -> LiveSession {
