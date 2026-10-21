@@ -641,7 +641,9 @@ fn a_live_channel_tunes_then_reports_under_its_session_and_its_stop_frees_the_tu
     assert_eq!(query_param(&decision, "path"), Some("%2Flivetv%2Fsessions%2F9b9fe727-0000-46db-b94c-ef512e3e61d2"));
     assert_eq!(query_param(&decision, "directPlay"), Some("1"));
     assert_eq!(query_param(&decision, "X-Plex-Client-Profile-Name"), Some("Generic"), "PMS 400s a profile-less decision");
-    assert!(query_param(&decision, "X-Plex-Client-Profile-Extra").is_some_and(|p| p.contains("mpegts")));
+    let profile = query_param(&decision, "X-Plex-Client-Profile-Extra").expect("a profile augmentation");
+    assert!(profile.contains("mpegts") && !profile.contains("direct-play"),
+        "an HLS target and no direct-play profile, or PMS decides a conversion: {profile}");
     assert_eq!(query_param(&decision, "session"), Some(plan.sess.as_str()), "the decision and the URL share one session");
 
     let live = plan.live.clone().expect("the plan names the recording");
