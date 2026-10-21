@@ -5,16 +5,24 @@
 //! as ErsatzTV) plus the EPG provider that names its channels. Everything a channel row shows
 //! comes from that provider, under the DVR's `epgIdentifier` path prefix
 //! (`/tv.plex.providers.epg.xmltv:7/…`): the lineup lists the mapped channels, the grid the
-//! airings. Tuning is a separate write and does not live here.
+//! airings.
+//!
+//! Watching a channel is three requests, in the order the official LG client makes them (measured
+//! 2026-10-21, `docs/pms-api.md` §10): the tune, which makes the server record the channel into a
+//! session of its own; the universal decision for that session, which names the playlist this
+//! client reads; and the timeline, whose `stopped` is what ends the recording and frees the tuner.
 
 use super::client::{Client, QueryBuilder};
 use super::models::{Dvr, EpgChannel, Metadata};
+use super::params::TimelineState;
 
 /// One channel as a Live TV row shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveChannel {
-    /// The DVR that tunes it — the `{dvr}` of `/livetv/dvrs/{dvr}/channels/{vcn}/tune`.
+    /// The DVR that tunes it — the `{dvr}` of `/livetv/dvrs/{dvr}/channels/{channel}/tune`.
     pub dvr: String,
+    /// The guide's channel id, the `{channel}` of the tune (`"C101.242.ersatztv.org"`).
+    pub channel: String,
     /// The virtual channel number, `"101"`.
     pub vcn: String,
     /// The channel's name without its number in front (`"Canal Los Simpsons"`).
@@ -63,6 +71,114 @@ pub fn usable_dvrs(dvrs: &[Dvr]) -> impl Iterator<Item = &Dvr> {
     })
 }
 
+/// A server-sent id that becomes one path segment of the tune: letters, digits and `._-` only.
+pub fn is_path_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && !id.starts_with('.')
+}
+
+/// `POST /livetv/dvrs/{dvr}/channels/{channel}/tune`, or `None` for an id that is not one segment.
+pub fn tune_path(dvr: &str, channel: &str) -> Option<String> {
+    (is_path_id(dvr) && is_path_id(channel))
+        .then(|| format!("/livetv/dvrs/{dvr}/channels/{channel}/tune"))
+}
+
+/// What a tune hands back: the server's own session for the channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveSession {
+    /// `/livetv/sessions/{uuid}` — the decision's `path` and the timeline's `key`.
+    pub key: String,
+    /// The airing being recorded, the timeline's `ratingKey`. May be empty.
+    pub rating_key: String,
+}
+
+const SESSIONS: &str = "/livetv/sessions/";
+
+/// `/livetv/sessions/{uuid}` with nothing after the id.
+fn is_session_key(key: &str) -> bool {
+    key.strip_prefix(SESSIONS).is_some_and(|id| {
+        (8..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+    })
+}
+
+/// The session a tune answered with. The response nests it (subscription → grab operation →
+/// item), so this takes the first object anywhere in the body whose `key` is a session key,
+/// rather than a fixed path through levels this client has never needed to read.
+pub fn session_of(body: &serde_json::Value) -> Option<LiveSession> {
+    use serde_json::Value;
+    match body {
+        Value::Object(map) => {
+            if let Some(key) = map.get("key").and_then(Value::as_str).filter(|k| is_session_key(k)) {
+                let rating_key = match map.get("ratingKey") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Number(n)) => n.to_string(),
+                    _ => String::new(),
+                };
+                return Some(LiveSession { key: key.to_owned(), rating_key });
+            }
+            map.values().find_map(session_of)
+        }
+        Value::Array(items) => items.iter().find_map(session_of),
+        _ => None,
+    }
+}
+
+/// `GET /video/:/transcode/universal/decision` for a live session — the official client's
+/// direct-play ask, minus its profile augmentation: the recording is already H.264/AAC in MPEG-TS.
+pub fn live_decision_path(session: &LiveSession, playback: &str) -> String {
+    QueryBuilder::new("/video/:/transcode/universal/decision")
+        .str("path", &session.key)
+        .int("mediaIndex", 0)
+        .int("partIndex", 0)
+        .str("protocol", "hls")
+        .int("directPlay", 1)
+        .int("directStream", 1)
+        .int("directStreamAudio", 1)
+        .str("session", playback)
+        .build()
+}
+
+/// What this client plays for a live session: the playlist and the codecs the Load declares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LivePlay {
+    pub part: String,
+    pub vcodec: String,
+    pub acodec: String,
+}
+
+/// The codecs of every measured recording (`docs/pms-api.md` §10), for a decision that names none.
+const RECORDED_VCODEC: &str = "h264";
+const RECORDED_ACODEC: &str = "aac";
+
+fn or_recorded(codec: &str, recorded: &str) -> String {
+    if codec.is_empty() { recorded } else { codec }.to_owned()
+}
+
+/// The playlist a decision named for this session: under the session's own key and an `.m3u8`,
+/// with its Media's codecs (the decision OUTPUT is what the Load must describe).
+pub fn live_part_of(session: &LiveSession, decision: &super::MediaContainer) -> Option<LivePlay> {
+    let prefix = format!("{}/", session.key);
+    decision.metadata.iter().flat_map(|m| &m.media).find_map(|media| {
+        media
+            .part
+            .iter()
+            .map(|p| p.key.as_str())
+            .find(|k| {
+                k.starts_with(&prefix)
+                    && !k.contains("..")
+                    && k.split_once('?').map_or(*k, |(path, _)| path).ends_with(".m3u8")
+            })
+            .map(|part| LivePlay {
+                part: part.to_owned(),
+                vcodec: or_recorded(&media.video_codec, RECORDED_VCODEC),
+                acodec: or_recorded(&media.audio_codec, RECORDED_ACODEC),
+            })
+    })
+}
+
 /// The lineup title without the channel number PMS puts in front of it.
 fn channel_name(ch: &EpgChannel) -> String {
     let title = ch.title.trim();
@@ -96,6 +212,7 @@ pub fn lineup(dvr: &Dvr, channels: &[EpgChannel], on_now: &[Metadata]) -> Vec<Li
             });
             LiveChannel {
                 dvr: dvr.key.clone(),
+                channel: ch.grid_key.clone(),
                 vcn: ch.vcn.clone(),
                 name: channel_name(ch),
                 thumb: ch.thumb.clone(),
@@ -147,6 +264,45 @@ impl Client {
             rows.extend(lineup(dvr, &channels, &on_now));
         }
         Some(rows)
+    }
+
+    /// `POST …/tune` — the server starts recording the channel and answers once it streams (4.8 s
+    /// measured). `None` when it refused, failed, or answered without a session.
+    pub fn tune(&self, _off: &plx_base::task::OffFrame, dvr: &str, channel: &str) -> Option<LiveSession> {
+        let path = tune_path(dvr, channel)?;
+        session_of(&self.post_value(&path)?)
+    }
+
+    /// The playlist this client reads for `session`: the decision's part, or — when the decision
+    /// answered but named none — the shape every measured one had, `{key}/{client}/index.m3u8`.
+    /// shortcut: the fallback trusts one measured server version; drop it once a decision without a
+    /// part has been seen to mean "do not play".
+    pub fn live_part(&self, _off: &plx_base::task::OffFrame, session: &LiveSession, playback: &str) -> Option<LivePlay> {
+        let header = format!("X-Plex-Session-Identifier: {playback}");
+        let decision = self.get_json_with_headers(&live_decision_path(session, playback), &[&header])?;
+        live_part_of(session, &decision).or_else(|| {
+            is_path_id(&self.client_id).then(|| LivePlay {
+                part: format!("{}/{}/index.m3u8?offset=-1.000000", session.key, self.client_id),
+                vcodec: RECORDED_VCODEC.to_owned(),
+                acodec: RECORDED_ACODEC.to_owned(),
+            })
+        })
+    }
+
+    /// `POST /:/timeline` for a live session: `time`/`duration` stay 0 as the official client sends
+    /// them. `Stopped` is the request that ends the recording and frees the tuner.
+    pub fn live_timeline(&self, session: &LiveSession, state: TimelineState, watched_ms: i64, playback: &str) -> bool {
+        let q = QueryBuilder::new("/:/timeline")
+            .str("key", &session.key)
+            .opt_str("ratingKey", &session.rating_key)
+            .str("state", state.as_str())
+            .int("time", 0)
+            .int("duration", 0)
+            .int("playbackTime", watched_ms.max(0))
+            .str("X-Plex-Session-Identifier", playback);
+        // `continuing=0`: nothing follows on this session (the official client's stop says so).
+        let q = if state == TimelineState::Stopped { q.int("continuing", 0) } else { q };
+        self.post_ok(&self.playback_identity(q).build())
     }
 }
 
@@ -237,6 +393,7 @@ mod tests {
             ]
         );
         assert!(rows.iter().all(|r| r.dvr == "7"));
+        assert_eq!(rows[0].channel, "C101.242.ersatztv.org", "the tune names the guide's id");
         assert_eq!(rows[0].thumb, "http://192.0.2.10:8409/iptv/logos/gen?text=Family");
     }
 
@@ -253,6 +410,75 @@ mod tests {
         assert!(usable[0].device[0].status == "alive" && is_provider_id(&usable[0].epg_identifier));
         assert!(!is_provider_id(""));
         assert!(!is_provider_id("a?b"));
+    }
+
+    #[test]
+    fn a_tune_names_one_dvr_and_one_channel_segment_or_nothing() {
+        assert_eq!(
+            tune_path("7", "C101.242.ersatztv.org").as_deref(),
+            Some("/livetv/dvrs/7/channels/C101.242.ersatztv.org/tune")
+        );
+        for (dvr, channel) in [("7", ""), ("", "C1"), ("7", "../library"), ("7", "a/b"), ("7?x", "C1"), ("7", "..")] {
+            assert_eq!(tune_path(dvr, channel), None, "{dvr:?} {channel:?}");
+        }
+    }
+
+    // The tune's body was not captured (only its size, 2764 bytes); this nests the session the
+    // way the subscription/grab/item names in the server log describe, two levels down.
+    const TUNED: &str = r#"{"MediaContainer":{"size":1,"MediaSubscription":[{"id":112,"type":4,
+        "MediaGrabOperation":[{"status":"inprogress","Metadata":{"key":"/livetv/sessions/9b9fe727-0000-46db-b94c-ef512e3e61d2",
+        "ratingKey":"355108","type":"episode","grandparentTitle":"Family Show","live":"1"}}]}]}}"#;
+
+    #[test]
+    fn the_session_is_found_wherever_the_tune_nests_it() {
+        let body: serde_json::Value = serde_json::from_str(TUNED).unwrap();
+        assert_eq!(
+            session_of(&body),
+            Some(LiveSession {
+                key: "/livetv/sessions/9b9fe727-0000-46db-b94c-ef512e3e61d2".into(),
+                rating_key: "355108".into(),
+            })
+        );
+        let numeric: serde_json::Value =
+            serde_json::from_str(r#"{"Metadata":[{"key":"/livetv/sessions/abcdef01","ratingKey":7}]}"#).unwrap();
+        assert_eq!(session_of(&numeric).unwrap().rating_key, "7");
+        for odd in [
+            r#"{"key":"/library/metadata/1"}"#,
+            r#"{"key":"/livetv/sessions/abcdef01/xyz/index.m3u8"}"#,
+            r#"{"key":"/livetv/sessions/../../library"}"#,
+            r#"{"MediaContainer":{"size":0}}"#,
+        ] {
+            assert_eq!(session_of(&serde_json::from_str(odd).unwrap()), None, "{odd}");
+        }
+    }
+
+    fn session() -> LiveSession {
+        LiveSession { key: "/livetv/sessions/9b9fe727-0000-46db-b94c-ef512e3e61d2".into(), rating_key: "355108".into() }
+    }
+
+    #[test]
+    fn the_decision_asks_to_direct_play_the_session_and_its_part_must_stay_under_it() {
+        assert_eq!(
+            live_decision_path(&session(), "pb1"),
+            "/video/:/transcode/universal/decision?path=%2Flivetv%2Fsessions%2F9b9fe727-0000-46db-b94c-ef512e3e61d2\
+             &mediaIndex=0&partIndex=0&protocol=hls&directPlay=1&directStream=1&directStreamAudio=1&session=pb1"
+        );
+        let decided = |key: &str| {
+            page(format!(r#"{{"MediaContainer":{{"Metadata":[{{"Media":[{{"videoCodec":"hevc","Part":[{{"key":"{key}","decision":"directplay"}}]}}]}}]}}}}"#).as_bytes())
+        };
+        let measured = "/livetv/sessions/9b9fe727-0000-46db-b94c-ef512e3e61d2/clientid/index.m3u8?offset=-1.000000";
+        assert_eq!(
+            live_part_of(&session(), &decided(measured)),
+            Some(LivePlay { part: measured.into(), vcodec: "hevc".into(), acodec: "aac".into() }),
+            "the decision's codecs, the recording's where it names none"
+        );
+        for wrong in [
+            "/livetv/sessions/other/clientid/index.m3u8",
+            "/livetv/sessions/9b9fe727-0000-46db-b94c-ef512e3e61d2/../../x.m3u8",
+            "/livetv/sessions/9b9fe727-0000-46db-b94c-ef512e3e61d2/clientid/00001.ts",
+        ] {
+            assert_eq!(live_part_of(&session(), &decided(wrong)), None, "{wrong}");
+        }
     }
 
     #[test]

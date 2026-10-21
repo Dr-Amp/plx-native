@@ -250,6 +250,9 @@ pub enum HomeReq {
     Play { sid: plx_plex::plex::ServerId, rk: String, resume_ns: i64 },
     Detail { sid: plx_plex::plex::ServerId, rk: String },
     ItemMenu { sid: plx_plex::plex::ServerId, rk: String },
+    /// OK on a Live TV channel tile: tune `channel` on DVR `dvr` of server `sid` and watch it.
+    /// `title` is the channel's name, for the player until the tune names the airing.
+    Tune { sid: plx_plex::plex::ServerId, dvr: String, channel: String, title: String },
     /// BACK from the shelves: fold to the hero and seat the engine in its remembered hero group.
     FoldToHero,
     Account,

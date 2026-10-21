@@ -667,6 +667,9 @@ fn home_requests(app: &mut App, now: u32) {
                 activate_home_item(app, source, entry, sid, &rk, Some(resume_ns), ret, now),
             HomeReq::Detail { sid, rk } =>
                 activate_home_item(app, source, entry, sid, &rk, None, ret, now),
+            HomeReq::Tune { sid, dvr, channel, title } => super::playback::play_live_channel(
+                &mut app.player.session, &mut app.adapters.player, sid, &dvr, &channel, &title,
+                HUD_LINGER_MS, Some(ret), &mut app.pages, &mut app.bridge),
             HomeReq::ItemMenu { sid, rk } => {
                 let snapshot = app.bridge.hubs_snapshot();
                 let Some(item) = home_item(snapshot.view(), sid, &rk)

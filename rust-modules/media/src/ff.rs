@@ -5159,6 +5159,22 @@ fn hls_cursor_open(
     // Parsed against where the fetch LANDED: a redirected master's children are relative to it.
     let (master_text, master_ms, master_landed) =
         hls_fetch_text(&master_resource, &auth, aq, net, reserve)?;
+    if crate::hls::is_media_playlist(&master_text) {
+        // A Live TV session: the URL is the media playlist itself, read again by the first
+        // `hls_cursor_next` like any variant's. No declared rate exists for it.
+        crate::player::log(&format!("hls: entry is a media playlist fetch_ms={master_ms}"));
+        return Ok(HlsCursor {
+            publishes_duration,
+            declared_bps: 0,
+            auth,
+            media: master_landed,
+            tracker: crate::hls::MediaTracker::default(),
+            pending: std::collections::VecDeque::new(),
+            ended: false,
+            target_duration_secs: 1,
+            start_applied: false,
+        });
+    }
     let master = crate::hls::parse_master(&master_landed, &master_text).map_err(|e| {
         crate::player::log(&format!("hls: master rejected: {e}"));
         HlsExit::Failed("HLS master rejected")

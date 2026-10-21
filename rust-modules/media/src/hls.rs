@@ -466,6 +466,22 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Whether `text` is already a MEDIA playlist (segments, no variants). A Live TV session's playlist
+/// is one: PMS serves `/livetv/sessions/{uuid}/{client}/index.m3u8` with no master in front of it
+/// (`docs/pms-api.md` §10), so the URL a route hands over is its own single variant. Shape only;
+/// [`parse_media`] still validates every line.
+pub fn is_media_playlist(text: &str) -> bool {
+    let mut lines = text.lines().map(str::trim);
+    lines.next() == Some("#EXTM3U") && {
+        let (mut segments, mut variants) = (false, false);
+        for line in lines {
+            segments |= line.starts_with("#EXTINF:");
+            variants |= line.starts_with("#EXT-X-STREAM-INF:");
+        }
+        segments && !variants
+    }
+}
+
 pub fn parse_master(source: &Resource, text: &str) -> Result<MasterPlaylist, Error> {
     let lines = playlist_lines(text)?;
     let mut version = None;
@@ -1067,6 +1083,27 @@ mod tests {
             text.push_str("#EXT-X-ENDLIST\n");
         }
         parse_media(&source, &text).unwrap()
+    }
+
+    // A Live TV session's playlist as PMS 1.43.3 served it (2026-10-21): no master, no
+    // PLAYLIST-TYPE, no ENDLIST while the channel plays, one-second segments named from zero.
+    const LIVE: &str = "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-TARGETDURATION:3\n#EXT-X-MEDIA-SEQUENCE:0\n\
+        #EXT-X-PROGRAM-DATE-TIME:2026-10-21T07:54:42.854397846Z\n#EXTINF:0.760000, nodesc\n00000.ts\n\
+        #EXTINF:1.000000, nodesc\n00001.ts\n#EXTINF:1.000000, nodesc\n00002.ts\n";
+
+    #[test]
+    fn a_live_session_playlist_is_its_own_variant_and_parses_as_growing_media() {
+        assert!(is_media_playlist(LIVE));
+        assert!(!is_media_playlist(
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nsession/index.m3u8\n"
+        ));
+        assert!(!is_media_playlist("#EXTINF:1.0,\n00000.ts\n"), "no header");
+        let at = source("/livetv/sessions/9b9fe727-0000/clientid/index.m3u8?offset=-1.000000&X-Plex-Token=secret");
+        let media = parse_media(&at, LIVE).unwrap();
+        assert_eq!((media.media_sequence, media.segments.len(), media.end_list), (0, 3, false));
+        assert_eq!(media.playlist_type, None);
+        assert_eq!(media.segments[1].resource.path, "/livetv/sessions/9b9fe727-0000/clientid/00001.ts");
+        assert_eq!(media.preferred_start_index().unwrap(), 0);
     }
 
     #[test]

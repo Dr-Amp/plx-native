@@ -62,19 +62,20 @@ pub const LIVE_TV_HUB: &str = "home.livetv";
 
 const LIVE_RK_PREFIX: &str = "livetv:";
 
-/// The `rk` of a channel tile: `livetv:{dvr}:{vcn}`. Distinct from every PMS ratingKey (digits),
-/// so focus memory and item identity keep a channel apart from any library row.
-pub fn live_channel_rk(dvr: &str, vcn: &str) -> String {
-    format!("{LIVE_RK_PREFIX}{dvr}:{vcn}")
+/// The `rk` of a channel tile: `livetv:{dvr}:{channel}`, the channel being the guide's id that the
+/// tune names. Distinct from every PMS ratingKey (digits), so focus memory and item identity keep a
+/// channel apart from any library row.
+pub fn live_channel_rk(dvr: &str, channel: &str) -> String {
+    format!("{LIVE_RK_PREFIX}{dvr}:{channel}")
 }
 
-/// The `(dvr, vcn)` a channel tile tunes, or `None` for every other row.
+/// The `(dvr, channel)` a channel tile tunes, or `None` for every other row.
 pub fn live_channel_of(m: &PmsMovie) -> Option<(&str, &str)> {
     if m.kind != KIND_LIVE_CHANNEL {
         return None;
     }
-    let (dvr, vcn) = m.rk.strip_prefix(LIVE_RK_PREFIX)?.split_once(':')?;
-    (!dvr.is_empty() && !vcn.is_empty()).then_some((dvr, vcn))
+    let (dvr, channel) = m.rk.strip_prefix(LIVE_RK_PREFIX)?.split_once(':')?;
+    (!dvr.is_empty() && !channel.is_empty()).then_some((dvr, channel))
 }
 
 /// A Live TV channel as a Home tile of server `sid`.
@@ -82,7 +83,7 @@ pub fn live_channel_tile(ch: &plx_plex::plex::livetv::LiveChannel, sid: ServerId
     PmsMovie {
         sid,
         kind: KIND_LIVE_CHANNEL,
-        rk: live_channel_rk(&ch.dvr, &ch.vcn),
+        rk: live_channel_rk(&ch.dvr, &ch.channel),
         title: ch.name.clone(),
         show_title: ch.now.clone(),
         thumb: ch.thumb.clone(),
@@ -3530,6 +3531,20 @@ fn build_test(n: usize) -> SourceBuild {
 pub fn seed_for_test(state: &mut PmsState, adapter: &Arc<PmsAdapter>, items: usize, hub_state: HubState) {
     plx_base::testlock::assert_held("the pms hub catalog (seed_for_test)");
     seed_with_scope_for_test(state, adapter, ServerId::UNSET, items, hub_state, &BrowseScope::standalone());
+}
+
+/// [`seed_for_test`] with this source's Live TV `channels` too, as tiles of its row.
+#[cfg(any(test, feature = "test-support"))]
+pub fn seed_live_for_test(state: &mut PmsState, adapter: &Arc<PmsAdapter>, items: usize, channels: &[plx_plex::plex::livetv::LiveChannel]) {
+    seed_for_test(state, adapter, items.max(1), HubState::Ready);
+    let scope = BrowseScope::standalone();
+    for src in &mut state.srcs {
+        if let Some(build) = src.last.as_mut() {
+            build.live = channels.iter().map(|ch| Arc::new(live_channel_tile(ch, src.sid))).collect();
+        }
+    }
+    let build = merge_with_scope(&state.srcs, &scope);
+    commit(state, build);
 }
 
 /// Seed a Hubs source that belongs to a real retained Browse directory. Full Bridge fixtures use

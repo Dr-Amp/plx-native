@@ -1504,9 +1504,38 @@ XMLTV guide. The app's reads live in `rust-modules/plex/src/plex/livetv.rs`.
   `channelIdentifier`, `channelTitle`, `channelThumb`, `protocol` `livetv`, `beginsAt` and `endsAt`
   (Unix seconds), and a `Channel[]` tag. The comparison operator is part of the KEY (`beginsAt%3C=`).
   Adding `type=1,4` returned the same four rows.
-- **Tuning is not recorded here yet.** `POST /livetv/dvrs/{dvr}/channels/{vcn}/tune` is the write that
-  starts a live session; a hand-sent tune is known to have left a server looping on its grabber, so
-  its shape is to be taken from an official client's request sequence before the app sends one.
+
+### Watching a channel (the official LG client's sequence, read from the server log 2026-10-21)
+
+Plex for LG 5.94.3 on webOS 10.3 tuned one channel, watched it for six minutes and backed out. The
+order below is that client's; nothing here was sent by hand (a hand-sent tune has been seen to leave
+a server looping on its grabber).
+
+1. **`POST /livetv/dvrs/{dvr}/channels/{gridKey}/tune`** — the channel is the guide's `gridKey`
+   (`C101.242.ersatztv.org`), not the `vcn`. The server reserves a tuner, starts a "rolling"
+   subscription (`Live TV - Session {client id}`) and a `copy` transcode of the tuner's stream, and
+   answers only once that streams: **200 after 4.8 s**, 2764 bytes. The body was not captured; what
+   it carries is the session `/livetv/sessions/{uuid}` (the client's next request names it) and the
+   airing's `ratingKey`, under a `MediaSubscription` → `MediaGrabOperation` → item nesting that the
+   app does not rely on (`livetv::session_of` takes the first object whose `key` is a session key).
+2. **`GET /video/:/transcode/universal/decision?path=%2Flivetv%2Fsessions%2F{uuid}`** with
+   `directPlay=1&directStream=1&directStreamAudio=1&protocol=hls&mediaIndex=0&partIndex=0&session=…`
+   → 200. The session is then **direct play**: `/status/sessions` shows `Part.decision=directplay`,
+   `Part.key` = **`/livetv/sessions/{uuid}/{X-Plex-Client-Identifier}/index.m3u8?offset=-1.000000`**,
+   H.264 High 1080p25 + AAC LC stereo 48 kHz in MPEG-TS, `TranscodeSession.videoDecision=copy`.
+3. **The playlist is a MEDIA playlist with no master in front of it**, re-read about once a second
+   (`Content-Type: application/vnd.apple.mpegurl`, `Cache-Control: no-cache`):
+   `#EXT-X-VERSION:4`, `#EXT-X-TARGETDURATION:3`, `#EXT-X-MEDIA-SEQUENCE:0`, one
+   `#EXT-X-PROGRAM-DATE-TIME`, then one-second `#EXTINF:1.000000, nodesc` segments named `00000.ts`,
+   `00001.ts`, … relative to the playlist. No `PLAYLIST-TYPE`, no `ENDLIST`, no discontinuity; the
+   list only grows (segment 0 was still listed after six minutes: `buildLiveM3U8: min 0 max 385`).
+   Segment requests carry no token in the URI.
+4. **`/:/timeline?key=%2Flivetv%2Fsessions%2F{uuid}&ratingKey={airing}&state=…&time=0&duration=0&playbackTime={ms}`**
+   — `buffering`, then `playing` about every 10 s. The server records it with `scrobble: 0`.
+5. **The stop is the timeline's `state=stopped&continuing=0`.** On it the server terminates the
+   streaming session ("Client stopped playback"), the recorder sees no consumer left, kills the
+   transcode, deletes its directory, **frees the tuner** and destroys the rolling subscription — all
+   inside the same 3 ms. The client's `DELETE /media/subscriptions/{id}` afterwards answered 404.
 
 ---
 

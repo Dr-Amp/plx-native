@@ -984,7 +984,7 @@ fn paging_a_recent_row_does_not_remove_other_home_rows() {
 fn live_tv_channels_form_one_row_after_continue_watching_and_stay_out_of_the_hero() {
     use plx_plex::plex::livetv::LiveChannel;
     let channel = |vcn: &str, name: &str, now: &str| LiveChannel {
-        dvr: "7".into(), vcn: vcn.into(), name: name.into(),
+        dvr: "7".into(), channel: format!("C{vcn}.242.ersatztv.org"), vcn: vcn.into(), name: name.into(),
         thumb: format!("http://192.0.2.10:8409/iptv/logos/gen?text={vcn}"), now: now.into(), ends_at: 0,
     };
     let mut owned = built(0, &[(10, "cw1")], vec![shelf(0, "Recent", "home.movies.recent", &["r1"])]);
@@ -1003,7 +1003,7 @@ fn live_tv_channels_form_one_row_after_continue_watching_and_stay_out_of_the_her
     let tiles = &items[live.start..live.start + live.len];
     assert_eq!(tiles.iter().map(|m| (m.title.as_str(), m.show_title.as_str())).collect::<Vec<_>>(),
         [("Family Channel", "Family Show"), ("Cartoons", "")]);
-    assert_eq!(live_channel_of(&tiles[0]), Some(("7", "101")));
+    assert_eq!(live_channel_of(&tiles[0]), Some(("7", "C101.242.ersatztv.org")), "the tune's two ids");
     assert_eq!(tiles[0].still, tiles[0].thumb, "a channel draws its logo on both tile faces");
     assert!(pool.iter().all(|slot| items[slot.idx].kind != KIND_LIVE_CHANNEL), "no channel becomes a billboard");
     assert_eq!(live_channel_of(&row(0, "101")), None, "a library row is never a channel");

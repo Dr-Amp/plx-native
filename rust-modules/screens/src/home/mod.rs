@@ -1859,7 +1859,8 @@ impl HomeScreen {
         let Some(item) = self.item_at(H::hubs(cx), row, col) else {
             return Handled::No;
         };
-        if item.rk.is_empty() {
+        // A channel has no item menu: it is no library item (`KIND_LIVE_CHANNEL`).
+        if item.rk.is_empty() || plx_data::pms::live_channel_of(item).is_some() {
             return Handled::No;
         }
         fx.push(Fx::App(AppFx::Home(HomeReq::ItemMenu {
@@ -2023,7 +2024,17 @@ impl HomeScreen {
                 let Some(item) = self.item_at(view, row, col) else {
                     return;
                 };
-                if self
+                if let Some((dvr, channel)) = plx_data::pms::live_channel_of(item) {
+                    (
+                        item,
+                        HomeReq::Tune {
+                            sid: item.sid,
+                            dvr: dvr.to_owned(),
+                            channel: channel.to_owned(),
+                            title: item.title.clone(),
+                        },
+                    )
+                } else if self
                     .rows
                     .get(row)
                     .is_some_and(|h| h.identity == HomeHubIdentity::ContinueWatching)
