@@ -41,12 +41,18 @@
 //!   ghosts fade on K_SCALE, survivors spring home on K_SCROLL.
 //! - **The pop rule.** A tile the engine reports focused that no deliberate move (`By::Dir` /
 //!   `By::Pointer`) announced draws at FULL focus scale at once — a restore or reconcile is adopted
-//!   whole, a page returns exactly as it was left. An unfocused tile draws at rest (or the live
+//!   whole, a page returns as it was left (a page that returns dormant, below, regrows its focused
+//!   card from rest instead). An unfocused tile draws at rest (or the live
 //!   let-go of one that lost focus and has not landed). A deliberate move grows from rest (or from
 //!   where its own let-go is, when focus comes back to a tile still letting go).
-//!   A shelf or grid whose page is still dissolving in is [`dormant`](Shelf::dormant) /
-//!   [`Grid::dormant`]: nothing is lifted under the fade, and the first awake tick grows the focused
-//!   card from rest (a focus the engine restored meanwhile is adopted whole, as above). A grid keeps
+//!   A shelf or grid whose page is still dissolving in, or is shown as a held transition image, is
+//!   [`dormant`](Shelf::dormant) / [`Grid::dormant`]: nothing is lifted under the fade or the image
+//!   (a shelf on a page in view eases what was lifted to rest; under a held image it, like a grid,
+//!   is at rest on its first tick), and the first awake tick grows the focused card from rest. A
+//!   focus the engine restored while the owner slept regrows from rest too, once a dormant tick has
+//!   run since (the Recommended page returning from a Detail under the BACK dip's image); only a
+//!   restore announced after the last dormant tick, on the tick the page wakes, is adopted whole,
+//!   as above. A grid keeps
 //!   its caption bands shut meanwhile and the waking tick opens the focused row's on the lift's own
 //!   frames: a caption is its band's content (a line is drawn only as the band opens and the room
 //!   holds it, `card_row::line_reveal_for`), so it never stands at full strength under a tile that
@@ -94,7 +100,7 @@ pub use avatars::AvatarRow;
 // Geometry and painters a screen's own layout reads (L0 `card_row` / `poster_grid`, re-exported so
 // those modules can stay `pub(crate)`).
 pub use crate::card_row::{
-    column_near_x, draw_credit_label, draw_heading, draw_label, cw_caption, heading_flow, heading_lift_max, label_band, paint_visible,
+    column_near_x, credit_role_dy, draw_credit_label, draw_heading, draw_heading_c, draw_label, cw_caption, heading_flow, heading_parts, HeadingPart, HEADING_SOURCE_PAD, heading_lift_max, label_band, paint_visible,
     resume_bar, reveal, scroll_into_view, settled_top, settled_top_for, tile_rect, under_band, under_band_for, RowStyle, TileLabel,
     band_open_for, BAND_OPEN, CREDIT_ROLE_LEADING, LABEL_BAND_COLLAPSED, LABEL_EDGE_FADE, LEGACY_BAND_H, MAX_ROW_ITEMS, ROW_PITCH_FIXED, UNDER_LABEL_H,
 };
@@ -414,11 +420,7 @@ pub(crate) fn lifted_out<H: Host, S: CardSource<H>>(
     src: &S,
     i: usize,
 ) -> bool {
-    let out = f.lifted.is_some_and(|k| k.entry == entry && k.elem == src.elem(i));
-    if out {
-        crate::popover::set_lift_owns(true);
-    }
-    out
+    f.leaves_out(entry, src.elem(i))
 }
 
 /// The paging rule shared by both sections: ask for cards up to `end` once per `(len, end)`, and

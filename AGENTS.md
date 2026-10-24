@@ -58,6 +58,12 @@ the macOS simulator are valuable, but they cannot prove every device behavior.
   `[port webos]` to `webos`, `keymanager`, `system`, `player::ffi` or `port`. Fix the reference
   (`docs/module-layers.md` says where code belongs and how to cut an upward name) instead of
   adding a (file, member) pair to `ci/allow/layers.txt`, which is empty and only shrinks.
+- **Logic never performs IO.** A machine (a screen, a `data/` store, the session owner, the player's
+  foreground lifecycle, a route planner) starts no worker, reads no process-global registry and has
+  no `cfg(test)` fork: its work leaves as a typed effect the app's runners execute, and every result
+  returns as one addressed event. `ci/check-deps.sh` freezes today's sites in the ledgers under
+  `ci/allow/{workers,globals,forks,fxlanes}/`, which only shrink: a new site fails `make check`, and
+  a migration lands by deleting lines (`docs/sans-io.md`).
 - **Re-basing a stacked PR after the one below it squashes:** on the upper branch, `git merge
   <lower's final head>`, `git merge <squash>^`, `git merge -s ours <squash>`, then
   `git merge origin/main`. `-s ours` on the squash alone drops whatever `main` gained before it.
@@ -77,6 +83,9 @@ the macOS simulator are valuable, but they cannot prove every device behavior.
   the broken behavior. Observe the failure, implement the fix, then observe it pass.
 - Do not use `make -p` or `make -pn`; recursive variables such as `TV` are misleading there. Use
   the `make -s print-*` query targets documented in `docs/agent-reference.md`.
+- Edition 2021 keeps a `while let`/`match` scrutinee's temporaries alive for the whole body:
+  `while let Some(x) = m.lock().next() { io(x) }` holds the lock across `io`. Bind first
+  (`let next = m.lock().next();`) whenever the body blocks (#908).
 
 ## Build and verification
 
@@ -192,6 +201,10 @@ the macOS simulator are valuable, but they cannot prove every device behavior.
   is named. A count of late frames, an A/B between two builds, or a reading of the heartbeat line
   is not a diagnosis, and "probably the upload" is not a finding. State a cause only with the
   counter or trace evidence behind it; what was not measured is reported as not determined.
+- A main-thread stall (one long `navcommit=`/`results=` leg on a `FRAMEDROP` line, `--arm
+  framedrop=N`) is attributed by wrapping that leg's calls in temporary
+  `plx_base::diag::spans::span("label", || …)` on a scratch branch: the labels print in that
+  frame's `spans=` field, so one deploy names the call.
 - FFI, linkage, `dynlib!`, Starfish, ACB, curl, or bundled-FFmpeg changes require the
   `fw-compat-reviewer` custom agent (`fw_compat_reviewer` in Codex), or the equivalent manual
   review, before push.

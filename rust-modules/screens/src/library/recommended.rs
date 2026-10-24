@@ -44,6 +44,7 @@ use plx_ui::page_regions::{Arrival, BackStep, PageRegions};
 use plx_ui::page_header::{HeaderFocus, HeaderRow, PageHeader, PageHeaderSpec, Slot};
 use plx_ui::breadcrumb::Crumb;
 use plx_ui::widgets::Art;
+use plx_ui::xfade::Xfade;
 use plx_ui::{on_axis, Env, Rect, Spring, View};
 
 use super::identity::{KeyRegion, KeyRegistry};
@@ -85,6 +86,10 @@ pub(super) struct Row {
     pub(super) heading: Option<(GroupId, u32)>,
     pub(super) elems: Vec<u32>,
     pub(super) landscape: bool,
+    /// The Continue Watching deck of poster cards: its band follows
+    /// `registry::captions::deck_policy` (its progress line is always shown). Derived from the
+    /// publication; not canon.
+    deck: bool,
     pub(super) cards: ui_cards::Shelf,
     /// What the row's keys were registered from, to tell a publication that changed the row from
     /// one that did not ([`Basis`]). Derived; not canon.
@@ -186,6 +191,14 @@ pub struct RecommendedScreen {
     live: bool,
     ground: plx_ui::widgets::PageGround,
     ground_seeded: bool,
+    /// **The shelves' arrival** (`plx_ui::xfade`, the cross-fade the Library's `page_fade` and
+    /// Search's results are on): a page opened before its first publication has nothing on screen
+    /// to dissolve, so it is mounted dark ([`Xfade::mount`]) and the rows that land fade in. A page
+    /// whose hubs were already published never mounts it: its arrival is the route dip's. Draws
+    /// around the shelves, their headings and the Empty status caption (never the title row, the
+    /// ground, the spinner or the hold hint), and holds the shelves dormant while it arrives
+    /// ([`Self::shelves_on`]).
+    fade: Xfade,
     sweep_down: bool,
     /// The crumb row's pills (the focus capsule, the selection plate under "Recommended") and its
     /// focus pop: the shared `PageHeader` motion, held by the page that wears the row.
@@ -336,10 +349,10 @@ impl RecommendedScreen {
             run: ShelfRun::default(), target_run: ShelfRun::default(),
             scroll: Spring::at(0.0), scroll_target: 0.0, restore_scroll: None, viewports: Vec::new(),
             initial: true, readout: Readout::Loading, live: true,
-            ground: plx_ui::widgets::PageGround::new(), ground_seeded: false, sweep_down: true,
+            ground: plx_ui::widgets::PageGround::new(), ground_seeded: false, fade: Xfade::new(), sweep_down: true,
             header_capsules: plx_ui::widgets::TabStrip::new(), header_pop: plx_ui::widgets::CtlPop::new(),
             header_row: plx_ui::page_header::SharedRow::new(),
-            hold_hint: plx_ui::hold_hint::HoldHint::once_per_run(plx_ui::hold_hint::Kind::Library),
+            hold_hint: plx_ui::hold_hint::HoldHint::new(),
             hold_sent: None, rows_stale: false,
             #[cfg(test)] shelf_visits: std::cell::Cell::new(0),
         }
@@ -350,7 +363,7 @@ impl RecommendedScreen {
         "RecommendedScreen{entry:u32,instance:u32,kind:u32,scroll:{pos:f32,vel:f32},scroll_target:f32,",
         "restore_scroll:Option<f32>,live:bool,initial:bool,sweep_down:bool,epoch:Option<u32>,query:Option<u32>,",
         "shelf_publication:Option<(HubsId{epoch:u32,sid:u32,section:u64},revision:u64)>,ground_seeded:bool,",
-        "ground:PageGround,header_capsules:",
+        "fade:Xfade{phase:u8,t:f32},ground:PageGround,header_capsules:",
         "TabStrip{sel:Capsule{x:Spring{pos:f32,vel:f32},w:Spring{pos:f32,vel:f32},a:Spring{pos:f32,vel:f32},at:u32},foc:Capsule{x:Spring{pos:f32,vel:f32},w:Spring{pos:f32,vel:f32},a:Spring{pos:f32,vel:f32},at:u32}}",
         ",header_pop:{sp:[Spring{pos:f32,vel:f32};1],focused:Option<u32>},memory:PageMemory::Library,viewports:[LibraryViewport],",
         "shelves:[{id:str,group:u32,heading:Option<(group:u32,elem:u32)>,landscape:bool,elems:[u32],motion:ShelfMotion}],",
@@ -418,6 +431,9 @@ impl RecommendedScreen {
         }
         self.readout = if self.section.is_none() || !settled(hubs) { Readout::Loading }
             else if self.shelves.is_empty() { Readout::Empty } else { Readout::Rows };
+        // A page with no row yet has nothing on screen to dissolve: park the shelves dark and let
+        // them fade in once the first publication lands (`Xfade::tick` in the page's tick).
+        if self.readout == Readout::Loading && self.shelves.is_empty() && !self.fade.is_swapping() { self.fade.mount(); }
         self.relayout(cx.focus.current);
     }
 
@@ -503,7 +519,7 @@ impl RecommendedScreen {
             cards
         });
         let heading = self.seat_heading(section, shelf, index);
-        Row { id: shelf.id.clone(), group, heading, elems, landscape: shelf.landscape, cards, basis: Basis::of(shelf, query) }
+        Row { id: shelf.id.clone(), group, heading, elems, landscape: shelf.landscape, deck: shelf.is_continue && !shelf.landscape, cards, basis: Basis::of(shelf, query) }
     }
 
     /// A kept row that stands at another index now: its group and heading keys remember the index
@@ -532,9 +548,10 @@ impl RecommendedScreen {
     fn relayout(&mut self, focus: Option<FocusKey<u32>>) {
         // The poster rows follow the Under posters setting; a landscape row (an episode still) is
         // not a poster and keeps its own two-line block and band.
-        let policy = Some(crate::registry::captions::policy());
+        let policy = crate::registry::captions::policy();
         for row in &mut self.shelves {
-            row.cards.set_caption_policy(policy.filter(|_| !row.landscape));
+            let policy = if row.deck { crate::registry::captions::deck_policy(&policy) } else { policy };
+            row.cards.set_caption_policy(Some(policy).filter(|_| !row.landscape));
         }
         self.run.set(self.shelves.iter().map(|row| shelf_pitch(row.landscape, row.cards.band_h(), row.cards.band_expand())));
         self.target_run.set(self.shelves.iter().map(|row| shelf_pitch(row.landscape, row.cards.band_h(),
@@ -693,8 +710,9 @@ impl RecommendedScreen {
         }).collect()
     }
 
-    /// `(page alpha, focused card's pop scale)` — what a viewer sees of a focus arrival. The page
-    /// is opaque from its first frame (the container's own transition carries the arrival).
+    /// `(shelves' alpha, focused card's pop scale)` — what a viewer sees of a focus arrival. The
+    /// alpha is the shelves' dissolve (1 unless the page opened before its first publication; the
+    /// route dip's own fade is the container's), the same answer the library page gives.
     #[cfg(any(test, feature = "test-support"))]
     pub fn probe_arrival(&self, focus: Option<FocusKey<u32>>) -> (f32, Option<f32>) {
         let elem = focus.filter(|key| key.entry == self.entry).map(|key| key.elem);
@@ -702,7 +720,7 @@ impl RecommendedScreen {
             let col = elem.and_then(|elem| shelf.elems.iter().position(|key| *key == elem))?;
             Some(shelf.cards.drawn_pop(col, Some(col)))
         });
-        (1.0, scale)
+        (self.fade.alpha(), scale)
     }
 
     fn from_deck<H: LibraryLike>(&self, elem: u32, cx: &Cx<'_, H>) -> bool {
@@ -727,8 +745,19 @@ impl RecommendedScreen {
     /// Feed an event to every row's card section: focus moves and the tick that steps them. The
     /// page keeps its own press, hold and paging handling, so the sections' `Activate` / `Hold` /
     /// `Want` are not used: `CardSource::more` is `false`.
+    ///
+    /// **The shelves are held at rest while the page is not yet seen** (`Shelf::dormant`): under
+    /// the route dip's image (`page_image_held`) or while the shelves dissolve in (the page's
+    /// `fade`). Under the image a card that was lifted (a page returning from a Detail it froze
+    /// mid-ease) is put at rest on the first tick, as the Library's grid does, because an ease
+    /// stepped under the image would hold it past the dissolve; while the shelves dissolve in the
+    /// page is in view and the let-go eases like an unfocused shelf's. The seat the page makes for
+    /// itself then grows from rest the frame the page can be seen, on the standard lift spring, and
+    /// the caption band it opens and the heading it lifts play live, instead of landing whole where
+    /// an image hides them and keeps the dip's picture standing for half a second.
     fn shelves_on<H: LibraryLike>(&mut self, ev: &ScreenEvent<H>, cx: &Cx<'_, H>, fx: &mut Effects<'_, H>) {
         let hubs = H::section_hubs(cx);
+        let unseen = self.fade.is_arriving() || plx_ui::containers::transition::page_image_held();
         let focus = cx.focus.current.filter(|key| key.entry == self.entry).map(|key| key.elem);
         let ticking = matches!(ev, ScreenEvent::Tick(_));
         let mut asks = Vec::new();
@@ -739,6 +768,7 @@ impl RecommendedScreen {
             let at = focus.and_then(|elem| row.elems.iter().position(|key| *key == elem));
             let paging = at.is_some_and(|col| col.saturating_add(ui_cards::PAGE_EDGE_CARDS) >= row.elems.len());
             let src = HubSrc { elems: &row.elems, shelf, paging };
+            row.cards.dormant(unseen);
             let want = row.cards.on(ev, cx, &src, fx);
             if !ticking && at.is_none() { row.cards.reset_page_requests(); }
             // An ask whose edge focus has left is withdrawn before the landing can slide the window
@@ -918,6 +948,9 @@ impl RecommendedScreen {
             }
             ScreenEvent::Tick(tick) => {
                 self.sync(cx);
+                // The shelves dissolve in once the first publication is there (no swap is ever
+                // scheduled on this fader, so there is never a commit frame to apply).
+                self.fade.tick(tick.dt(), self.readout != Readout::Loading);
                 if self.live {
                     let dt = tick.dt();
                     let focused = cx.focus.current;
@@ -1126,9 +1159,10 @@ impl RecommendedScreen {
         self.run.window(-base, SCR_H - base)
     }
 
-    /// The painter the rows' cards are drawn through: the page's alpha.
+    /// The painter the rows (their headings and their cards) and the Empty status caption are drawn
+    /// through: the page's alpha under the shelves' own dissolve.
     fn shelf_painter<H: LibraryLike>(&self, f: &DrawFrame<'_, '_, H>) -> plx_ui::Painter {
-        f.painter.alpha(f.page_alpha)
+        f.painter.alpha(f.page_alpha * self.fade.alpha())
     }
 
     /// The page's header row, "<Library> › Recommended": the shared `PageHeader` configured with a
@@ -1180,7 +1214,7 @@ impl RecommendedScreen {
             plx_gfx::gfx::frame_clear(plx_ui::theme::CLEAR_RGB.0, plx_ui::theme::CLEAR_RGB.1, plx_ui::theme::CLEAR_RGB.2);
         });
         plx_ui::profile::phase("rc.ground", || self.ground.draw(f.painter.alpha(f.page_alpha), Rect::FULL));
-        let p = f.painter.alpha(f.page_alpha);
+        let p = self.shelf_painter(f);
         let env = Env::inert();
         self.draw_title(f);
         plx_ui::profile::phase("rc.rows", || {
@@ -1197,7 +1231,7 @@ impl RecommendedScreen {
                 } else {
                     ui_cards::draw_heading(p, &shelf.title, "", MARGIN_X, heading_y, SCR_W - 2.0 * MARGIN_X, f.measure);
                 }
-                row.cards.paint(f, self.shelf_painter(f), &self.hub_src(index, f.cx), self.shelf_frame(index));
+                row.cards.paint(f, p, &self.hub_src(index, f.cx), self.shelf_frame(index));
             }
         });
         match self.readout {
@@ -1209,7 +1243,7 @@ impl RecommendedScreen {
                 let caption = std::ffi::CString::new(plx_platform::i18n::msg::recommended_page_empty()).unwrap_or_default();
                 let frame = Rect::new(MARGIN_X, CONTENT_TOP + plx_ui::page_header::BLOCK_H, SCR_W - 2.0 * MARGIN_X, SCR_H - (CONTENT_TOP + plx_ui::page_header::BLOCK_H) - MARGIN_Y);
                 plx_ui::widgets::StatusOverlay::new(frame, &caption, plx_ui::widgets::StatusKind::Empty)
-                    .phase(f.cx.tick.ms).draw_measured(&env, f.painter.alpha(f.page_alpha), f.cx.measure);
+                    .phase(f.cx.tick.ms).draw_measured(&env, p, f.cx.measure);
             }
             Readout::Rows => {}
         }
@@ -1289,6 +1323,7 @@ impl LogicalState for RecommendedScreen {
             c.u32(id.epoch).u32(u32::from(id.sid.raw())).u64(id.section as u64).u64(revision);
         });
         c.bool(self.ground_seeded);
+        self.fade.write(c);
         self.ground.write_motion(c);
         self.header_capsules.write_motion(c);
         self.header_pop.write_motion(c);
@@ -1298,7 +1333,7 @@ impl LogicalState for RecommendedScreen {
         c.seq(self.shelves.len());
         for row in &self.shelves {
             // `basis` is what the keys were registered from: derived from the publication, not canon.
-            let Row { id, group, heading, elems, landscape, cards, basis: _ } = row;
+            let Row { id, group, heading, elems, landscape, deck: _, cards, basis: _ } = row;
             c.str(id).u32(group.0);
             c.option(*heading, |c, (group, elem)| { c.u32(group.0).u32(elem); });
             c.bool(*landscape).seq(elems.len());

@@ -175,6 +175,7 @@ const VS_ART_WASH: &CStr = glsl!(
 const FS_BLUR: &CStr = glsl!("shaders/fs_blur.frag");
 const FS_GLASS: &CStr = glsl_dithered!("shaders/fs_glass.frag");
 const FS_FLAT: &CStr = glsl!("shaders/fs_flat.frag");
+const FS_RAMP: &CStr = glsl!("shaders/fs_ramp.frag");
 const VS_ART_SCRIM: &CStr = glsl!("shaders/vs_art_scrim.vert");
 const FS_ART_SCRIM: &CStr = glsl!("shaders/fs_art_scrim.frag");
 const GL_VERTEX_SHADER: c_uint = 0x8B31;
@@ -494,7 +495,7 @@ fn frame_clear_alpha(r: f32, g: f32, b: f32, a: f32) {
     if !frame_clear_allowed() {
         return;
     }
-    probed_clear(|| {
+    probed_clear(clears_presented_fb, || {
         plx_base::diag::spans::span("clear", || unsafe {
             glClearColor(r, g, b, a);
             glClear(GL_COLOR_BUFFER_BIT);
@@ -502,9 +503,28 @@ fn frame_clear_alpha(r: f32, g: f32, b: f32, a: f32) {
     });
 }
 
-/// Run `clear`, bracketed by the installed probe when [`arm_clear_probe`] offered it this frame.
-fn probed_clear(clear: impl FnOnce()) {
-    let probe = CLEAR_PROBE.with(|p| p.armed.replace(false).then(|| p.hooks.get())).flatten();
+/// Does a clear issued now write the framebuffer the frame is PRESENTED from? Only that one can be
+/// the back-buffer wait. A page replayed into a blur source ([`blur_source_pass`], the tap target
+/// bound by `blur_snapshot_direct`) or drawn into a host snapshot ([`plx_base::surface::PageTarget`],
+/// which redirects [`plx_base::surface::default_fb`]) clears an FBO instead. Two flag reads, no GL
+/// query: the hooks are installed in every build, so this runs on the first clear of every frame.
+fn clears_presented_fb() -> bool {
+    !blur_source_pass() && plx_base::surface::default_fb() == plx_base::surface::frame_fb()
+}
+
+/// Run `clear`, bracketed by the installed probe when [`arm_clear_probe`] offered it this frame
+/// and `presented` says this clear writes the presented framebuffer. A clear of any other target
+/// leaves the probe armed for the frame's real first framebuffer command: on a frame that rebuilds
+/// a glass source, the page's own clear runs first INSIDE the source replay, into the tap target,
+/// and bracketing that one priced a 0.04 ms wait while the real one (the visible page's clear,
+/// 8-18 ms on the television's pong scenes) went unpriced. `presented` is asked only when offered.
+fn probed_clear(presented: impl FnOnce() -> bool, clear: impl FnOnce()) {
+    let probe = CLEAR_PROBE
+        .with(|p| (p.armed.get() && presented()).then(|| {
+            p.armed.set(false);
+            p.hooks.get()
+        }))
+        .flatten();
     if let Some((waiting, _)) = probe {
         waiting();
     }
@@ -524,8 +544,9 @@ pub fn install_clear_probe(waiting: fn(), acquired: fn()) {
 }
 
 /// Offer the installed probe the next clear, and only the next one: the first clear that actually
-/// reaches the framebuffer after this call brackets the wait, later clears of the same frame (a
-/// popover's, a second pass) do not, so one frame yields one waiting/acquired pair. The loop calls
+/// reaches the PRESENTED framebuffer after this call brackets the wait (a clear into a blur source
+/// or a host snapshot does not take it), later clears of the same frame (a popover's, a second
+/// pass) do not, so one frame yields one waiting/acquired pair. The loop calls
 /// this once per non-player frame; the player clears from the loop and brackets that itself.
 pub fn arm_clear_probe() {
     CLEAR_PROBE.with(|p| p.armed.set(p.hooks.get().is_some()));
@@ -594,6 +615,14 @@ static mut AL_BL: c_int = 0;
 static mut FPROG: c_uint = 0;
 static mut FL_RECT: c_int = 0;
 static mut FL_COL: c_int = 0;
+/// The two-stop ramp program (`shaders/fs_ramp.frag`) and its three uniforms; 0 when it failed to
+/// compile or link (it is built with `link_optional_program`, so a driver's compile rejection
+/// degrades instead of exiting), in which case a square, unfocused gradient takes `fs_src.frag`'s
+/// flat path as before.
+static mut RPROG: c_uint = 0;
+static mut RP_RECT: c_int = 0;
+static mut RP_TOP: c_int = 0;
+static mut RP_BOT: c_int = 0;
 static mut UL_DITHER: c_int = 0;
 // The artwork's bottom gradient has its own small program: no card focus/rim/pill work.
 static mut AS_PROG: c_uint = 0;
@@ -1124,6 +1153,21 @@ pub fn init_gl() {
             glUniform2f(glGetUniformLocation(FPROG, c"u_screen".as_ptr()), SCR_W, SCR_H);
         }
 
+        // Optional on purpose: `link_program` exits the process on a compile rejection
+        // (`gfx_compile`), which would make `draw_ramp`'s fallback unreachable for the failure a
+        // driver is likeliest to give a new program. `try_compile` logs the compile error itself.
+        RPROG = link_optional_program(VS_SRC.as_ptr(), FS_RAMP.as_ptr()).unwrap_or_else(|| {
+            log("ramp prog compile/link failed — square gradients take the fill program's flat path");
+            0
+        });
+        if RPROG != 0 {
+            RP_RECT = glGetUniformLocation(RPROG, c"u_rect".as_ptr());
+            RP_TOP = glGetUniformLocation(RPROG, c"u_colTop".as_ptr());
+            RP_BOT = glGetUniformLocation(RPROG, c"u_colBot".as_ptr());
+            use_prog(RPROG);
+            glUniform2f(glGetUniformLocation(RPROG, c"u_screen".as_ptr()), SCR_W, SCR_H);
+        }
+
         // The underlay field. `vs_src.vert` because a field is drawn 1:1 over its rect, so the
         // unit quad IS the texture coordinate and there is nothing for a `u_uvrect` to express.
         // DITHERED: `fs_field.frag` is built with `glsl_dithered!`, so its paired vertex source
@@ -1277,6 +1321,41 @@ fn same_colour(top: *const f32, bot: *const f32) -> bool {
     unsafe { (0..4).all(|i| *top.add(i) == *bot.add(i)) }
 }
 
+/// Which program fills a [`draw_rect`] quad. The first two are the cases where `fs_src.frag` would
+/// have taken its own flat fast path anyway (the quad is exactly the rect, no AA bleed), so they
+/// draw the same pixels from a smaller program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RectFill {
+    /// One colour: `shaders/fs_flat.frag` ([`draw_flat`]).
+    Flat,
+    /// Two colours, top to bottom: `shaders/fs_ramp.frag` ([`draw_ramp`]).
+    Ramp,
+    /// Everything else (rounded, focused): `fs_src.frag`'s SDF fill.
+    Sdf,
+}
+
+/// The program for a rect of this corner `radius` and `focus`, whose top and bottom colours are
+/// (`one_colour`) or are not the same fill. The `radius`/`focus` thresholds are `fs_src.frag`'s own
+/// flat-path test (`u_radius < 0.5 && u_focus < 0.001`), so a rect is routed off that program only
+/// when the shader would have skipped the SDF for it; `pad` is not an input because that path never
+/// reads it.
+///
+/// The test is made in `f32` here. On the device `u_focus` is a mediump uniform, so the shader's
+/// `u_focus < 0.001` may compare in fp16 and round a focus just under 1e-3 differently; no caller
+/// passes such a value on a square rect, and `draw_flat` already had the same property.
+#[inline]
+fn rect_fill(radius: f32, focus: f32, one_colour: bool) -> RectFill {
+    if radius < 0.5 && focus < 0.001 {
+        if one_colour {
+            RectFill::Flat
+        } else {
+            RectFill::Ramp
+        }
+    } else {
+        RectFill::Sdf
+    }
+}
+
 /// One colour over an axis-aligned quad through `shaders/fs_flat.frag` — the cheapest fragment this
 /// renderer has, and the one every full-screen scrim is. Falls back to the fill program's flat path
 /// (same pixels, ~2 shader words a fragment dearer) when the flat program failed to link.
@@ -1301,6 +1380,35 @@ unsafe fn draw_flat(x: f32, y: f32, w: f32, h: f32, col: *const f32) {
     use_prog(FPROG); // u_screen is set once at init (uniforms are per-program state)
     glUniform4f(FL_RECT, x, y, w, h);
     glUniform4fv(FL_COL, 1, col);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+/// A top-to-bottom two-stop gradient over an axis-aligned quad through `shaders/fs_ramp.frag` — the
+/// hero backdrop's ramp bands. Falls back to the fill program's flat path (same pixels, dearer per
+/// fragment) when the ramp program failed to compile or link. The quad is exactly `x, y, w, h` on both paths,
+/// the AA bleed being the SDF path's alone.
+unsafe fn draw_ramp(x: f32, y: f32, w: f32, h: f32, top: *const f32, bot: *const f32) {
+    if RPROG == 0 {
+        use_prog(PROG);
+        glUniform4f(LOC_RECT, x, y, w, h);
+        glUniform2f(LOC_SIZE, w, h);
+        glUniform1f(LOC_PAD, 0.0);
+        glUniform1f(LOC_RADIUS, 0.0);
+        glUniform1f(LOC_RADR, 0.0);
+        glUniform4fv(LOC_COLTOP, 1, top);
+        glUniform4fv(LOC_COLBOT, 1, bot);
+        glUniform1f(LOC_FOCUS, 0.0);
+        glUniform1f(LOC_RIMW, 0.0);
+        glUniform4f(LOC_RIMCOL, 0.0, 0.0, 0.0, 0.0);
+        glUniform1f(LOC_RIMTOP, 0.0);
+        pill_off();
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        return;
+    }
+    use_prog(RPROG); // u_screen is set once at init (uniforms are per-program state)
+    glUniform4f(RP_RECT, x, y, w, h);
+    glUniform4fv(RP_TOP, 1, top);
+    glUniform4fv(RP_BOT, 1, bot);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
 
@@ -1376,22 +1484,33 @@ pub fn draw_rect(
         return;
     }
     unsafe {
-        // `pad` is not in the condition: `fs_src.frag`'s own flat path never reads it either, so
-        // the two programs draw the same quad for a square, unfocused rect whatever it was given.
-        if radius < 0.5 && focus < 0.001 && same_colour(top, bot) {
-            draw_flat(x, y, w, h, top);
-            return;
+        // `pad` is not an input to the routing: `fs_src.frag`'s own flat path never reads it
+        // either, so the programs draw the same quad for a square, unfocused rect whatever it was
+        // given. A uniform one goes to the flat program, a two-stop gradient to the ramp program.
+        match rect_fill(radius, focus, same_colour(top, bot)) {
+            RectFill::Flat => {
+                draw_flat(x, y, w, h, top);
+                return;
+            }
+            RectFill::Ramp => {
+                draw_ramp(x, y, w, h, top, bot);
+                return;
+            }
+            RectFill::Sdf => {}
         }
-        // A flat two-stop gradient STAYS on this program, and that was measured rather than assumed
-        // (`plxnative-hwcnt`, 2026-09-02): routed through the ambient program instead, the hero's
-        // two full-width ramp quads made the frame 0.6M GPU cycles DEARER, because `fs_src`'s
-        // early-out below is one `mix` where a four-corner field is three. What this program pays
-        // for on a flat quad is its size — Midgard sizes the register file for the whole shader,
-        // so the capsule arcs and the glow lower the occupancy of a path that never runs them —
-        // and that is still cheaper than the extra arithmetic.
+        // History, because the obvious reroute for a flat gradient is not the one that paid. In
+        // `plxnative-hwcnt` on 2026-09-02, sending the hero's two full-width ramp quads through the
+        // AMBIENT program made the frame 0.6M GPU cycles DEARER, because `fs_src`'s early-out was
+        // one `mix` where a four-corner field is three. What the ramps were paying on THIS program
+        // was its size (2026-10-24: ~3 arithmetic words a fragment for what is one `mix`):
+        // Midgard sizes the register file for the whole shader, so the capsule arcs and the glow
+        // lowered the occupancy of a path that never ran them, and the uniform test ahead of the
+        // `mix` ran on every fragment. `draw_ramp` is the same `mix` in a program with nothing else
+        // in it, which is why it, and not the ambient field, is where a square gradient goes.
         use_prog(PROG);
-        // Only the rounded/focus SDF path needs the AA bleed; a plain rect takes the fast-path fill
-        // and must stay exactly its bounds (a 1px overhang would fatten scrims/backgrounds).
+        // Only the rounded/focus SDF path needs the AA bleed; a plain rect (the flat and ramp
+        // programs above, `fs_src.frag`'s own fast path) must stay exactly its bounds (a 1px
+        // overhang would fatten scrims/backgrounds).
         let aa = if radius >= 0.5 || focus > 0.001 {
             AA_BLEED
         } else {
@@ -1797,7 +1916,9 @@ fn shadow_skip_rect(quad: [f32; 4], blur: f32, radius: f32, off: f32, cut: f32) 
     let (ox, oy) = (quad[0] + blur, quad[1] + blur - off);
     let k = if cut >= 0.0 {
         // Rounded occluder, corner radius rc: the axis-aligned rect inset by rc(1 - 1/sqrt 2) has
-        // its corners on the arcs' 45-degree points, so it lies inside the shape; +1 px is margin.
+        // its corners on the arcs' 45-degree points, so it lies inside the shape; +1 px is margin,
+        // which also covers the cut's coverage ramp (fs_shadow's `CUT_AA`, 0.75 px: the rect lies
+        // where the coverage is exactly 0, not only where the sd is negative).
         let rc = cut.min(bw * 0.5).min(bh * 0.5);
         rc * (1.0 - std::f32::consts::FRAC_1_SQRT_2) + 1.0
     } else {
@@ -7604,6 +7725,7 @@ mod tests {
             ("fs_src.frag", FS_SRC),
             ("fs_shadow.frag", FS_SHADOW),
             ("fs_flat.frag", FS_FLAT),
+            ("fs_ramp.frag", FS_RAMP),
             ("fs_art_scrim.frag", FS_ART_SCRIM),
             ("fs_ambient.frag (plain twin)", FS_AMBIENT_PLAIN),
         ] {
@@ -7689,6 +7811,101 @@ mod tests {
         assert!(same_colour(a.as_ptr(), a.as_ptr()), "the same array twice is the common call");
         assert!(same_colour(a.as_ptr(), b.as_ptr()), "equal components are the same fill");
         assert!(!same_colour(a.as_ptr(), c.as_ptr()), "one component apart is a gradient");
+    }
+
+    /// **`draw_rect`'s program choice, as a pure function.** A square, unfocused rect never needs the
+    /// SDF: one colour is the flat program's, two colours the ramp program's. Rounding or focus
+    /// keeps the fill program, whatever the colours are. The thresholds are `fs_src.frag`'s own
+    /// flat-path test (`u_radius < 0.5`, `u_focus < 0.001`), so each boundary is pinned from both
+    /// sides, and a NaN input (every comparison false) lands on the SDF program, as it does in the
+    /// shader.
+    #[test]
+    fn a_square_unfocused_rect_is_flat_or_ramp_and_anything_else_is_the_sdf_fill() {
+        assert_eq!(rect_fill(0.0, 0.0, true), RectFill::Flat, "one colour: the scrim");
+        assert_eq!(rect_fill(0.0, 0.0, false), RectFill::Ramp, "two colours: the hero's ramp band");
+        for one_colour in [true, false] {
+            assert_eq!(rect_fill(14.0, 0.0, one_colour), RectFill::Sdf, "rounded");
+            assert_eq!(rect_fill(0.0, 1.0, one_colour), RectFill::Sdf, "focused");
+            assert_eq!(rect_fill(14.0, 1.0, one_colour), RectFill::Sdf, "rounded and focused");
+            assert_eq!(rect_fill(0.5, 0.0, one_colour), RectFill::Sdf, "radius 0.5 is the first rounded");
+            assert_eq!(rect_fill(0.001, 0.001, one_colour), RectFill::Sdf, "focus 0.001 is the first focused");
+            assert_eq!(rect_fill(f32::NAN, 0.0, one_colour), RectFill::Sdf, "NaN radius");
+            assert_eq!(rect_fill(0.0, f32::NAN, one_colour), RectFill::Sdf, "NaN focus");
+        }
+        assert_eq!(rect_fill(0.499, 0.0, false), RectFill::Ramp, "just under the radius threshold");
+        assert_eq!(rect_fill(0.0, 0.000_999, false), RectFill::Ramp, "just under the focus threshold");
+        assert_eq!(rect_fill(0.0, 0.000_999, true), RectFill::Flat);
+        // The same pair test feeds it, so the common call (one array passed twice) is a scrim.
+        let a = [0.0f32, 0.0, 0.0, 0.5];
+        let b = [0.0f32, 0.0, 0.0, 0.0];
+        assert_eq!(rect_fill(0.0, 0.0, same_colour(a.as_ptr(), a.as_ptr())), RectFill::Flat);
+        assert_eq!(rect_fill(0.0, 0.0, same_colour(a.as_ptr(), b.as_ptr())), RectFill::Ramp);
+    }
+
+    /// **The ramp program is `fs_src.frag`'s flat path and nothing else.** The picture only stays
+    /// the same if the expression, the interpolation and every precision qualifier on it are the
+    /// fill program's own, so each is read out of both sources and compared; the draw must keep the
+    /// rect's exact bounds (no AA bleed, which is the SDF path's alone), book the draw in the
+    /// overdraw ledger BEFORE choosing a program, and fall back to the fill program rather than
+    /// draw nothing when the ramp program did not compile or link. Each arm of the routing must call
+    /// ITS program (a swap would still contain both calls), and the ramp program must be built from
+    /// `VS_SRC` + `FS_RAMP` through `link_optional_program`: `link_program` exits the process on a
+    /// compile rejection, so the fallback above would never be reached for it.
+    #[test]
+    fn the_ramp_program_is_the_fill_programs_flat_path_in_a_smaller_shader() {
+        let ramp = shader_code(FS_RAMP);
+        let fill = shader_code(FS_SRC);
+        for line in [
+            "precision mediump float;",
+            "varying highp vec2 v_uv;",
+            "uniform vec4 u_colTop;",
+            "uniform vec4 u_colBot;",
+            "float vy = v_uv.y;",
+            "gl_FragColor = mix(u_colTop, u_colBot, vy);",
+        ] {
+            assert!(ramp.lines().any(|l| l.trim() == line), "fs_ramp.frag must carry `{line}`");
+            assert!(fill.lines().any(|l| l.trim() == line), "fs_src.frag's flat path must carry `{line}`");
+        }
+        assert!(!ramp.contains("u_radius") && !ramp.contains("u_focus"), "no SDF inputs");
+        assert!(!ramp.contains("if (") && !ramp.contains("discard"), "no branch: that is the point");
+
+        let src = include_str!("gfx.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests").expect("the unit tests")];
+        let body = |head: &str| {
+            let from = prod.find(head).unwrap_or_else(|| panic!("`{head}` is gone"));
+            let rest = &prod[from..];
+            &rest[..rest.find("\n}\n").expect("the end of the function")]
+        };
+        let ramp_draw = body("unsafe fn draw_ramp(");
+        assert!(ramp_draw.contains("glUniform4f(RP_RECT, x, y, w, h);"), "exactly the rect's bounds");
+        assert!(ramp_draw.contains("if RPROG == 0 {") && ramp_draw.contains("use_prog(PROG);"), "the fallback");
+        let rect_draw = body("pub fn draw_rect(");
+        let (gated, routed) = (
+            rect_draw.find("gate(Class::Rect, x, y, w, h)").expect("the ledger gate"),
+            rect_draw.find("rect_fill(radius, focus, same_colour(top, bot))").expect("the routing"),
+        );
+        assert!(gated < routed, "the draw is booked in the ledger before a program is chosen");
+        // Each arm is cut out of the routing `match` (up to the next arm) and must call its own
+        // program and not the other's.
+        let arm = |head: &str, next: &str| {
+            let from = rect_draw.find(head).unwrap_or_else(|| panic!("`{head}` is gone"));
+            let rest = &rect_draw[from..];
+            &rest[..rest.find(next).unwrap_or_else(|| panic!("`{next}` no longer follows `{head}`"))]
+        };
+        let flat_arm = arm("RectFill::Flat =>", "RectFill::Ramp =>");
+        let ramp_arm = arm("RectFill::Ramp =>", "RectFill::Sdf =>");
+        assert!(
+            flat_arm.contains("draw_flat(x, y, w, h, top)") && !flat_arm.contains("draw_ramp("),
+            "the Flat arm draws through draw_flat with the one colour"
+        );
+        assert!(
+            ramp_arm.contains("draw_ramp(x, y, w, h, top, bot)") && !ramp_arm.contains("draw_flat("),
+            "the Ramp arm draws through draw_ramp with both colours"
+        );
+        assert!(
+            prod.contains("RPROG = link_optional_program(VS_SRC.as_ptr(), FS_RAMP.as_ptr())"),
+            "the ramp program is vs_src.vert + fs_ramp.frag, linked optionally so a compile rejection falls back"
+        );
     }
 
     #[test]
@@ -8793,12 +9010,13 @@ mod clear_probe_tests {
             || LOG.with(|l| l.borrow_mut().push("acquired")),
         );
         let clear = || LOG.with(|l| l.borrow_mut().push("clear"));
-        super::probed_clear(clear);
+        let panel = || true;
+        super::probed_clear(panel, clear);
         super::arm_clear_probe();
-        super::probed_clear(clear);
-        super::probed_clear(clear);
+        super::probed_clear(panel, clear);
+        super::probed_clear(panel, clear);
         super::arm_clear_probe();
-        super::probed_clear(clear);
+        super::probed_clear(panel, clear);
         let log = LOG.with(|l| std::mem::take(&mut *l.borrow_mut()));
         assert_eq!(
             log,
@@ -8806,6 +9024,29 @@ mod clear_probe_tests {
             "an unarmed clear is bare; an armed frame gets one pair, and its second clear none"
         );
     }
+
+    /// A frame that rebuilds a glass source clears the tap target first (the page's own clear,
+    /// replayed into the source) and the presented framebuffer second. The probe prices the back
+    /// buffer wait, which only the second can be, so the first must leave it armed.
+    #[test]
+    fn an_fbo_clear_leaves_the_probe_for_the_presented_one() {
+        super::install_clear_probe(
+            || LOG.with(|l| l.borrow_mut().push("waiting")),
+            || LOG.with(|l| l.borrow_mut().push("acquired")),
+        );
+        let clear = || LOG.with(|l| l.borrow_mut().push("clear"));
+        super::arm_clear_probe();
+        super::probed_clear(|| false, clear);
+        super::probed_clear(|| true, clear);
+        super::probed_clear(|| true, clear);
+        let log = LOG.with(|l| std::mem::take(&mut *l.borrow_mut()));
+        assert_eq!(
+            log,
+            ["clear", "waiting", "clear", "acquired", "clear"],
+            "the source pass's clear is bare; the presented clear after it takes the pair"
+        );
+    }
+
 }
 
 #[cfg(test)]
@@ -8849,13 +9090,21 @@ mod shadow_band_tests {
         len + q[0].max(q[1]).min(0.0) - r
     }
 
-    /// `fs_shadow.frag`'s discard test for a fragment at `pos` (authored px) of `quad`.
+    /// `fs_shadow.frag`'s `CUT_AA`, parsed from the shader itself.
+    fn cut_aa() -> f32 {
+        let src = super::FS_SHADOW.to_str().unwrap();
+        let at = src.find("#define CUT_AA").expect("the cut's ramp half-width");
+        src[at..].lines().next().unwrap().split_whitespace().nth(2).unwrap().parse().unwrap()
+    }
+
+    /// `fs_shadow.frag`'s discard test (the cut's coverage is exactly 0) for a fragment at `pos`
+    /// (authored px) of `quad`.
     fn discards(quad: [f32; 4], blur: f32, radius: f32, off: f32, cut: f32, pos: [f32; 2]) -> bool {
         let p = [pos[0] - (quad[0] + quad[2] * 0.5), pos[1] - (quad[1] + quad[3] * 0.5)];
         let hsz = [(quad[2] * 0.5 - blur).max(0.0), (quad[3] * 0.5 - blur).max(0.0)];
         let pq = [p[0], p[1] + off];
         if cut >= 0.0 {
-            sd_box(pq, hsz, cut.min(hsz[0].min(hsz[1]))) < 0.0
+            sd_box(pq, hsz, cut.min(hsz[0].min(hsz[1]))) <= -cut_aa()
         } else {
             pq[0].abs() < hsz[0] - (radius + 1.0) && pq[1].abs() < hsz[1] - (radius + 1.0)
         }
@@ -8933,7 +9182,8 @@ mod shadow_band_tests {
         assert_eq!((n, b[0]), (1, quad));
     }
 
-    /// Everything inside the skip rect (corners included) is a fragment the shader discards.
+    /// Everything inside the skip rect (corners included) is a fragment the shader discards: its cut
+    /// coverage is exactly 0, so skipping it changes no pixel.
     #[test]
     fn shadow_skip_rect_is_certainly_discarded() {
         for (w, h, r, blur, off, cut) in cases() {
@@ -8977,8 +9227,9 @@ mod shadow_band_tests {
     /// Blur larger than the box, tiny boxes, and an occluder pushed off the quad all fall back to
     /// the whole quad or to well-formed bands.
     /// **The cut's box pre-test only skips work, never a decision.** `fs_shadow.frag` evaluates the
-    /// occluder's rounded `sdBox` only for a fragment inside the occluder's bounding box: outside it,
-    /// a component of `q` is >= the corner radius, so `sdBox >= 0` and the fragment is kept anyway.
+    /// occluder's rounded `sdBox` only for a fragment inside the occluder's bounding box grown by
+    /// `CUT_AA`: outside it, a component of `q` is >= the corner radius + `CUT_AA`, so
+    /// `sdBox >= CUT_AA`, the coverage ramp is full and the fragment is kept at full strength.
     /// Graded on the replica over every case and a dense grid, and the shader must run the box test
     /// BEFORE the SDF it skips. Red on the build whose cut ran `sdBox` on every band fragment (most
     /// of them far outside the panel).
@@ -8994,7 +9245,7 @@ mod shadow_band_tests {
         let cut = code.find("if (u_cut >= 0.0)").expect("the cut branch");
         let tail = &code[cut..];
         let sdf = tail.find("sdBox(pq").expect("the cut's SDF");
-        let boxed = tail.find("all(lessThan(abs(pq), hsz))");
+        let boxed = tail.find("all(lessThan(abs(pq), hsz + vec2(CUT_AA)))");
         assert!(boxed.is_some_and(|b| b < sdf), "the bounding-box test must guard the cut's sdBox");
         for (w, h, r, blur, off, cut) in cases().into_iter().filter(|c| c.5 >= 0.0) {
             let quad = quad_of(w, h, blur);
@@ -9004,8 +9255,9 @@ mod shadow_band_tests {
                 for j in 0..=96 {
                     let pos = [quad[0] + quad[2] * i as f32 / 96.0, quad[1] + quad[3] * j as f32 / 96.0];
                     let pq = [pos[0] - cx, pos[1] - cy + off];
-                    if !(pq[0].abs() < hsz[0] && pq[1].abs() < hsz[1]) {
-                        assert!(!discards(quad, blur, r, off, cut, pos), "{w}x{h} r{r} cut{cut}: {pos:?} outside the box is discarded");
+                    if !(pq[0].abs() < hsz[0] + cut_aa() && pq[1].abs() < hsz[1] + cut_aa()) {
+                        let sd = sd_box(pq, hsz, cut.min(hsz[0].min(hsz[1])));
+                        assert!(sd >= cut_aa() - 1e-3, "{w}x{h} r{r} cut{cut}: {pos:?} outside the grown box has coverage < 1 (sd {sd})");
                     }
                 }
             }

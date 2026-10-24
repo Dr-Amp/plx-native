@@ -4,16 +4,14 @@ use crate::registry::tile_facts;
 use plx_data::search::scope::{ScopeSource, SourceScopeSnapshot};
 use plx_ui::consts::{MARGIN_X, SCR_H};
 use plx_ui::label::{HAlign, Label, VAlign};
+use plx_ui::vstack::{Anchor, VStack};
 use plx_ui::widgets::{Art, Button, StatusKind, StatusOverlay};
 use plx_ui::{theme, Env, Painter, View};
 use std::ffi::{CStr, CString};
-use std::os::raw::c_int;
 
 const CARET_W: f32 = 5.0;
 const CARET_GAP: f32 = 8.0;
 const GHOST_GAP: f32 = theme::size::BODY as f32;
-const COUNT_GAP: f32 = theme::space::SM;
-const SOURCE_PAD: f32 = theme::space::XS;
 
 #[derive(Default)]
 pub(super) struct Resources {
@@ -157,31 +155,20 @@ pub(super) fn draw<H: SearchLike>(screen: &SearchScreen, f: &mut DrawFrame<'_, '
         }
         let slot = layout::ordinal(row.kind) as usize;
         let title = &screen.render.titles[slot];
-        let cap = f.cx.measure.cap_h(theme::size::HEADLINE);
         let source = if screen.owner_row == Some(i) && screen.owner_alpha.pos > OWNER_FLOOR {
             screen.render.owner.as_c_str()
         } else {
             c""
         };
-        heading_flow(
+        plx_ui::cards::draw_heading_c(
+            p,
             title,
             &screen.render.counts[slot],
             source,
-            |run, dx, size, bold, ink, faded| {
-                let mut label = Label::new(run.as_ptr(), size, ink).v(VAlign::Baseline);
-                if bold != 0 {
-                    label = label.bold();
-                }
-                label.draw(
-                    if faded {
-                        p.alpha(screen.owner_alpha.pos.clamp(0.0, 1.0))
-                    } else {
-                        p
-                    },
-                    Rect::new(MARGIN_X + dx, top - shelf.heading_lift(), 0.0, cap),
-                );
-                f.cx.measure.width(run, size, bold != 0)
-            },
+            MARGIN_X,
+            top - shelf.heading_lift(),
+            screen.owner_alpha.pos,
+            f.cx.measure,
         );
         if let Some(src) = screen.row_cards(H::search(f.cx), i) {
             shelf.draw(f, p, &src, frame);
@@ -366,19 +353,29 @@ fn empty<H: SearchLike>(screen: &SearchScreen, f: &DrawFrame<'_, '_, H>, p: Pain
     let statement = cstring(&statement);
     let hh = f.cx.measure.cap_h(theme::size::CAPTION);
     let sh = f.cx.measure.cap_h(theme::size::TITLE);
-    let top = rect.y + (rect.h - hh - sh - theme::space::MD) * 0.5;
+    let (header_y, statement_y) = empty_pair(rect, hh, sh);
     Label::new(header.as_ptr(), theme::size::CAPTION, theme::TEXT_TERTIARY)
         .h(HAlign::Center)
         .v(VAlign::CapTop)
-        .draw(p, Rect::new(rect.x, top, rect.w, 0.0));
+        .draw(p, Rect::new(rect.x, header_y, rect.w, 0.0));
     Label::new(statement.as_ptr(), theme::size::TITLE, theme::TEXT_HEADING)
         .bold()
         .h(HAlign::Center)
         .v(VAlign::CapTop)
-        .draw(
-            p,
-            Rect::new(rect.x, top + hh + theme::space::MD, rect.w, 0.0),
-        );
+        .draw(p, Rect::new(rect.x, statement_y, rect.w, 0.0));
+}
+
+/// The empty state's two cap tops: the header's band over the statement's, one MD apart, the pair
+/// centred in `area`. `Item` is the search's own row type here, so the stack's is named by its path.
+pub(super) fn empty_pair(area: Rect, header_h: f32, statement_h: f32) -> (f32, f32) {
+    let items = [plx_ui::hstack::Item::new(header_h), plx_ui::hstack::Item::new(statement_h)];
+    let pair = VStack::new(
+        &items,
+        theme::space::MD,
+        Anchor::Centre(area.y + area.h * 0.5),
+    );
+    let at = |i| pair.span(i).map_or(area.y, |(y, _)| y);
+    (at(0), at(1))
 }
 
 /// What a result tile draws. A collection always draws through `Art::Poster` with its row, so the
@@ -523,34 +520,6 @@ fn header_of(state: EmptyState) -> &'static CStr {
 
 fn no_results_line(q: &str) -> String {
     plx_platform::i18n::msg::browse_search_no_results(q)
-}
-
-fn heading_flow(
-    title: &CStr,
-    count: &CStr,
-    source: &CStr,
-    mut run: impl FnMut(&CStr, f32, c_int, c_int, [f32; 4], bool) -> f32,
-) -> f32 {
-    let mut dx = run(
-        title,
-        0.0,
-        theme::size::HEADLINE,
-        1,
-        theme::TEXT_HEADING,
-        false,
-    );
-    if !count.is_empty() {
-        dx += COUNT_GAP;
-        dx += run(count, dx, theme::size::BODY, 0, theme::TEXT_TERTIARY, false);
-    }
-    if source.is_empty() {
-        return dx;
-    }
-    dx += SOURCE_PAD;
-    dx += run(c"·", dx, theme::size::BODY, 0, theme::TEXT_SEPARATOR, true);
-    dx += SOURCE_PAD;
-    dx += run(source, dx, theme::size::BODY, 0, theme::TEXT_TERTIARY, true);
-    dx
 }
 
 fn source_label(source: &ScopeSource) -> String {
@@ -1127,40 +1096,48 @@ mod tests {
 
     #[test]
     fn the_heading_states_its_count_and_annotates_only_a_borrowed_source() {
-        let w = |s: &str, sz: c_int| s.chars().count() as f32 * sz as f32 * 0.5;
-        type Run = (String, f32, c_int, c_int, [f32; 4], bool);
-        let runs = |title: &str, count: &str, source: &str| {
+        use plx_ui::cards::HEADING_SOURCE_PAD;
+        let _g = plx_base::testlock::serial();
+        // PAINTED through the call Search's result rows make, read back run by run, left to right
+        let runs = |title: &str, count: &str, source: &str, alpha: f32| {
             let (t, c, s) = (cs(title), cs(count), cs(source));
-            let mut out: Vec<Run> = Vec::new();
-            heading_flow(&t, &c, &s, |run, dx, size, bold, ink, faded| {
-                let text = run.to_str().unwrap_or_default().to_string();
-                out.push((text.clone(), dx, size, bold, ink, faded));
-                w(&text, size)
+            let mut out = plx_ui::draw_census::capture_runs(|| {
+                plx_ui::cards::draw_heading_c(
+                    plx_ui::Painter::recording(),
+                    &t,
+                    &c,
+                    &s,
+                    MARGIN_X,
+                    100.0,
+                    alpha,
+                    &plx_ui::widgets::LegacyMeasure,
+                );
             });
+            out.sort_by(|a, b| a.at.x.total_cmp(&b.at.x));
             out
         };
-        let bare = runs("Movies", "12 results", "");
-        assert_eq!(bare.len(), 2);
-        assert_eq!((bare[0].2, bare[0].3), (theme::size::HEADLINE, 1));
-        assert_eq!(bare[0].4, theme::TEXT_HEADING);
-        assert_eq!((bare[1].2, bare[1].3), (theme::size::BODY, 0));
-        assert_eq!(bare[1].4, theme::TEXT_TERTIARY);
-        assert_eq!(bare[1].1, w("Movies", theme::size::HEADLINE) + COUNT_GAP);
-        let shared = runs("Movies", "12 results", "friend");
-        assert_eq!(shared.len(), 4);
-        assert_eq!(shared[..2], bare[..2]);
-        assert_eq!(shared[2].0, "·");
-        assert_eq!(shared[2].4, theme::TEXT_SEPARATOR);
-        assert_eq!(
-            shared[2].1,
-            bare[1].1 + w("12 results", theme::size::BODY) + SOURCE_PAD
-        );
-        assert_eq!(shared[3].0, "friend");
-        assert_eq!(shared[3].4, theme::TEXT_TERTIARY);
-        assert_eq!((shared[3].2, shared[3].3), (theme::size::BODY, 0));
-        assert!(shared[2].5 && shared[3].5);
-        assert!(!shared[0].5 && !shared[1].5);
-        assert_eq!(runs("Collections", "", "").len(), 1);
+        let gaps_are_the_pad = |runs: &[plx_ui::draw_census::Run]| {
+            for pair in runs.windows(2) {
+                let gap = pair[1].at.x - (pair[0].at.x + pair[0].at.w);
+                assert!((gap - HEADING_SOURCE_PAD).abs() < 0.5, "{} -> {}: {gap}", pair[0].text, pair[1].text);
+            }
+        };
+        // the count is a quiet note behind a dot, at the gap every heading's note keeps
+        let bare = runs("Movies", "12 results", "", 1.0);
+        assert_eq!(bare.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), ["Movies", "\u{b7}", "12 results"]);
+        assert_eq!(bare[0].at.x, MARGIN_X);
+        assert_eq!((bare[0].size, bare[0].bold, bare[0].ink), (theme::size::HEADLINE, true, theme::TEXT_HEADING));
+        assert_eq!(bare[1].ink, theme::TEXT_SEPARATOR);
+        assert_eq!((bare[2].size, bare[2].bold, bare[2].ink), (theme::size::BODY, false, theme::TEXT_TERTIARY));
+        gaps_are_the_pad(&bare);
+        // a borrowed source is a second note on the same pad, and only it fades with the owner
+        let shared = runs("Movies", "12 results", "friend", 0.5);
+        assert_eq!(shared.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), ["Movies", "\u{b7}", "12 results", "\u{b7}", "friend"]);
+        gaps_are_the_pad(&shared);
+        assert_eq!(shared[2].ink, theme::TEXT_TERTIARY, "the count does not fade");
+        assert!((shared[4].ink[3] - theme::TEXT_TERTIARY[3] * 0.5).abs() < 1e-4, "the source rides the owner's alpha: {:?}", shared[4].ink);
+        // a hidden count is ABSENT: the title alone, no dot
+        assert_eq!(runs("Collections", "", "", 1.0).len(), 1);
     }
 
     /// A tile that is not a poster keeps this block: an episode still is worded by the one landscape

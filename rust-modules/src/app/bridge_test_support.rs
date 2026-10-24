@@ -18,7 +18,9 @@ pub(super) fn goto(d: &mut Dispatcher<AppHost>, want: AppArg) {
 
 pub(super) fn frame(d: &mut Dispatcher<AppHost>, rig: &mut Bridge, route: AppArg, tick: Tick, inputs: Vec<InputEvent<u32>>) -> (&'static str, FrameReport) {
     goto(d, route);
-    presented(super::frame(d, rig, tick, inputs))
+    let out = presented(super::frame(d, rig, tick, inputs));
+    rig.assert_no_store_jobs_left_for_test();
+    out
 }
 
 /// …and the same driver for the two frames that also want the effect tap or a supplied result
@@ -27,14 +29,18 @@ pub(super) fn frame_with_tap(d: &mut Dispatcher<AppHost>, rig: &mut Bridge, rout
     inputs: Vec<InputEvent<u32>>, tap: &mut dyn plx_ui::dispatch::Tap<AppHost>)
     -> (&'static str, FrameReport) {
     goto(d, route);
-    presented(super::frame_with_tap(d, rig, tick, inputs, tap))
+    let out = presented(super::frame_with_tap(d, rig, tick, inputs, tap));
+    rig.assert_no_store_jobs_left_for_test();
+    out
 }
 
 pub(super) fn frame_with_results(d: &mut Dispatcher<AppHost>, rig: &mut Bridge, route: AppArg, tick: Tick,
     inputs: Vec<InputEvent<u32>>, take: impl FnOnce() -> AppResults,
     tap: &mut dyn plx_ui::dispatch::Tap<AppHost>) -> (&'static str, FrameReport) {
     goto(d, route);
-    presented(super::frame_with_results(d, rig, tick, inputs, take, tap))
+    let out = presented(super::frame_with_results(d, rig, tick, inputs, take, tap));
+    rig.assert_no_store_jobs_left_for_test();
+    out
 }
 
 /// A detail page's argument, for the tests that used to name `Route::Detail` and let a trail
@@ -205,6 +211,9 @@ fn pump_requests(d: &mut Dispatcher<AppHost>, rig: &mut Bridge, mut item: Option
             (Some(_), None) => format!("unperformed watchlist:{label}"),
         });
     }
+    // The requests above include an item menu's Play, whose `describe_movie` emits a store job: the
+    // drain after it must have started it, as the loop's own `update` pump is not run here.
+    rig.assert_no_store_jobs_left_for_test();
     seen
 }
 
@@ -268,7 +277,26 @@ pub(super) struct World {
 }
 
 impl Drop for World {
-    fn drop(&mut self) { plx_plex::plex::reset_servers_for_test(); }
+    fn drop(&mut self) {
+        plx_plex::plex::reset_servers_for_test();
+        crate::app::collections_probe::clear_seeds_for_test();
+    }
+}
+
+/// How many collections the rig's probe stands in for on every section it seeds (a server the rig
+/// has no network to ask): enough that the Library header's Collections control is on the row.
+pub(crate) const RIG_COLLECTIONS: u32 = 4;
+
+impl Bridge {
+    /// Seed the Collections probe's `answer` for every section of the directory captured now (the
+    /// probe never reaches a server under test, `collections_probe::seed_for_test`), replacing the
+    /// rig's earlier seeds: `Count(n)` puts the control on the Library header, `Count(0)` or
+    /// `Forbidden` takes it off, `Unknown` is a probe that has not answered.
+    pub(crate) fn seed_collections_for_test(&self, answer: plx_plex::plex::collections::CollectionsCount) {
+        for section in self.directory.view().sections() {
+            if let Some(sid) = section.sid { crate::app::collections_probe::seed_for_test(sid, section.key, answer); }
+        }
+    }
 }
 
 impl World {
@@ -297,6 +325,7 @@ impl World {
     fn build_shelves(name: &str, two_libraries: bool, answered: bool, shelved: bool) -> World {
         let (serial, session) = Self::lock(name);
         plx_plex::plex::reset_servers_for_test();
+        crate::app::collections_probe::clear_seeds_for_test();
         let own = plx_plex::plex::register_for_test("route-own", "127.0.0.1", 9, "synthetic", "fixture");
         let shared = plx_plex::plex::register_for_test("route-shared", "127.0.0.1", 10, "synthetic", "fixture");
         plx_plex::plex::set_current(own);
@@ -309,6 +338,7 @@ impl World {
             bridge.browse_run(plx_data::stores::browse::BrowseCmd::ApplyPins(vec![(FILM_CLUB, true)]));
         }
         bridge.refresh_browse_directory();
+        bridge.seed_collections_for_test(plx_plex::plex::collections::CollectionsCount::Count(RIG_COLLECTIONS));
         bridge.browse_run(plx_data::stores::browse::BrowseCmd::SetCur(0));
         {
             let mut browse = bridge.stores.browse.borrow_mut();
@@ -326,6 +356,16 @@ impl World {
     /// "Film Club" beside "Movies".
     pub(super) fn movies_library(name: &str, two_libraries: bool) -> World {
         let mut w = Self::build(name, two_libraries);
+        w.open_library();
+        w
+    }
+
+    /// The Movies library whose sections' Collections probe answered `answer` (a refusal, none, or a
+    /// count other than the rig's), settled: the header the rig's server would give a library with
+    /// that answer.
+    pub(super) fn movies_library_answering(name: &str, answer: plx_plex::plex::collections::CollectionsCount) -> World {
+        let mut w = Self::build(name, false);
+        w.bridge.seed_collections_for_test(answer);
         w.open_library();
         w
     }
@@ -355,7 +395,7 @@ impl World {
     }
 
     /// The Collections page, opened with OK on the Library header's Collections control, its own
-    /// listing held LOADING (the Library under it is answered, so the control is there to press).
+    /// listing held LOADING (the Library under it is answered, and the rig's probe is seeded with a count, so the control is there to press).
     pub(super) fn collections_loading(name: &str) -> World {
         let mut w = Self::movies_library(name, false);
         w.bridge.stores.browse.borrow_mut().hold_listing_for_test();
@@ -766,9 +806,6 @@ pub(super) struct Drawn {
 }
 
 impl Drawn {
-    /// Was `text` drawn, exactly as one run?
-    pub(super) fn says(&self, text: &str) -> bool { self.words.iter().any(|(words, _)| words == text) }
-
     /// **The lines of the focused tile's label block this frame drew**, top to bottom, with no list of
     /// words to look for: every run `card_row::draw_label_block` drew, whatever its ink
     /// (`plx_ui::draw_census::label_lines`), so a line the setting turned off, or one nothing asked
@@ -827,4 +864,52 @@ impl Drop for DirectoryPolicyCleanup {
 fn presented<R>(frame: R) -> R {
     plx_ui::panel_motion::PanelMotion::drain_queued_text_for_test();
     frame
+}
+
+/// A one-thread loopback PMS for route tests: `respond` maps each request's path to a status line
+/// and a JSON body. Dropping it stops and joins the thread, so a test that never dials still ends.
+pub(crate) struct Pms {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    pub(crate) port: i32,
+}
+
+impl Pms {
+    pub(crate) fn serve(respond: fn(&str) -> (&'static str, String)) -> Pms {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port() as i32;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            while !flag.load(Ordering::SeqCst) {
+                let Ok((mut conn, _)) = plx_base::testnet::accept(&listener) else {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    continue;
+                };
+                let mut buf = [0u8; 4096];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]);
+                let path = head.split_whitespace().nth(1).unwrap_or("");
+                let (status, body) = respond(path.split('?').next().unwrap_or(""));
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+            }
+        });
+        Pms { stop, thread: Some(thread), port }
+    }
+}
+
+impl Drop for Pms {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }

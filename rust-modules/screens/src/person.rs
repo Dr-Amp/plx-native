@@ -37,7 +37,9 @@ use plx_ui::screen::{
 #[cfg(test)]
 use plx_ui::screen::Enter;
 use plx_ui::text_view::TextView;
+use plx_ui::hstack::Item;
 use plx_ui::theme;
+use plx_ui::vstack::{Anchor, VStack};
 use plx_ui::widgets::{Art, PageGround, StatusKind, StatusOverlay};
 use plx_ui::{Env, Painter, Rect, View};
 
@@ -119,7 +121,6 @@ const LIFE_GAP: f32 = theme::space::MD;
 // the bio highlight sits `--space-md` below the dates line) — and the box itself pads the prose by
 // `HL_PAD_Y` on every side, so the cap-to-prose gap this measures to has to carry both.
 const BIO_GAP: f32 = theme::space::MD + HL_PAD_Y;
-const SHELF_COUNT_GAP: f32 = theme::space::SM;
 const fn text_w_const(d: f32) -> f32 {
     SCR_W - MARGIN_X - (MARGIN_X + d + BAND_GAP)
 }
@@ -230,40 +231,41 @@ fn header_flow(
     measure: &dyn Measure,
 ) -> HeaderFlow {
     let mut f = HeaderFlow::default();
-    let mut y = measure.cap_h(theme::size::DISPLAY);
-    if pending || has_roles {
-        y += META_GAP;
-        f.meta_y = Some(y);
-        y += measure.cap_h(theme::size::LABEL);
-    }
-    if pending || has_life {
-        y += if f.meta_y.is_some() {
-            LIFE_GAP
-        } else {
-            META_GAP
-        };
-        f.life_y = Some(y);
-        // The life line draws at `CAPTION` (see `draw_header`'s loop), not `LABEL` — advancing by
-        // the wrong rung's cap height left a few px of drift between the pending skeleton's
-        // reserved band and the loaded line's actual one.
-        y += measure.cap_h(theme::size::CAPTION);
-    }
-    if pending || !bio.is_empty() {
-        y += BIO_GAP;
-        f.bio_y = Some(y);
-        y += if pending && bio.is_empty() {
-            BIO_LEAD * BIO_LINES as f32
-        } else {
-            let view = bio_view(bio, 1.0, measure);
-            f.bio_truncated = view.truncates(BIO_W);
-            view.measure_h(BIO_W)
-        };
-    }
-    if has_entry {
-        y += ENTRY_GAP;
-        f.entry_y = Some(y);
-        y += LinkedHeading::HEIGHT;
-    }
+    let has_meta = pending || has_roles;
+    let has_life = pending || has_life;
+    let has_bio = pending || !bio.is_empty();
+    let bio_h = if !has_bio {
+        0.0
+    } else if pending && bio.is_empty() {
+        BIO_LEAD * BIO_LINES as f32
+    } else {
+        let view = bio_view(bio, 1.0, measure);
+        f.bio_truncated = view.truncates(BIO_W);
+        view.measure_h(BIO_W)
+    };
+    // One stack, so a missing line takes its gap with it. The name and meta lines own the gap BELOW
+    // them (`after`): the name leaves META_GAP to whatever follows it (the meta line, or the life
+    // line when there is no meta) and the meta line leaves LIFE_GAP to the life line; the
+    // biography keeps BIO_GAP, and the entry ENTRY_GAP, whichever lines above them are absent. The
+    // life line draws at `CAPTION` (see `draw_header`'s loop), not `LABEL` — advancing by the wrong
+    // rung's cap height left a few px of drift between the pending skeleton's reserved band and the
+    // loaded line's actual one.
+    let items = [
+        Item::new(measure.cap_h(theme::size::DISPLAY)).after(META_GAP),
+        presence(has_meta, measure.cap_h(theme::size::LABEL)).after(LIFE_GAP),
+        presence(has_life, measure.cap_h(theme::size::CAPTION)),
+        presence(has_bio, bio_h).before(BIO_GAP),
+        presence(has_entry, LinkedHeading::HEIGHT).before(ENTRY_GAP),
+    ];
+    let stack = VStack::new(&items, 0.0, Anchor::Top(0.0));
+    // The bottom of the last line as the spans stand (`y + h`), not `stack.height()`: the sum the
+    // callers compare `exp_h` against, with no ulp between them.
+    let y = stack.placed().last().map_or(0.0, |s| s.y + s.h);
+    f.name_y = 0.0;
+    f.meta_y = stack.span(1).map(|(y, _)| y);
+    f.life_y = stack.span(2).map(|(y, _)| y);
+    f.bio_y = stack.span(3).map(|(y, _)| y);
+    f.entry_y = stack.span(4).map(|(y, _)| y);
     let bare = !pending && f.meta_y.is_none() && f.life_y.is_none() && f.bio_y.is_none();
     f.exp_d = if bare { PORTRAIT_BARE } else { PORTRAIT_EXP };
     f.exp_h = y.max(f.exp_d);
@@ -279,6 +281,11 @@ fn header_flow(
         }
     }
     f
+}
+
+/// An item `h` tall when `present`, else one that takes no room and no gap.
+fn presence(present: bool, h: f32) -> Item {
+    if present { Item::new(h) } else { Item::absent() }
 }
 
 fn bio_view<'a>(bio: &'a str, a: f32, measure: &'a dyn Measure) -> TextView<'a> {
@@ -504,7 +511,7 @@ impl PersonScreen {
         Self {
             page: Page::new(entry, sid, key, guid, name, thumb),
             // A page that leaves focus (a menu over it, a pointer gone) rests at the top.
-            stack: Stack::new(entry).hold_hint(plx_ui::hold_hint::Kind::Person).home_when_unfocused(true),
+            stack: Stack::new(entry).hold_hint().home_when_unfocused(true),
             teardown_closed: false,
         }
     }
@@ -1007,33 +1014,16 @@ impl Page {
     /// Shelf `kind`'s heading and count, drawn in the shelf block's own space (`lift` is how far
     /// the focused tile makes it rise); the tiles are the stack's.
     fn draw_shelf_heading(&self, p: Painter, kind: usize, lift: f32, measure: &dyn plx_machine::machine::Measure) {
-        let hy = -lift;
-        Label::new(
-            shelf_title()[kind].as_ptr(),
-            theme::size::HEADLINE,
-            theme::TEXT_HEADING,
-        )
-        .bold()
-        .v(VAlign::CapTop)
-        .draw(p, Rect::new(MARGIN_X, hy, SCR_W, 0.0));
-        if !self.shelf_count_c[kind].as_bytes().is_empty() {
-            let tw = measure.width(shelf_title()[kind], theme::size::HEADLINE, true);
-            Label::new(
-                self.shelf_count_c[kind].as_ptr(),
-                theme::size::CAPTION,
-                theme::TEXT_TERTIARY,
-            )
-            .v(VAlign::Baseline)
-            .draw(
-                p,
-                Rect::new(
-                    MARGIN_X + tw + SHELF_COUNT_GAP,
-                    hy,
-                    0.0,
-                    measure.cap_h(theme::size::HEADLINE),
-                ),
-            );
-        }
+        plx_ui::cards::draw_heading_c(
+            p,
+            shelf_title()[kind],
+            &self.shelf_count_c[kind],
+            c"",
+            MARGIN_X,
+            -lift,
+            1.0,
+            measure,
+        );
     }
 
     /// The skeleton / empty read-out where the first shelf would be, `y` being that shelf's top.
@@ -1588,9 +1578,9 @@ mod tests {
 
     /// The hold hint (`ui::hold_hint`) on a Person shelf card: it stands after the dwell on a
     /// settled card, not on the Filmography pill (not a card), not while a menu owns focus, and
-    /// not a second time on a Person page this run.
+    /// not a second time this run.
     #[test]
-    fn the_hold_hint_stands_on_a_resting_shelf_card_once_per_run() {
+    fn the_hold_hint_stands_on_a_resting_shelf_card_once_per_install() {
         let _g = plx_base::testlock::serial();
         plx_ui::hold_hint::reset_learned_for_test();
         plx_ui::hold_hint::reset_shown_for_test();
@@ -1605,11 +1595,11 @@ mod tests {
         };
         rest(&mut s, card, 1.2);
         assert!(!s.stack.hint_visible(), "not before the dwell");
-        // negatives first: a stand spends the kind's latch and would make them vacuous
+        // negatives first: a stand spends the run's latch and would make them vacuous
         rest(&mut s, plx_machine::machine::FocusKey { entry: EntryId(900), elem: 0 }, 4.0);
-        assert!(!s.stack.hint_visible() && !plx_ui::hold_hint::shown_this_run(plx_ui::hold_hint::Kind::Person), "never while a menu owns focus");
+        assert!(!s.stack.hint_visible() && !plx_ui::hold_hint::shown_this_run(), "never while a menu owns focus");
         rest(&mut s, plx_machine::machine::FocusKey { entry: EntryId(0), elem: ENTRY_ELEM }, 4.0);
-        assert!(!s.stack.hint_visible() && !plx_ui::hold_hint::shown_this_run(plx_ui::hold_hint::Kind::Person), "never on the Filmography pill");
+        assert!(!s.stack.hint_visible() && !plx_ui::hold_hint::shown_this_run(), "never on the Filmography pill");
         rest(&mut s, card, 3.6);
         assert!(s.stack.hint_visible(), "after the dwell, on a settled card");
         rest(&mut s, plx_machine::machine::FocusKey { entry: EntryId(900), elem: 0 }, 1.0);
@@ -3196,4 +3186,46 @@ mod tests {
         assert!(worst <= 0.0, "a caption line of the Movies shelf ends {worst:.1} px below the drawn top of the Shows heading");
     }
 
+
+    /// Q4, painted: a shelf's heading is the one heading + count idiom. The title, the dot and the
+    /// count are PAINTED through a recording painter and read back run by run: each stands
+    /// `HEADING_SOURCE_PAD` after the one before it; a shelf with no count draws its title alone.
+    #[test]
+    fn a_painted_shelf_heading_keeps_the_pad_between_title_dot_and_count() {
+        let _g = plx_base::testlock::serial();
+        let (_store, mut s) = seed(2, 2);
+        s.page.shelf_count_c = [std::ffi::CString::new("22").unwrap(), std::ffi::CString::default()];
+        let paint = |kind: usize| {
+            let mut runs = plx_ui::draw_census::capture_runs(|| {
+                s.page.draw_shelf_heading(Painter::recording(), kind, 0.0, &plx_ui::widgets::LegacyMeasure);
+            });
+            runs.sort_by(|a, b| a.at.x.total_cmp(&b.at.x));
+            runs
+        };
+        let counted = paint(0);
+        assert_eq!(counted.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), [shelf_title()[0].to_str().unwrap(), "\u{b7}", "22"]);
+        assert_eq!(counted[0].at.x, MARGIN_X);
+        for pair in counted.windows(2) {
+            let gap = pair[1].at.x - (pair[0].at.x + pair[0].at.w);
+            assert!((gap - plx_ui::cards::HEADING_SOURCE_PAD).abs() < 0.5, "{} -> {}: {gap}", pair[0].text, pair[1].text);
+        }
+        assert_eq!(counted[2].size, theme::size::BODY, "the count is a BODY note, not a caption");
+        assert_eq!(paint(1).len(), 1, "a shelf with no count draws its title alone");
+    }
+
+    /// The header's gaps ride the item, not its neighbour: with no life line the biography keeps
+    /// BIO_GAP under the meta line, and with no biography the entry keeps ENTRY_GAP under the life line.
+    #[test]
+    fn header_gaps_survive_an_absent_neighbour() {
+        let m = FixtureMeasure;
+        let label = m.cap_h(theme::size::LABEL);
+        let no_life = header_flow(false, "A biography.", true, false, false, &m);
+        assert_eq!(no_life.life_y, None);
+        let (meta, bio) = (no_life.meta_y.unwrap(), no_life.bio_y.unwrap());
+        assert!((bio - meta - label - BIO_GAP).abs() < 0.01);
+        let no_bio = header_flow(false, "", true, true, true, &m);
+        assert_eq!(no_bio.bio_y, None);
+        let (life, entry) = (no_bio.life_y.unwrap(), no_bio.entry_y.unwrap());
+        assert!((entry - life - m.cap_h(theme::size::CAPTION) - ENTRY_GAP).abs() < 0.01);
+    }
 }

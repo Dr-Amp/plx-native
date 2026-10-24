@@ -87,7 +87,7 @@ pub struct AccountPreferenceReply {
 }
 
 pub enum PreferenceCmd {
-    /// Capture the live profile only after admission: even session::peek can schedule storage IO.
+    /// Capture the live profile only after admission.
     Load { reply: std::sync::mpsc::Sender<AccountPreferenceReply> },
     Save {
         request: plx_plex::plex::account::PreferenceRequest,
@@ -1281,19 +1281,24 @@ pub trait LibraryLike: AppLike<Memory = PageMemory> + Sized {
     fn listing<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::ListingView<'a>;
     fn directory<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::DirectoryView<'a>;
     fn section_hubs<'a>(cx: &Cx<'a, Self>) -> plx_data::stores::browse::HubsView<'a>;
-    /// How many collections `section` holds, from the `type=18` `Size:0` probe of
-    /// `/library/sections/{id}/all` (`totalSize`). `None` = not known yet; `Some(Err(Forbidden))` =
-    /// the server answered HTTP 403 (the Collections control is then hidden); `Some(Ok(0))` = none.
+    /// How many collections the directory's section `section` (an index into
+    /// `directory(cx).sections()`, which names the server as well as the section key) holds, from
+    /// the `type=18` `Size:0` probe of `/library/sections/{id}/all` (`totalSize`). `None` = not
+    /// known yet (the Collections control is then not on the row); `Some(Err(Forbidden))` = the
+    /// server answered HTTP 403 (hidden); `Some(Ok(0))` = none (hidden). Any section of the
+    /// directory may be asked about, not only the current one: the app warms them all when the
+    /// directory lands, so a switch finds its answer already there.
     ///
-    /// CONTRACT FREEZE: a provided method so every existing host compiles; P2 implements it on
-    /// `AppHost` (`src/app/bridge.rs`) over the probe, and P4 reads it.
-    fn collections_count(_cx: &Cx<'_, Self>, _section: u32) -> Option<Result<u32, Forbidden>> {
+    /// CONTRACT FREEZE: a provided method so every existing host compiles; `AppHost`
+    /// (`src/app/bridge.rs`) implements it over the probe.
+    fn collections_count(_cx: &Cx<'_, Self>, _section: usize) -> Option<Result<u32, Forbidden>> {
         None
     }
 }
 
-/// The server refused the collections listing (HTTP 403): the answer is final for this session, so
-/// it is kept distinct from "none yet" and from a count of zero.
+/// The server refused the collections listing (HTTP 401/403): the answer is final for the identity
+/// (credential) it was asked under, so it is kept distinct from "none yet" and from a count of
+/// zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Forbidden;
 
@@ -2567,10 +2572,13 @@ pub const SCREEN_SHAPES: &[&str] = &[
 // `bands` symbolically, so their shape strings did not change. One bump; the three replay fixtures
 // were re-recorded against it; the previous pin was 0x0803_2f8d_c828_6d70.
 // Live TV page (this fork): `ARG_SHAPE` gains the `LiveTv` page and `SCREEN_SHAPES` appends
-// `LiveTvScreen::SHAPE`. One bump; the replay fixtures were NOT re-recorded (they need the macOS
-// simulator), so `make check-replay` is expected to fail until they are; the previous pin was
-// 0x6b71_df9e_04db_2b76.
-const SCREEN_SHAPES_PIN: u64 = 0x148a_9729_ab40_7a50;
+// `LiveTvScreen::SHAPE`. Player two-press BACK while busy: `PlayerScreen`'s `hud` gains `exit_armed`
+// (a BACK hid the transport while the pipeline was busy, so the hide cannot show) and
+// `back_leaves_at_press` (that arming, sampled before the press un-dismisses), both after
+// `visible_at_press` in the canon and the shape string. Both land under one bump, so the three
+// replay fixtures must be re-recorded against this pin (macOS simulator; not runnable on Linux).
+// The previous pins were 0x6b71_df9e_04db_2b76 (base) and 0x209b_8063_1907_d7c8 (upstream main).
+const SCREEN_SHAPES_PIN: u64 = 0xd8eb_9b2a_4776_0476;
 
 #[cfg(test)]
 mod arg_tests {

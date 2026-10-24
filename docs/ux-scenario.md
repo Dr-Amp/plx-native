@@ -164,9 +164,10 @@ promoted items; the dots under the action row show the position.
 | control | what OK does |
 |---|---|
 | **Play** / **Continue** | starts playback — *Continue* when the item has a resume point, *Play* when it does not |
+| **🔖** (bookmark) | adds the title to the Watchlist (an episode's or season's show), or removes it when it is already on it; outline off the list, filled on it. Present only when the hero row names a title with a known catalog id |
 | **ⓘ** (info) | opens that item's detail page |
 
-Those are the only two. **The `›` beside them is an indicator, not a third button** — it is drawn,
+Those are the only three, in that order (the bookmark disc is absent for a row with no catalog id), and none of the circles carries a name, focused or not. **The `›` beside them is an indicator, not a third button** — it is drawn,
 it never takes focus and it has no hit rect. The hero is paged by **RIGHT past the info disc** or
 **LEFT off the Play pill**, and it also advances itself every **8 s** while the row sits idle. The
 dots under the row show the position.
@@ -190,12 +191,12 @@ just the page.
 
 DOWN from the hero enters the shelves; DOWN again steps between them; LEFT/RIGHT walks the cards.
 The focused card grows, and what Settings → Libraries → Under posters asks for appears
-beneath it (a title line when its Title switch is On; a line the setting turns on is never left empty, so a season, which has no length, says *"Season 6"* under its show's name, and a film the server told us nothing about says *"Movie"*; the setting is the same under every poster in the app: Search results, a person's filmography, a title's Related and collection shelves and a collection's members, though not under a landscape still or a cast headshot) — a Continue Watching card keeps its status line, here *"8 min
-left"*, which is the resume state. A watched item carries a check mark in its corner.
+beneath it (a title line when its Title switch is On; a line the setting turns on is never left empty, so a season, which has no length, says *"Season 6"* under its show's name, and a film the server told us nothing about says *"Movie"*; the setting is the same under every poster in the app: Search results, a person's filmography, a title's Related and collection shelves and a collection's members, though not under a landscape still or a cast headshot) — a Continue Watching card always shows its status line, under every Details setting, Nothing included, here *"S3 · E4 · 8m
+left"* (*"8m left"* for a film), which is the resume state. A watched item carries a check mark in its corner.
 
 **OK on a card in *Continue Watching* opens its page by default** (Settings → Playback →
-Continue Watching: *Open details*); set to *Play*, OK plays it directly and the amber ▶ before the card's title is
-what announces that (it needs the title line, so Under posters → Title On) — the ▶ is drawn only in that mode, and in the default the card's menu leads
+Continue Watching: *Open details*); set to *Play*, OK plays it directly and the amber ▶ before the first line the card draws is
+what announces that (the title when Under posters → Title is On, otherwise the status line) — the ▶ is drawn only in that mode, and in the default the card's menu leads
 with Play instead; an *episode* card there opens its **show** on that episode's season (the card's menu
 offers *Go to Episode*). **Every other card opens a page, an episode included**: an episode tile on a
 discovery shelf ("Recently Released Episodes", "Recently Added…") opens that EPISODE's own page and
@@ -557,10 +558,10 @@ distinction §6.1 draws.
 | **Rewind / Fast-forward** | the same as LEFT / RIGHT (§1.2) |
 | **UP / DOWN** | move between the HUD's three bands; a press on a hidden HUD is spent raising it |
 | **Stop** | leave the player |
-| **BACK** | cancel a scrub in progress (§6.6); otherwise hide the HUD if it is up, and leave the player from a bare picture |
+| **BACK** | cancel a scrub in progress (§6.6); otherwise hide the HUD if it is up, and leave the player from a bare picture. While playback is still loading, buffering or seeking, the HUD cannot come down: the first BACK hides it with nothing visible, and the next BACK leaves. Any other key in between, or the load finishing, makes it a first BACK again |
 | **EXIT** | terminate the app (§2.3) |
 
-**Stop, and a BACK that finds nothing to cancel or hide, do the same thing here**: both run one teardown ritual — cancel any play still being
+**Stop, and a BACK that finds nothing to cancel or hide (or that is the second in a row while the player is busy), do the same thing here**: both run one teardown ritual — cancel any play still being
 resolved, close every panel, stop the buffer feed — and return to **the page playback started
 from**. For an episode that is the **show page, scrolled to the episode that played**, not the
 generic show root. The final position is reported to the server on the way out, so the item resumes
@@ -646,7 +647,9 @@ up commits the drag. A playing film plays on from the new spot; a paused film se
    goes, the knob eases back to the playhead over about 0.3 s, and the HUD stays up; BACK did not
    hide it or leave.
 2. **Otherwise BACK is the ordinary one**: with the HUD up it hides it (the film keeps playing), and
-   from a bare picture it leaves the player (§6.4). **A committed scrub is final** — an OK / Play
+   from a bare picture it leaves the player (§6.4); while the player is still loading, buffering or
+   seeking, the HUD cannot come down, so the first BACK hides it unseen and the next one leaves.
+   **A committed scrub is final** — an OK / Play
    confirmation or a pointer drag's release is not followed by a way back to where the scrub
    started; BACK straight afterwards hides the HUD like any other BACK.
 

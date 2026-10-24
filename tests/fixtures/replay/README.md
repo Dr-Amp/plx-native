@@ -542,3 +542,35 @@ was replaced (`git rm -r`, `tools/plxnative-rec import`, the committed manifests
 byte, `anchor: true` kept: they already equal the new recorder's header). `make check-replay`
 replays all three with `verdict=SAME` in Targets and Resolve and every difference counter at zero
 (three consecutive runs).
+
+One heading + count idiom (`card_row::heading_parts`, Q4: a Person's shelf count is now a quiet note behind a
+dot, in the `BODY` rung where it was `CAPTION` bare) changed recorded behaviour without moving the shape:
+`12-filmography-detail-return` mounts Person, so it was observed being refused (`replay: REFUSED — replay
+measurement table miss`, both modes), while `1-boot-home-chip-grid` and `6-settings-family` stayed SAME.
+Attributed from the measurements themselves: the fresh recording holds the committed one's 136 `metrics`
+queries plus exactly three gained Width queries, all at 28 px regular: the separator dot (`·`) and the two
+shelf counts ("22", "4"); none lost. The route and focus-fingerprint sequences are identical to the
+committed recording's. The anchor was recorded afresh on the unchanged shape (`tests/focusfp.sh --rec --only
+12`), passed `plxnative-rec check`, and only its `rec-0000.jsonl` was replaced (the manifest already equals
+the recorder's header, `anchor: true` kept). The re-record also gained 4 non-tick `eff` records (an extra Home
+hubs/discovery work+delivery pair): timing of the recording, not Q4. `make check-replay` replays all three with
+`verdict=SAME` in Targets and Resolve and every difference counter at zero (three consecutive runs).
+
+The Continue Watching caption (an episode reads "S3 · E4 · 18m left" where it read "Show · 18m left";
+Under posters = Nothing keeps that line and the deck shelf keeps a one-line band) moved what Home draws
+without moving the shape. `1-boot-home-chip-grid` was refused (`replay: REFUSED — replay measurement
+table miss`, both modes) on the one new measured run, "S2 · E2 · 32m left", while `6-settings-family` and
+`12-filmography-detail-return` stayed SAME. The closed alphabet's deck pattern became
+`S[0-9]+ · E[0-9]+ · [0-9]+m left`. The anchor was recorded afresh (`tests/focusfp.sh --rec --only 1`),
+passed `plxnative-rec check`, and only `1-boot-home-chip-grid/rec-0000.jsonl` was replaced: the manifest
+(anchor flag included) stands. `tests/replay_fixtures.py` replays all three with `verdict=SAME` in Targets
+and Resolve and every difference counter at zero.
+
+The player's two-press BACK while the pipeline is busy (`HudState::exit_armed` and
+`back_leaves_at_press`, both in `PlayerScreen`'s canon and shape string; `SCREEN_SHAPES_PIN`
+`0x6b71_df9e_04db_2b76` -> `0x209b_8063_1907_d7c8`) moved the state shape from 2896094977091175041 to
+4253715640610457423, read from the old and the new recorder headers by `tools/plxnative-rec rerecord`.
+All three anchors were refused on load (`StateShape` in the fixture preflight), then recorded afresh
+against the synthetic server with `tests/focusfp.sh --rec --only 1,6,12`, passed `plxnative-rec
+check`, and were installed with `tools/plxnative-rec rerecord`, anchors retained. `make check-replay`
+replays all three with `verdict=SAME` in Targets and Resolve and every difference counter at zero.
