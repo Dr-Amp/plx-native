@@ -1574,7 +1574,7 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
     let client = plx_plex::plex::client_for(env.sid);
     if let Some(tune) = &env.live {
         if let Some(client) = client {
-            build_live_stream(off, tune, client, env, &mut plan);
+            build_live_stream(off, tune, client, &mut plan);
         }
         return plan;
     }
@@ -2670,8 +2670,7 @@ pub(super) fn video_copy_fps(contract: &plx_plex::plex::EncodeContract, src_fps:
 /// direct-play mode: the server already records the channel as H.264/AAC in MPEG-TS, and the
 /// official client plays it the same way (`docs/pms-api.md` §10).
 fn build_live_stream(
-    off: &plx_base::task::OffFrame, tune: &LiveTune, client: &plx_plex::plex::Client, env: &ResolveEnv,
-    plan: &mut Plan,
+    off: &plx_base::task::OffFrame, tune: &LiveTune, client: &plx_plex::plex::Client, plan: &mut Plan,
 ) {
     let session = new_sess("");
     plan.sess = session.clone();
