@@ -25,7 +25,7 @@ pub struct LiveChannel {
     pub channel: String,
     /// The virtual channel number, `"101"`.
     pub vcn: String,
-    /// The channel's name without its number in front (`"Canal Los Simpsons"`).
+    /// The channel's name without its number in front (`"Family Channel"`).
     pub name: String,
     /// The provider's logo URL. It is served by the TUNER's host, which the TV may not reach, so
     /// it is fetched through the server's photo transcoder like any other image.

@@ -161,7 +161,7 @@ pub struct DvrDevice {
 }
 
 /// One channel of a DVR's guide lineup. `title` carries the number in front
-/// (`"101 Canal Los Simpsons"`); `thumb` is a URL on the TUNER's host, which only the server is
+/// (`"101 Family Channel"`); `thumb` is a URL on the TUNER's host, which only the server is
 /// sure to reach.
 #[derive(Deserialize, Default, Clone, Debug)]
 pub struct EpgChannel {
