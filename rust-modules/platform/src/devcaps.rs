@@ -65,6 +65,12 @@ pub const DP_AUDIO_CODECS: &str = "aac,ac3,eac3,dts,opus";
 /// them, because the codec is a property of the buffer-feed pipeline rather than of the table.
 const PIPELINE_ONLY_AUDIO: &[&str] = &["opus"];
 
+/// Auto's channel ceiling for Opus, whatever a table row claims: stereo plays cleanly on every set
+/// measured, while 5.1 stalls on a C1 (webOS 6) once packets pass ~1500 bytes, with nothing in the
+/// log (#917, #918). Wider tracks stay with the server; Force Direct Play applies no ceiling, as for
+/// every codec. A 5.1 Opus film did play through on a C5 (webOS 10.3), so this can loosen per model.
+const OPUS_AUTO_MAX_CHANNELS: u32 = 2;
+
 const CAPS_TABLE: &str = "/etc/umediaserver/device_codec_capability_config.json";
 
 /// The decode-capability snapshot the playback stack derives from. `OnceLock` for the same
@@ -431,6 +437,10 @@ fn parse(s: &str) -> Option<Caps> {
         let pipeline = DP_AUDIO_CODECS.split(',').filter(|c| !table_gated(c));
         audio.into_iter().chain(pipeline).collect::<Vec<_>>().join(",")
     };
+    if audio.split(',').any(|c| c == "opus") {
+        let old = audio_channels.get("opus").copied().unwrap_or(0);
+        audio_channels.insert("opus".to_owned(), min_nz(old, OPUS_AUTO_MAX_CHANNELS));
+    }
     Some(Caps {
         hevc,
         hevc_max,
@@ -648,6 +658,16 @@ mod tests {
         assert!(!Caps::assumed().audio_has("opus"));
         assert!(parse(REAL).unwrap().forced_feeds_audio("opus"));
         assert!(!Caps::assumed().forced_feeds_audio("opus"), "Forced gates Opus on the table too");
+        // Auto takes stereo Opus only; a wider track goes to the server, even when a table row
+        // claims more (#918). Forced keeps no ceiling.
+        let real = parse(REAL).unwrap();
+        assert!(real.audio_supports("opus", 2) && real.audio_supports("opus", 1));
+        assert!(!real.audio_supports("opus", 6), "surround Opus is the server's in Auto");
+        assert_eq!(real.audio_channels.get("opus"), Some(&2));
+        let claims_six = r#"{"videoCodecs":[{"name":"H.264","maxWidth":1920,"maxHeight":1080}],
+            "audioCodecs":[{"name":"AAC","channels":6},{"name":"OPUS","channels":6}]}"#;
+        assert_eq!(parse(claims_six).unwrap().audio_channels.get("opus"), Some(&2));
+        assert!(!Caps::assumed().audio_channels.contains_key("opus"));
         let no_audio = r#"{"videoCodecs":[{"name":"H.264","maxWidth":1920,"maxHeight":1080}],
             "audioCodecs":[{"name":"WMA","channels":2}]}"#;
         assert_eq!(parse(no_audio).unwrap().audio, Caps::assumed().audio);
