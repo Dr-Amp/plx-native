@@ -925,8 +925,9 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
         if plx_media::route::is_live(&app.player.session) {
             log("livetv: background ends the channel");
             super::playback::exit_player(
-                &mut app.player.session,
+                &mut app.player,
                 &mut app.adapters.player,
+                &mut app.repause_at,
                 &mut app.refresh_hubs,
                 &mut app.pages,
             );

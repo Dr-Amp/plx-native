@@ -1035,7 +1035,7 @@ fn card(s: ServerId, rk: &str, title: &str, show: Option<u8>, sec: i64, media: b
 }
 
 fn deck_of(cards: Vec<CwItem>) -> SourceBuild {
-    SourceBuild { lane: Default::default(), cw: cards, shelves: Vec::new() }
+    SourceBuild { lane: Default::default(), cw: cards, shelves: Vec::new(), live: Vec::new() }
 }
 
 /// `n` servers in the registry (the first is our own, the rest are credited), `(slot, handle)` each.
