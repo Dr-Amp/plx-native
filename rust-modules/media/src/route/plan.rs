@@ -1569,8 +1569,13 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
         source_decodable: true,
         ..Default::default()
     };
+    // The server's client is read once, ahead of the Live TV branch: both resolves make their PMS
+    // calls through it, and a server that is gone ends either one the same way.
+    let client = plx_plex::plex::client_for(env.sid);
     if let Some(tune) = &env.live {
-        build_live_stream(off, tune, env, &mut plan);
+        if let Some(client) = client {
+            build_live_stream(off, tune, client, env, &mut plan);
+        }
         return plan;
     }
     if env.direct_play_mode == DirectPlayMode::Disabled && rk.is_empty() {
@@ -1579,7 +1584,7 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
     }
     let forced = env.direct_play_mode == DirectPlayMode::Forced;
     let playback_quality = if forced { Quality::Original } else { env.quality };
-    let client = match plx_plex::plex::client_for(env.sid) {
+    let client = match client {
         Some(c) => c,
         None => return plan,
     };
@@ -2664,10 +2669,10 @@ pub(super) fn video_copy_fps(contract: &plx_plex::plex::EncodeContract, src_fps:
 /// library path applies — no PlayQueue, no metadata, no track memory, no quality ladder, no
 /// direct-play mode: the server already records the channel as H.264/AAC in MPEG-TS, and the
 /// official client plays it the same way (`docs/pms-api.md` §10).
-fn build_live_stream(off: &plx_base::task::OffFrame, tune: &LiveTune, env: &ResolveEnv, plan: &mut Plan) {
-    let Some(client) = plx_plex::plex::client_for(env.sid) else {
-        return;
-    };
+fn build_live_stream(
+    off: &plx_base::task::OffFrame, tune: &LiveTune, client: &plx_plex::plex::Client, env: &ResolveEnv,
+    plan: &mut Plan,
+) {
     let session = new_sess("");
     plan.sess = session.clone();
     let Some(live) = client.tune(off, &tune.dvr, &tune.channel, &session) else {
