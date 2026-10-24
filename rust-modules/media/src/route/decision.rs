@@ -60,6 +60,9 @@ struct PlaybackRequest {
     /// Background hero preview. No PlayQueue, no timeline, no scrobble, resume at 0, and the
     /// caller must not push the player route.
     preview: bool,
+    /// The version the viewer picked (Play Version), `None` for the default. Kept on the request,
+    /// so a retry or quality change of this playback resolves the same version.
+    version: Option<plx_plex::plex::MediaId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,6 +258,10 @@ pub struct PlaybackSession {
     /// ratingKey of the currently-playing item (movie or episode), so an audio-track
     /// switch can force a fresh transcode of the same item.
     cur_rk: String,
+    /// The playing version's `mediaIndex` (0 for the default), installed with `cur_rk` from the
+    /// plan, so every later encoder of this playback (seek, quality change, ABR rung, Original
+    /// recovery) asks for the same version.
+    cur_media_index: usize,
     /// The SERVER the currently-playing item came from — the other half of its identity.
     ///
     /// A ratingKey names an item only within one server: `1` is a real item on our own server and a
@@ -516,6 +523,7 @@ impl PlaybackSession {
         auto_prior_kbps: 0,
         auto_bootstrap_rung: None,
         cur_rk: String::new(),
+        cur_media_index: 0,
         cur_sid: ServerId::UNSET,
         cur_audio: None,
         cur_sub_sid: 0,
@@ -601,6 +609,7 @@ impl PlaybackSession {
             auto_prior_kbps,
             auto_bootstrap_rung,
             cur_rk,
+            cur_media_index,
             cur_sid,
             cur_audio,
             cur_sub_sid,
@@ -668,6 +677,7 @@ impl PlaybackSession {
             auto_prior_kbps: *auto_prior_kbps,
             auto_bootstrap_rung: *auto_bootstrap_rung,
             cur_rk: cur_rk.clone(),
+            cur_media_index: *cur_media_index,
             cur_sid: *cur_sid,
             cur_audio: cur_audio.clone(),
             cur_sub_sid: *cur_sub_sid,
@@ -3070,6 +3080,7 @@ pub struct HlsAbrControl {
     trace_generation: u32,
     sid: ServerId,
     rating_key: String,
+    media_index: usize,
     logical_session: String,
     audio_stream_id: i64,
     subtitle_stream_id: i64,
@@ -3393,6 +3404,7 @@ impl HlsAbrControl {
         // before the candidate produces segment zero. Couple both wire fields per encoder.
         let spec = transcode_spec(
             &self.rating_key,
+            self.media_index,
             &encoder_session,
             &encoder_session,
             plx_plex::plex::TranscodeOffset::from_micros(offset_micros),
@@ -3628,6 +3640,7 @@ pub fn hls_abr_control(ps: &PlaybackSession) -> Option<(HlsAbrControl, WorkerTic
             trace_generation: playback_trace_generation(),
             sid: cur_sid(ps),
             rating_key: cur_rk(ps),
+            media_index: cur_media_index(ps),
             logical_session: sess(ps),
             audio_stream_id: cur_audio_sid(ps),
             subtitle_stream_id: cur_sub_sid(ps),
@@ -4420,6 +4433,7 @@ pub(super) struct OriginalRecoveryPlan {
     pub(super) client: Option<&'static plx_plex::plex::Client>,
     sid: ServerId,
     rk: String,
+    media_index: usize,
     part_id: i64,
     subtitle_sid: i64,
     /// The namespace the replacement encoder's session id is minted under.
@@ -4537,6 +4551,7 @@ fn plan_original_recovery(
         client: cur_client(ps),
         sid: cur_sid(ps),
         rk: cur_rk(ps),
+        media_index: cur_media_index(ps),
         part_id: cur_part_id(ps),
             subtitle_sid: cur_sub_sid(ps),
         namespace,
@@ -5403,6 +5418,10 @@ pub fn cur_memory_note(ps: &PlaybackSession) -> bool {
 /// ratingKey of the currently-playing item (for /:/timeline progress reports).
 pub fn cur_rk(ps: &PlaybackSession) -> String {
     ps.cur_rk.clone()
+}
+/// The playing version's `mediaIndex` — see [`PlaybackSession::cur_media_index`].
+fn cur_media_index(ps: &PlaybackSession) -> usize {
+    ps.cur_media_index
 }
 /// The server the currently-playing item came from — see [`PlaybackSession::cur_sid`]. MAIN THREAD.
 ///
@@ -6316,6 +6335,7 @@ pub(super) struct RebasePlan {
     pub(super) owner: RebaseFor,
     client: &'static plx_plex::plex::Client,
     rk: String,
+    media_index: usize,
     /// The route generation the rebuild was planned against. The commit is gated on it.
     expected: WorkerTicket,
     /// The encoder the route plays now; stopped once the replacement is the route's.
@@ -6493,6 +6513,7 @@ pub(super) fn plan_rebase(
         owner,
         client,
         rk,
+        media_index: cur_media_index(ps),
         expected,
         previous,
         replacement,
@@ -6514,6 +6535,7 @@ pub(super) fn plan_rebase(
 pub(super) fn run_rebase(off: &plx_base::task::OffFrame, plan: &RebasePlan) -> RebaseOutcome {
     let sp = transcode_spec(
         &plan.rk,
+        plan.media_index,
         &plan.replacement,
         &plan.replacement,
         plx_plex::plex::TranscodeOffset::from_seconds(plan.offset_secs.max(0)),
@@ -7054,6 +7076,7 @@ pub(super) fn measure_remote_remux(
     off: &plx_base::task::OffFrame,
     client: &plx_plex::plex::Client,
     rk: &str,
+    media_index: usize,
     session: &str,
     audio_stream_id: i64,
     subtitle_stream_id: i64,
@@ -7070,6 +7093,7 @@ pub(super) fn measure_remote_remux(
     let spec_for = |audio| {
         transcode_spec_carrying_burn(
             rk,
+            media_index,
             session,
             session,
             plx_plex::plex::TranscodeOffset::Fresh,
@@ -7133,11 +7157,12 @@ pub(super) struct MdeVerdict {
 pub(super) fn server_decision(
     c: &plx_plex::plex::Client,
     rk: &str,
+    media_index: usize,
     session: &str,
     audio_stream_id: i64,
     subtitle_stream_id: i64,
 ) -> Option<MdeVerdict> {
-    let mc = match c.mde_decision(rk, session, audio_stream_id, subtitle_stream_id) {
+    let mc = match c.mde_decision(rk, media_index, session, audio_stream_id, subtitle_stream_id) {
         Some(mc) => mc,
         None => {
             // failed fetch OR unparseable (XML/truncated) body — no Original Part
@@ -7155,7 +7180,7 @@ fn mde_verdict(mc: &plx_plex::plex::MediaContainer) -> Option<MdeVerdict> {
     let part = match mc
         .metadata
         .first()
-        .and_then(|m| m.media.first())
+        .and_then(|m| m.decided_media())
         .and_then(|md| md.part.first())
     {
         Some(p) => p,
@@ -7195,9 +7220,9 @@ fn mde_verdict(mc: &plx_plex::plex::MediaContainer) -> Option<MdeVerdict> {
 }
 
 pub(super) fn forced_server_decision(
-    c: &plx_plex::plex::Client, rk: &str, session: &str, audio: i64, sub: i64,
+    c: &plx_plex::plex::Client, rk: &str, media_index: usize, session: &str, audio: i64, sub: i64,
 ) -> Option<MdeVerdict> {
-    mde_verdict(&c.mde_decision_forced(rk, session, audio, sub)?)
+    mde_verdict(&c.mde_decision_forced(rk, media_index, session, audio, sub)?)
 }
 
 /// Select the audio + subtitle streams server-side for the current part before a
@@ -7532,6 +7557,7 @@ impl ResolveEnv {
             sub_mode: SubMode::Track,
             forced_lang: forced_only_lang(ps).to_string(),
             cached_item: meta.cached_playing(sid, rk),
+            version: None,
             quality: quality(),
             direct_play_mode: direct_play_mode(),
             src_kbps: resolve_src_kbps(meta.current(), sid, rk),
@@ -7799,6 +7825,7 @@ pub fn request_play(
     acodec: &str,
     title: &str,
     ctx: &str,
+    version: Option<plx_plex::plex::MediaId>,
 ) -> bool {
     request_play_inner(
         ps,
@@ -7812,6 +7839,7 @@ pub fn request_play(
             title: title.to_owned(),
             ctx: ctx.to_owned(),
             preview: false,
+            version,
         },
         None,
         None,
@@ -7844,6 +7872,7 @@ pub fn request_preview(
             title: title.to_owned(),
             ctx: plx_data::metadata::TRAILER_CONTEXT.to_owned(),
             preview: true,
+            version: None,
         },
         None,
         None,
@@ -7870,6 +7899,12 @@ fn request_env(
     env.omit_queue_continuous = plx_data::metadata::context_omits_queue_continuous(&request.ctx);
     env.set_preview(request.preview);
     env.fresh_play = retry.is_none() && !request.preview;
+    env.version = request.version;
+    if env.version.is_some() {
+        // Both describe the default version: a picked one is measured from its own fetch.
+        env.cached_item = None;
+        env.src_kbps = 0;
+    }
     if let Some(retry) = retry {
         apply_retry(&mut env, retry);
     }
@@ -8069,6 +8104,8 @@ fn reset_track_selection(sid: ServerId, rk: &str, retry: Option<RetryContext>) {
     match retry {
         Some(retry) => crate::player::restore_subtitle_offset(retry.sub_offset_ms),
         None => {
+            // A retry is the same item and keeps its speed; a new one starts at 1x.
+            crate::player::reset_play_rate();
             if let Some(offset_ms) = remembered_subtitle_offset(sid, rk) {
                 crate::player::restore_subtitle_offset(offset_ms);
             }
@@ -8193,7 +8230,13 @@ fn retry_context_with(ps: &PlaybackSession, resume_ns: i64, direct_play: Option<
 /// `ctx` is the HUD's context line (`year · rating · runtime`). The caller formats it
 /// (`app::playback::movie_ctx`) because the runtime string is `ui::fmt`'s and `route` sits below
 /// `ui`.
-pub fn request_play_movie(ps: &mut PlaybackSession, meta: &mut plx_data::stores::metadata::MetadataStore, m: &PmsMovie, ctx: &str) -> bool {
+pub fn request_play_movie(
+    ps: &mut PlaybackSession,
+    meta: &mut plx_data::stores::metadata::MetadataStore,
+    m: &PmsMovie,
+    ctx: &str,
+    version: Option<plx_plex::plex::MediaId>,
+) -> bool {
     if m.part.is_empty() {
         return false;
     }
@@ -8217,6 +8260,7 @@ pub fn request_play_movie(ps: &mut PlaybackSession, meta: &mut plx_data::stores:
         &m.acodec,
         &m.title,
         ctx,
+        version,
     )
 }
 
@@ -8257,7 +8301,7 @@ pub fn request_play_up_next(ps: &mut PlaybackSession, meta: &mut plx_data::store
     } else {
         surface_sid()
     };
-    request_play(ps, meta, sid, &u.rk, &u.part, &u.vcodec, &u.acodec, title, ctx)
+    request_play(ps, meta, sid, &u.rk, &u.part, &u.vcodec, &u.acodec, title, ctx, None)
 }
 
 /// Supersede an in-flight resolve (BACK during a load). The landing is dropped by generation.
@@ -8505,6 +8549,7 @@ fn apply_plan(ps: &mut PlaybackSession, meta: &mut plx_data::stores::metadata::M
             // after this point (the track PUT, a transcode seek, the retranscode, the stop, and
             // the 10 s progress reporter engine.rs is about to spawn) resolves its server from it.
             cur_rk: rk.to_string(),
+            cur_media_index: plan.media_index,
             cur_sid: plan.sid,
             // The carried track, as `build_stream` froze it from the fetched stream. `None` = the
             // plan names the server default, or its track list was never fetched.
@@ -8657,6 +8702,7 @@ fn prepare_original_remux(
     let spec_for = |audio, force_burn| {
         transcode_spec(
             rk,
+            plan.media_index,
             &replacement,
             &replacement,
             plx_plex::plex::TranscodeOffset::from_seconds(plan.offset_secs.max(0)),
@@ -8967,6 +9013,7 @@ pub(super) struct RetranscodeClaimInputs {
     client: &'static plx_plex::plex::Client,
     sid: ServerId,
     rk: String,
+    media_index: usize,
     part_id: i64,
     audio_sid: i64,
     subtitle_sid: i64,
@@ -9098,6 +9145,7 @@ pub(super) fn request_retranscode(
     let qsess = next_encoder_session(&inputs.namespace);
     let sp = transcode_spec(
         &inputs.rk,
+        inputs.media_index,
         &qsess,
         &qsess,
         plx_plex::plex::TranscodeOffset::from_seconds(inputs.offset_secs.max(0)),
@@ -9256,6 +9304,7 @@ fn prepare_retranscode_inputs(
         src_dv_decision: ps.src_dv_decision,
         carried_audio: ps.cur_audio.clone(),
         rk,
+        media_index: cur_media_index(ps),
     })
 }
 
@@ -10874,6 +10923,10 @@ mod resolve_route_tests;
 #[cfg(test)]
 #[path = "decision_plan_tests.rs"]
 mod plan_tests;
+
+#[cfg(test)]
+#[path = "decision_version_tests.rs"]
+mod version_tests;
 
 #[cfg(test)]
 #[path = "decision_quality_recovery_tests.rs"]

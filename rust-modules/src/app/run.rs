@@ -1903,7 +1903,7 @@ pub(crate) unsafe fn playback_tick(app: &mut App, fr: &mut Frame) {
         // The return hold ends when the refetch it waits for has SETTLED for the played item's
         // source: issued (the owed flag is spent) and that source's read taken, whether it brought
         // a catalog or failed (a failure keeps the content and moves no generation, so the
-        // generation is not the signal). A refused launch settles at once. Nothing here can extend
+        // generation is not the signal). A refused launch is settled by the next Hubs step, one frame later. Nothing here can extend
         // the hold: the bound is the dip's own, on the frame clock.
         super::playback::return_hold_settle(app, fr.now);
         // What quiet reads staged for Home lands here when the store says nothing in view moves
@@ -2577,7 +2577,8 @@ pub(crate) unsafe fn update(app: &mut App, fr: &mut Frame) {
         // costs one batch at its exit); the patches below are not held.
         app.bridge.hold_network(matches!(app.route(), AppArg::Player));
         // Stops first: the resume patch lands before any read of the item is asked for.
-        app.bridge.stops_pump();
+        let endpoints = app.bridge.stops_pump();
+        super::bridge::execute_endpoint_outcomes(&mut app.pages, endpoints);
         app.bridge.catalog_feed(&mut app.pages);
         let endpoints = app.bridge.viewstate_pump();
         super::bridge::execute_endpoint_outcomes(&mut app.pages, endpoints);
@@ -2602,7 +2603,9 @@ pub(crate) unsafe fn update(app: &mut App, fr: &mut Frame) {
                 }
                 shown
             });
-        if app.bridge.notify_pump(&content, shown) {
+        let (resynced, endpoints) = app.bridge.notify_pump(&content, shown);
+        super::bridge::execute_endpoint_outcomes(&mut app.pages, endpoints);
+        if resynced {
             app.reread.resync(); // a lost stream: events were missed, every covered page is owed a re-read
         }
         // …and the covered pages' own re-read, once each cover episode (`app/reread.rs`).
@@ -3056,6 +3059,7 @@ pub(crate) unsafe fn report(app: &mut App, fr: &mut Frame) {
                 | AppArg::ItemMenu(_)
                 | AppArg::PlayerOverlay(_)
                 | AppArg::AltSources(_)
+                | AppArg::VersionsPanel(_)
                 | AppArg::TracksPanel(_)
                 | AppArg::AboutPanel
                 | AppArg::PersonBio
@@ -4353,7 +4357,8 @@ mod lifecycle_regression_tests {
                 "h264",
                 "aac",
                 "First",
-                ""
+                "",
+                None,
             ));
             self.entered.recv_timeout(Duration::from_secs(3)).unwrap();
         }
@@ -4585,7 +4590,8 @@ mod lifecycle_regression_tests {
                 "hevc",
                 "eac3",
                 "Episode 1",
-                ""
+                "",
+                None,
             ));
             self.entered.recv_timeout(Duration::from_secs(3)).unwrap();
             self.resolve();
@@ -5445,7 +5451,7 @@ mod lifecycle_regression_tests {
         // The viewer pauses the live Engine through the real transport, so it owns a user hold
         // that only a real resume releases.
         assert!(
-            plx_media::player::lifecycle::set_transport_paused(&mut rig.app.adapters.player, true),
+            plx_media::player::transport::set_transport_paused(&mut rig.app.adapters.player, true),
             "the fixture's pause is accepted"
         );
         assert!(paused(), "the Engine is under the viewer's pause");
@@ -5813,7 +5819,8 @@ mod lifecycle_regression_tests {
             "h264",
             "aac",
             "Replacement",
-            ""
+            "",
+            None,
         ));
         rig.accept_start();
         assert!(plx_media::route::play_pending());
@@ -5856,6 +5863,14 @@ mod lifecycle_regression_tests {
         loop_requests(app);
         unsafe { update(app, &mut fr); }
         app.bridge.assert_no_store_jobs_left_for_test();
+    }
+
+    /// One frame, then the jobs the stores sent in it run on this thread (the test runner parks
+    /// them, as it parks a detail fetch): a read-back's request reaches the server in the frame
+    /// that sent it, as a worker's would, and its answer is the next frame's to take.
+    fn step_and_run_jobs(rig: &mut Rig, t: &mut u32) {
+        step(&mut rig.app, t, vec![]);
+        rig.app.bridge.run_held_store_jobs_for_test();
     }
 
     /// The page stack on the transition `boot.rs` builds it with. `app()`'s dispatcher commits
@@ -6172,7 +6187,7 @@ mod lifecycle_regression_tests {
         plx_media::route::scrobble_stop(&mut rig.app.player.session, Some(("1".into(), 30_000, 60_000)), None);
         plx_media::route::drain_scrobble();
         poll_until("returning to the page re-read nothing: its resume point is still the one it opened with", || {
-            step(&mut rig.app, &mut t, vec![]);
+            step_and_run_jobs(&mut rig, &mut t);
             plx_data::metadata::detail_generation_for_test(rig.app.bridge.metadata_mut().adapter_ref()) > reads_before
         });
     }
@@ -6327,9 +6342,9 @@ mod lifecycle_regression_tests {
         assert!(rig.app.bridge.viewstate_run(plx_data::stores::viewstate::ViewStateCmd::Request {
             sid: rig.sid, rk: "100".into(), write: plx_data::viewstate::Write::Watched,
             scope: plx_data::viewstate::Scope::Show, guid: String::new(),
-        }));
+        }).changed);
         poll_until("the write and its read-back never finished", || {
-            step(&mut rig.app, t, vec![]);
+            step_and_run_jobs(rig, t);
             let seen = rig.requests.lock().unwrap();
             seen.iter().position(|r| r.contains("/:/scrobble"))
                 .is_some_and(|at| seen.iter().skip(at).any(|r| r.contains("GET /library/metadata/100") && !r.contains("children")))
@@ -7148,7 +7163,7 @@ mod lifecycle_regression_tests {
         plx_media::route::scrobble_stop(&mut rig.app.player.session, Some(("1".into(), 600_000, 600_000)), None);
         plx_media::route::drain_scrobble();
         poll_until("the grid tile never read watched", || {
-            step(&mut rig.app, &mut t, vec![]);
+            step_and_run_jobs(&mut rig, &mut t);
             rig.app.bridge.grid_tile_for_test(0) == Some((true, false, 0))
         });
         // The read-back that found the end queued the fan-out-only request (a second server is
@@ -7389,7 +7404,8 @@ mod lifecycle_regression_tests {
         assert!(!plx_media::route::stops_owed(), "the retired stop is no longer owed");
         // before any frame: the mailbox itself, which the app would otherwise drain into the new stores
         assert!(plx_media::route::take_landed_stops().is_empty(), "the old identity's stop reached the mailbox");
-        for _ in 0..12 { step(&mut rig.app, &mut t, vec![]); }
+        // the read-back is a `StoreJob`: the rig's `Held` runner parks it, and only the sweep runs it
+        for _ in 0..12 { step_and_run_jobs(&mut rig, &mut t); }
         assert_eq!(requests_matching(&rig, "GET /library/metadata/", from), 0, "the old identity's stop was read back");
     }
 
@@ -7449,22 +7465,24 @@ mod lifecycle_regression_tests {
         assert!(rig.app.bridge.viewstate_run(plx_data::stores::viewstate::ViewStateCmd::Request {
             sid: rig.sid, rk: "1".into(), write: plx_data::viewstate::Write::Watched,
             scope: plx_data::viewstate::Scope::Leaf, guid: String::new(),
-        }));
+        }).changed);
         poll_until("the write never reached the server", || {
-            step(&mut rig.app, &mut t, vec![]);
+            step_and_run_jobs(&mut rig, &mut t);
             requests_matching(&rig, "/:/scrobble", reads_from) == 1
         });
-        for _ in 0..12 { step(&mut rig.app, &mut t, vec![]); }
+        // The held jobs run in these frames too: a read-back sent under the player would reach the
+        // server here, so the count below is a statement about what the store sent.
+        for _ in 0..12 { step_and_run_jobs(&mut rig, &mut t); }
         assert!(super::super::bridge::player(&rig.app.pages).is_some(), "premise: still under the player");
         assert_eq!(requests_matching(&rig, "GET /library/metadata/", reads_from), 0, "a read-back went out under the player");
         assert_eq!(rig.app.bridge.hub_refetches_for_test(), refetches, "a hubs refetch started under the player");
         let back = back_key(t + 16);
         step(&mut rig.app, &mut t, vec![back]);
         poll_until("the read-back never went out after the player left", || {
-            step(&mut rig.app, &mut t, vec![]);
+            step_and_run_jobs(&mut rig, &mut t);
             requests_matching(&rig, "GET /library/metadata/", reads_from) >= 1
         });
-        for _ in 0..12 { step(&mut rig.app, &mut t, vec![]); }
+        for _ in 0..12 { step_and_run_jobs(&mut rig, &mut t); }
         assert_eq!(requests_matching(&rig, "GET /library/metadata/", reads_from), 1, "one batch, at the exit");
     }
 

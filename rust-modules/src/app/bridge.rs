@@ -570,7 +570,7 @@ impl Bridge {
         let stores = plx_data::stores::Stores::default();
         let mut directory = plx_data::stores::browse::DirectorySnapshot::default();
         let browse = stores.capture_browse(&mut directory);
-        let search = stores.search_snapshot(browse.directory.view());
+        let search = stores.search_snapshot(browse.directory.view(), &Self::household_ids());
         Self::with_publications_and_stores(measure, now_us, init, session_adapter, consent,
             consent_adapter, store_runner,
             StorePublications {
@@ -1035,7 +1035,7 @@ impl Bridge {
         let browse_changed = listing_changed || !self.directory.same_publication(&directory_before)
             || hubs_before != (self.section_hubs.view().id(), self.section_hubs.view().revision());
         let search = if self.home_io.is_some() { self.search.clone() } else {
-            self.stores.search_snapshot(self.directory.view())
+            self.stores.search_snapshot(self.directory.view(), &Self::household_ids())
         };
         let search_changed = !self.search.same_publication(&search);
         if search_changed {
@@ -1135,7 +1135,11 @@ impl Bridge {
             }
             if let Some((rk, mark)) = page.focused_episode(ret.focus, meta) {
                 // the ONE entry point whose item is a leaf of the season this page has loaded
-                let mut arg = strip_menu_arg(sid, &rk, ItemMenuKind::Episode { mark }, entry, ret.focus, rect);
+                let versions = meta.current()
+                    .and_then(|d| d.episodes.position(&rk).and_then(|i| d.episodes.get(i)))
+                    .map(|ep| ep.versions.clone())
+                    .unwrap_or_default();
+                let mut arg = strip_menu_arg(sid, &rk, ItemMenuKind::Episode { mark, versions }, entry, ret.focus, rect);
                 arg.watchlist = self.watchlist_face(page.watchlist_hex(), plx_data::watchlist::model::Kind::Show, true);
                 return Some(arg);
             }
@@ -1247,8 +1251,14 @@ impl Bridge {
         self.stores.person_run(cmd)
     }
 
+    /// One frame's Person pump: refill the keys, step, and start the requests the step emitted, all
+    /// in this call, so the tape's admissions are written where the page asked for them, before
+    /// the next store's (`collection_pump`, then the detail reconciliation) record theirs.
     pub(crate) fn person_pump(&mut self) -> bool {
-        self.stores.person_pump()
+        super::adapters::stores::refill_client_keys(&mut self.client_keys);
+        let changed = self.stores.person_pump(&self.client_keys);
+        self.start_store_jobs_of(StoreId::Person);
+        changed
     }
 
     pub(crate) fn person_view(&self) -> plx_data::person::PersonView<'_> {
@@ -1268,6 +1278,47 @@ impl Bridge {
         super::adapters::stores::refill_client_keys(&mut self.client_keys);
         let changed = self.stores.collection_pump(&self.client_keys);
         self.start_store_jobs_of(StoreId::Collection);
+        changed
+    }
+
+    /// The catalog page's frame pass: the store's landing pass (a refused read asked again, a
+    /// landing for a switched profile read again under the new one), then every job that pass
+    /// emitted started, in this call. No keys: the read is plex.tv's, as the captured identity.
+    pub(crate) fn catalog_pump(&mut self) -> bool {
+        let changed = self.stores.catalog.pump();
+        self.start_store_jobs_of(StoreId::Catalog);
+        changed
+    }
+
+    /// The catalog page mounted (or read again) for `hex`: the store's `open`, then its read
+    /// started in this call.
+    pub(crate) fn catalog_open(&mut self, hex: [u8; 12]) {
+        self.stores.catalog.open(hex);
+        self.start_store_jobs_of(StoreId::Catalog);
+    }
+
+    /// The catalog page went away (or the profile changed): forget the title. A reset emits no
+    /// job and drops any the store held, so there is nothing to drain.
+    pub(crate) fn catalog_reset(&mut self) {
+        self.stores.catalog.reset();
+    }
+
+    /// Run one subtitle-search command. A command decides from the model alone (the request is the
+    /// pump's, which is where the registry's answer is read), so it emits no job; the drain stays
+    /// so that a command which one day does is started in the call that ran it.
+    pub(crate) fn subsearch_run(&mut self, cmd: plx_data::subsearch::SubSearchCmd) -> bool {
+        let changed = self.stores.subtitle_search_run(cmd);
+        self.start_store_jobs_of(StoreId::SubtitleSearch);
+        changed
+    }
+
+    /// One frame's subtitle-search pump: refill the keys, step, and start the request the step
+    /// emitted, all in this call. The player's search panel is what pumps the store, so the refill
+    /// costs a registry walk only while that panel is open.
+    pub(crate) fn subsearch_pump(&mut self) -> bool {
+        super::adapters::stores::refill_client_keys(&mut self.client_keys);
+        let changed = self.stores.subtitle_search_pump(&self.client_keys);
+        self.start_store_jobs_of(StoreId::SubtitleSearch);
         changed
     }
 
@@ -1304,7 +1355,9 @@ impl Bridge {
     /// return how many there were. Called by a caller that ran a command on the bare store
     /// ([`Bridge::metadata_mut`]) right after that call, so the tape's admission record is written
     /// where the command was issued, and by the backstop ([`Bridge::start_late_store_jobs`]). A
-    /// step the Bridge runs itself drains only its own store, with [`Bridge::start_store_jobs_of`].
+    /// step the Bridge runs itself drains the outboxes it can fill: its own store's with
+    /// [`Bridge::start_store_jobs_of`], and for a `Stores` call that fans out to other stores each
+    /// one in its `*_FILLS` list, with [`Bridge::start_store_jobs_in`].
     pub(crate) fn start_store_jobs(&mut self) -> usize {
         let jobs = self.stores.take_jobs();
         self.start_jobs(jobs)
@@ -1317,6 +1370,13 @@ impl Bridge {
     pub(crate) fn start_store_jobs_of(&mut self, id: StoreId) -> usize {
         let jobs = self.stores.take_jobs_of(id);
         self.start_jobs(jobs)
+    }
+
+    /// [`Bridge::start_store_jobs_of`] for each store a fanning `Stores` call can fill, in the order
+    /// its `*_FILLS` list names them (`Stores::VIEWSTATE_FILLS`, `Stores::NOTIFY_FILLS`): the
+    /// calls that step more than one store drain every outbox they can fill and nothing else.
+    pub(crate) fn start_store_jobs_in(&mut self, ids: &[StoreId]) -> usize {
+        ids.iter().map(|&id| self.start_store_jobs_of(id)).sum()
     }
 
     fn start_jobs(&mut self, jobs: Vec<plx_data::stores::StoreJob>) -> usize {
@@ -1338,7 +1398,7 @@ impl Bridge {
         }
         self.late_store_jobs += late;
         plx_base::eventlog::log(&format!(
-            "stores: WARN {late} store job(s) reached a pump unstarted ({} so far): a sender bypassed its Bridge drain (metadata_run / collection_pump / start_store_jobs_of / start_store_jobs)",
+            "stores: WARN {late} store job(s) reached a pump unstarted ({} so far): a sender bypassed its Bridge drain (metadata_run / person_pump / collection_pump / catalog_open / catalog_pump / subsearch_pump / search_run / search_pump / reconcile_pump / hubs_run / viewstate_run / viewstate_pump / notify_pump / start_store_jobs_in / start_store_jobs_of / start_store_jobs)",
             self.late_store_jobs
         ));
     }
@@ -1348,6 +1408,13 @@ impl Bridge {
     #[cfg(test)]
     pub(crate) fn run_held_store_jobs_for_test(&mut self) -> usize {
         self.store_runner.run_held()
+    }
+
+    /// TEST ONLY: [`Bridge::run_held_store_jobs_for_test`] for ONE store's jobs (a rig that feeds
+    /// the catalog page runs the catalog's read and leaves a Detail fetch parked).
+    #[cfg(test)]
+    pub(crate) fn run_held_store_jobs_of_for_test(&mut self, id: StoreId) -> usize {
+        self.store_runner.run_held_of(id)
     }
 
     /// TEST ONLY: run the session cache refresh the fixture adapter is holding, on this thread,
@@ -1361,7 +1428,7 @@ impl Bridge {
 
     /// TEST ONLY: no sender bypassed the drain. A frame's end is the moment to ask, and both halves
     /// matter: a job still on an outbox is a sender that neither went through its store's Bridge
-    /// method ([`Bridge::metadata_run`], [`Bridge::collection_pump`]) nor drained with
+    /// method ([`Bridge::metadata_run`], [`Bridge::person_pump`], [`Bridge::collection_pump`], [`Bridge::catalog_open`], [`Bridge::catalog_pump`], [`Bridge::subsearch_pump`], [`Bridge::search_run`], [`Bridge::search_pump`], [`Bridge::reconcile_pump`], [`Bridge::hubs_run`], [`Bridge::viewstate_run`], [`Bridge::viewstate_pump`], [`Bridge::notify_pump`]) nor drained with
     /// [`Bridge::start_store_jobs`] (the detail pump's
     /// backstop would start it a frame late), and a nonzero `late_store_jobs` is a sender the
     /// backstop has ALREADY rescued, which the job check alone cannot see once `update()` has run
@@ -1369,9 +1436,9 @@ impl Bridge {
     #[cfg(test)]
     pub(crate) fn assert_no_store_jobs_left_for_test(&self) {
         assert!(!self.stores.has_jobs(),
-            "a store job sits on an outbox: its sender neither ran through its store's Bridge drain (metadata_run / collection_pump / start_store_jobs_of) nor drained with Bridge::start_store_jobs");
+            "a store job sits on an outbox: its sender neither ran through its store's Bridge drain (metadata_run / person_pump / collection_pump / catalog_open / catalog_pump / subsearch_pump / search_run / search_pump / reconcile_pump / hubs_run / viewstate_run / viewstate_pump / notify_pump / start_store_jobs_in / start_store_jobs_of) nor drained with Bridge::start_store_jobs");
         assert_eq!(self.late_store_jobs, 0,
-            "a pump's backstop had to start store jobs their sender left unstarted: that sender bypassed its Bridge drain (metadata_run / collection_pump / start_store_jobs_of / start_store_jobs)");
+            "a pump's backstop had to start store jobs their sender left unstarted: that sender bypassed its Bridge drain (metadata_run / person_pump / collection_pump / catalog_open / catalog_pump / subsearch_pump / search_run / search_pump / reconcile_pump / hubs_run / viewstate_run / viewstate_pump / notify_pump / start_store_jobs_in / start_store_jobs_of / start_store_jobs)");
     }
 
     pub(crate) fn metadata_view(&self) -> plx_data::metadata::MetadataView<'_> {
@@ -1386,8 +1453,14 @@ impl Bridge {
         self.stores.metadata_pump()
     }
 
-    pub(crate) fn viewstate_run(&mut self, cmd: plx_data::stores::viewstate::ViewStateCmd) -> bool {
-        self.stores.viewstate_run(cmd, self.directory.view())
+    /// The outcome's `endpoints` are the refreshes the edit's Hubs step settled (a launch the
+    /// runner refused since the last Hubs step is settled by whatever steps Hubs next): the caller
+    /// carries them.
+    pub(crate) fn viewstate_run(&mut self, cmd: plx_data::stores::viewstate::ViewStateCmd) -> plx_data::stores::StoreOutcome {
+        super::adapters::stores::refill_client_keys(&mut self.client_keys);
+        let outcome = self.stores.viewstate_run(cmd, self.directory.view(), &self.client_keys);
+        self.start_store_jobs_in(plx_data::stores::Stores::VIEWSTATE_FILLS);
+        outcome
     }
 
     /// Keep the view-state reconcile network work owed while the player is on top
@@ -1398,18 +1471,24 @@ impl Bridge {
 
     /// Take the stops whose `stopped` POST was attempted or abandoned, patch each item's resume
     /// point at once, and owe it a read-back (`Stores::stops_landed`). Route-unconditional: an Up
-    /// Next chain stops one episode after another without ever leaving the player.
-    pub(crate) fn stops_pump(&mut self) {
+    /// Next chain stops one episode after another without ever leaving the player. The patches
+    /// reach Hubs as `ApplyView` only, which launches nothing, so this drains no outbox; the step
+    /// still settles a refused launch, so the endpoint refreshes it owes are returned for the caller
+    /// to carry.
+    pub(crate) fn stops_pump(&mut self) -> plx_data::stores::EndpointRefreshSet {
         let stops = plx_data::stores::take_landings_owed(
             &self.stores.landgate,
             plx_data::stores::StoreId::ViewStop,
             |got: &[plx_data::viewstate::StopRecord]| got.is_empty() && plx_media::route::stops_owed(),
             plx_media::route::take_landed_stops,
         );
-        if !stops.is_empty() {
-            self.stores.stops_landed(stops, self.directory.view());
-            plx_machine::idle::invalidate();
+        if stops.is_empty() {
+            return Default::default();
         }
+        super::adapters::stores::refill_client_keys(&mut self.client_keys);
+        let endpoints = self.stores.stops_landed(stops, self.directory.view(), &self.client_keys);
+        plx_machine::idle::invalidate();
+        endpoints
     }
 
     /// The Watchlist store's landing pass, once a frame and route-unconditional: a write burst
@@ -1421,23 +1500,32 @@ impl Bridge {
     }
 
     pub(crate) fn viewstate_pump(&mut self) -> plx_data::stores::EndpointRefreshSet {
-        self.stores.viewstate_pump(self.directory.view())
+        super::adapters::stores::refill_client_keys(&mut self.client_keys);
+        let endpoints = self.stores.viewstate_pump(self.directory.view(), &self.client_keys);
+        self.start_store_jobs_in(plx_data::stores::Stores::VIEWSTATE_FILLS);
+        endpoints
     }
 
     /// The read-back worker's pass (`stores::viewreconcile`), and the Browse pump a membership
     /// re-query needs while a page is pushed over the Library page and so it is not ticked to pump its own store.
+    /// The keys are refilled first and the reads the step sent are started before this goes on, in
+    /// the same call; only the reconcile outbox is drained here, the shared `Stores` call's other
+    /// fan-outs emit no jobs of their own.
     pub(crate) fn reconcile_pump(&mut self) -> plx_data::stores::EndpointRefreshSet {
-        if self.stores.reconcile_pump(self.directory.view()) {
+        super::adapters::stores::refill_client_keys(&mut self.client_keys);
+        let mut outcome = self.stores.reconcile_pump(self.directory.view(), &self.client_keys);
+        self.start_store_jobs_of(StoreId::ViewReconcile);
+        if outcome.changed {
             plx_machine::idle::invalidate();
         }
         if self.stores.network_held() {
-            return Default::default(); // a membership re-query is a network read
+            return outcome.endpoints; // a membership re-query is a network read
         }
         let mut browse = self.stores.browse.borrow_mut();
         if browse.requery_owed() {
-            return browse.pump_with_gate(&self.stores.landgate).endpoints;
+            outcome.endpoints.merge(browse.pump_with_gate(&self.stores.landgate).endpoints);
         }
-        Default::default()
+        outcome.endpoints
     }
 
     /// The PMS notification feed's per-frame pass (`stores::notify`), and the mapping of what it
@@ -1447,10 +1535,14 @@ impl Bridge {
     /// are on it: what they hold decides which hints are read back.
     /// A notification never reaches the stop queue or the playback Offset (S5). The event log gets
     /// only server slots and counts, never a session, key or identifier.
-    /// `true` when a feed came back after a gap, so the caller owes the covered pages a re-read.
-    pub(crate) fn notify_pump(&mut self, pages: &[ContentArg], shown: plx_data::stores::notify_map::Shown) -> bool {
+    /// `true` when a feed came back after a gap, so the caller owes the covered pages a re-read;
+    /// and the endpoint refreshes the map's quiet refetches settled, for the caller to carry.
+    pub(crate) fn notify_pump(&mut self, pages: &[ContentArg], shown: plx_data::stores::notify_map::Shown)
+        -> (bool, plx_data::stores::EndpointRefreshSet) {
         let out = self.stores.notify_pump();
-        let spent = self.stores.notify_map(&out, pages, shown, self.directory.view());
+        super::adapters::stores::refill_client_keys(&mut self.client_keys);
+        let mut spent = self.stores.notify_map(&out, pages, shown, self.directory.view(), &self.client_keys);
+        self.start_store_jobs_in(plx_data::stores::Stores::NOTIFY_FILLS);
         if !spent.refetched.is_empty() || !spent.invalidated.is_empty() {
             plx_base::eventlog::log(&format!(
                 "notify: refetched {} source(s) invalidated {} server(s)", spent.refetched.len(), spent.invalidated.len()));
@@ -1461,7 +1553,7 @@ impl Bridge {
         for (sid, epoch) in &out.resynced {
             plx_base::eventlog::log(&format!("notify: sid={} resync epoch={epoch}", sid.raw()));
         }
-        !out.resynced.is_empty()
+        (!out.resynced.is_empty(), std::mem::take(&mut spent.endpoints))
     }
 
     /// WILL background: the feed's connections are cancelled now and stay closed until resume.
@@ -1523,10 +1615,33 @@ impl Bridge {
         self.stores.take_landed_views()
     }
 
+    /// The signed-in profile's household member ids, which Search's source scope grades each
+    /// server's household mark against. The Bridge reads the session here and hands the answer to
+    /// the store; the data layer reads no session global for it.
+    fn household_ids() -> Vec<i64> {
+        plx_plex::plex::session::peek().household_ids()
+    }
+
     /// Search commands snapshot their initial favourite-library ranking from the same retained
     /// directory the screen read when it emitted the command.
+    ///
+    /// A command emits no fetch (the requests are the pump's), but a recents edit
+    /// (`RememberRecent` / `ClearRecents`) emits its `StoreJob::SaveRecents` here, and this drain is
+    /// what starts it.
     pub(crate) fn search_run(&mut self, cmd: plx_data::stores::search::SearchCmd) -> bool {
-        self.stores.search_run(cmd, self.directory.view())
+        let changed = self.stores.search_run(cmd, self.directory.view());
+        self.start_store_jobs_of(StoreId::Search);
+        changed
+    }
+
+    /// One frame's Search pump: refill the keys, step, and start the fetches the step emitted, all
+    /// in this call. The step lands the sources' answers, runs the debounce and emits one request
+    /// per source that is due; the runner launches each through the client the keys named.
+    pub(crate) fn search_pump(&mut self, dt: f32) -> bool {
+        super::adapters::stores::refill_client_keys(&mut self.client_keys);
+        let changed = self.stores.search_pump(dt, self.directory.view(), &self.client_keys);
+        self.start_store_jobs_of(StoreId::Search);
+        changed
     }
 
     pub(crate) fn browse_directory(&self) -> plx_data::stores::browse::DirectoryView<'_> {
@@ -1544,7 +1659,7 @@ impl Bridge {
         self.stores.hubs.snapshot()
     }
 
-    /// Does a Hubs worker still owe this owner a landing? False once every spawned fetch has been
+    /// Does a Hubs worker still owe this owner a landing? False once every launched fetch has been
     /// taken (applied or failed) and for a launch that was refused.
     pub(crate) fn hubs_owed(&self) -> bool {
         self.stores.hubs.owed()
@@ -1558,8 +1673,11 @@ impl Bridge {
     /// Synchronous addressed Hubs command against this owner's retained Browse directory. Used by
     /// callers outside the per-frame dispatch (server activation, boot).
     pub(crate) fn hubs_run(&mut self, cmd: plx_data::stores::hubs::HubsCmd) -> plx_data::stores::StoreOutcome {
+        super::adapters::stores::refill_client_keys(&mut self.client_keys);
         let directory = self.directory.view();
-        self.stores.hubs.run_with_directory(cmd, directory)
+        let out = self.stores.hubs.run_with_directory(cmd, directory, &self.client_keys);
+        self.start_store_jobs_of(StoreId::Hubs);
+        out
     }
 
     /// One store's generation, for the recorder's per-frame landing scan
@@ -1790,6 +1908,18 @@ impl Bridge {
         Handled::Yes
     }
 
+    /// Start the Hubs jobs a controlled Home arm's step just emitted, each admitted through the
+    /// run's ledger ([`super::adapters::stores::StoreRunner::start_admitted`]). Inside the arm, so the
+    /// hubs line is written before a later arm of the same turn (`StoreWork::BrowseDiscovery`)
+    /// writes the discovery line: the ledger is one ordered queue. An associated function over the
+    /// fields (not `&mut self`) so an arm holding `home_io` can call it.
+    fn admit_hubs_jobs(stores: &mut plx_data::stores::Stores,
+        runner: &mut super::adapters::stores::StoreRunner, io: &mut super::bootstrap::HomeIo) {
+        for job in stores.take_jobs_of(StoreId::Hubs) {
+            runner.start_admitted(job, Some(io));
+        }
+    }
+
     fn deliver_inner(&mut self, to: MachineId, msg: &AppMsg, parts: &CxParts<u32>, fx: &mut Effects<'_, AppHost>) -> Handled {
         if let AppMsg::Consent(command) = msg {
             if to != MachineId::Consent { return Handled::No; }
@@ -1846,8 +1976,10 @@ impl Bridge {
         if let Some(io) = &mut self.home_io {
             match msg {
                 AppMsg::Store(StoreCmd::Hubs(cmd)) => {
+                    super::adapters::stores::refill_client_keys(&mut self.client_keys);
                     let directory = self.directory.view();
-                    let due = io.hubs_with_directory(&mut self.stores.hubs, Some(cmd.clone()), 0.0, directory).endpoints;
+                    let due = self.stores.hubs.run_with_directory(cmd.clone(), directory, &self.client_keys).endpoints;
+                    Self::admit_hubs_jobs(&mut self.stores, &mut self.store_runner, io);
                     return Self::carry(&mut self.endpoint_carry, due);
                 }
                 AppMsg::Store(StoreCmd::Browse(plx_data::stores::browse::BrowseCmd::Discovery(result))) => {
@@ -1864,8 +1996,10 @@ impl Bridge {
                     return Self::carry(&mut self.endpoint_carry, endpoints);
                 }
                 AppMsg::StoreWork(plx_data::stores::StoreWork::Hubs) => {
+                    super::adapters::stores::refill_client_keys(&mut self.client_keys);
                     let directory = self.directory.view();
-                    let due = io.hubs_with_directory(&mut self.stores.hubs, None, parts.tick.dt(), directory).endpoints;
+                    let due = self.stores.hubs.tick_with_directory(parts.tick.dt(), directory, &self.client_keys).endpoints;
+                    Self::admit_hubs_jobs(&mut self.stores, &mut self.store_runner, io);
                     return Self::carry(&mut self.endpoint_carry, due);
                 }
                 AppMsg::StoreWork(plx_data::stores::StoreWork::BrowseDiscovery) => {
@@ -1885,12 +2019,12 @@ impl Bridge {
                 return Handled::Yes;
             }
             AppMsg::Store(StoreCmd::SubtitleSearch(command)) => {
-                self.stores.subtitle_search_run(command.clone());
+                self.subsearch_run(command.clone());
                 return Handled::Yes;
             }
             AppMsg::Store(StoreCmd::ViewState(command)) => {
-                self.viewstate_run(command.clone());
-                return Handled::Yes;
+                let due = self.viewstate_run(command.clone()).endpoints;
+                return Self::carry(&mut self.endpoint_carry, due);
             }
             AppMsg::Store(StoreCmd::Metadata(command)) => {
                 self.metadata_run(command.clone());
@@ -1908,19 +2042,25 @@ impl Bridge {
                 Handled::Yes
             }
             AppMsg::Store(StoreCmd::Hubs(c)) => {
+                super::adapters::stores::refill_client_keys(&mut self.client_keys);
                 let directory = self.directory.view();
-                let due = self.stores.hubs.run_with_directory(c.clone(), directory).endpoints;
+                let due = self.stores.hubs.run_with_directory(c.clone(), directory, &self.client_keys).endpoints;
+                self.start_store_jobs_of(StoreId::Hubs);
                 Self::carry(&mut self.endpoint_carry, due)
             }
             AppMsg::Store(cmd) => step_store(cmd, &cx, fx),
             AppMsg::HubsResult(result) => {
+                super::adapters::stores::refill_client_keys(&mut self.client_keys);
                 let directory = self.directory.view();
-                let due = self.stores.hubs.land_with_directory(result, directory).endpoints;
+                let due = self.stores.hubs.land_with_directory(result, directory, &self.client_keys).endpoints;
+                self.start_store_jobs_of(StoreId::Hubs);
                 Self::carry(&mut self.endpoint_carry, due)
             }
             AppMsg::StoreWork(plx_data::stores::StoreWork::Hubs) => {
+                super::adapters::stores::refill_client_keys(&mut self.client_keys);
                 let directory = self.directory.view();
-                let due = self.stores.hubs.tick_with_directory(parts.tick.dt(), directory).endpoints;
+                let due = self.stores.hubs.tick_with_directory(parts.tick.dt(), directory, &self.client_keys).endpoints;
+                self.start_store_jobs_of(StoreId::Hubs);
                 Self::carry(&mut self.endpoint_carry, due)
             }
             AppMsg::StoreWork(plx_data::stores::StoreWork::BrowseDiscovery) => {
@@ -1932,11 +2072,11 @@ impl Bridge {
                 Self::carry(&mut self.endpoint_carry, due)
             }
             AppMsg::StoreWork(plx_data::stores::StoreWork::Search { dt_us }) => {
-                self.stores.search_pump(*dt_us as f32 / 1_000_000.0, self.directory.view());
+                self.search_pump(*dt_us as f32 / 1_000_000.0);
                 Handled::Yes
             }
             AppMsg::StoreWork(plx_data::stores::StoreWork::SubtitleSearch) => {
-                self.stores.subtitle_search_pump();
+                self.subsearch_pump();
                 Handled::Yes
             }
             _ => Handled::No,
@@ -4133,6 +4273,10 @@ mod search_publication_tests;
 mod search_owned_tests;
 
 #[cfg(test)]
+#[path = "search_fetch_pin_tests.rs"]
+mod search_fetch_pin_tests;
+
+#[cfg(test)]
 #[path = "detail_panel_tests.rs"]
 mod detail_panel_tests;
 
@@ -4168,6 +4312,12 @@ mod collection_lifecycle_tests;
 #[cfg(test)]
 #[path = "store_admission_tests.rs"]
 mod store_admission_tests;
+#[cfg(test)]
+#[path = "home_admission_tests.rs"]
+mod home_admission_tests;
+#[cfg(test)]
+#[path = "person_admission_tests.rs"]
+mod person_admission_tests;
 
 // The route-test lanes: key-driven tests of the Library / Collections redesign's routes, over one
 // shared driver (`test_support::World`).
