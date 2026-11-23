@@ -522,17 +522,31 @@ fn change_live_channel(
 ) {
     if !matches!(direction, -1 | 1) { return; }
     let channels = bridge.livetv_view().channels;
-    let Some((index, _)) = live_channel(&player.session, channels) else { return };
-    if channels.len() < 2 { return; }
+    let Some((index, _)) = live_channel(&player.session, channels) else {
+        // The channel on screen is not one the lineup lists (an unloaded or a redacted store), so
+        // there is no neighbour to walk to. The device log is the only place this is visible.
+        log(&format!("livetv: channel change ignored — direction {direction} on a channel the lineup does not list"));
+        return;
+    };
+    if channels.len() < 2 {
+        log("livetv: channel change ignored — one channel in the lineup");
+        return;
+    }
     let next = if direction < 0 { index.checked_sub(1).unwrap_or(channels.len() - 1) } else { (index + 1) % channels.len() };
     let ch = &channels[next];
     let play = plx_screens::registry::PlayIntent::Live {
         sid: ch.sid, dvr: ch.dvr.clone(), channel: ch.channel.clone(), title: ch.name.clone(),
     };
+    // Read while the lineup is still borrowed: the bridge is borrowed mutably further down.
+    let refused = format!("livetv: channel change refused — the route took no live request for {} {}", ch.vcn, ch.dvr);
     stop_player_resources(player, pa, repause_at, pages);
     *repause_at = -1;
     if super::content::request_play_intent(&mut player.session, bridge.metadata_mut(), &play) {
         start_playback(&mut player.session, pa, 0, Origin::Here, HUD_LINGER_MS, None, pages, bridge);
+    } else {
+        // The retune took no request (a resolve still in flight, or a route that refused it): the
+        // old channel has already been stopped, so this is a failed change, not an ignored one.
+        log(&refused);
     }
 }
 

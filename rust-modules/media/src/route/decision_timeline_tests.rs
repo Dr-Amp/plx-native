@@ -1612,6 +1612,44 @@ fn a_refused_live_decision_still_plays_the_session_s_own_playlist() {
     assert_eq!((plan.vcodec.as_str(), plan.acodec.as_str()), ("h264", "aac"));
 }
 
+/// **The blocker from the maintainer's webOS 4.5 run** (PR #993, 2026-11-15): a channel whose own
+/// playlist cannot be decoded falls back to the live universal transcoder — the session the tune is
+/// already recording, asked fresh at the edge — instead of ending playback. Nothing here stops that
+/// session: the `transcode stopped ok=0` in his log was the app stopping an encode that never ran.
+#[test]
+fn a_live_channel_s_refused_own_playlist_converts_the_recording_it_opened() {
+    use std::time::Duration;
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let (port, rx) = live_pms(false);
+    let sid = plx_plex::plex::register_for_test("route-live-open-failed", "127.0.0.1", port, "tok-live", "cid-live");
+    let mut meta = plx_data::stores::metadata::MetadataStore::default();
+    assert!(request_live(&mut ps, &mut meta, plx_platform::devcaps::caps(), sid, "7",
+        "C101.242.ersatztv.org", "Channel one"));
+    assert!(wait_resolve_workers_for_test(Duration::from_secs(10)));
+    let plan = pump_play(&mut ps, &mut meta).expect("the tune lands");
+    settle_plan_start_in_unit_test(&mut ps, plan.route_start);
+    // The tune and its direct-play decision are on the wire before the open that fails; drain both so
+    // the request this test reads next can only be the conversion's.
+    assert!(rx.recv_timeout(Duration::from_secs(5)).expect("the tune").starts_with("POST /livetv/dvrs/7/"));
+    assert!(rx.recv_timeout(Duration::from_secs(5)).expect("the decision").starts_with("GET /video/:/transcode/universal/decision?"));
+    // The demuxer then failed on the cut's edge (no SPS/IDR), which is the failure this rung exists for.
+    assert!(matches!(dispatch_live_refusal_conversion(&mut ps), RecoveryDispatch::Flying { .. }));
+    let mut decision = None;
+    while let Ok(line) = rx.recv_timeout(Duration::from_secs(5)) {
+        if line.starts_with("GET /video/:/transcode/universal/decision?") {
+            decision = Some(line);
+            break;
+        }
+    }
+    let decision = decision.expect("the conversion asks the server for a decision");
+    assert_eq!(query_param(&decision, "path"), Some("%2Flivetv%2Fsessions%2F9b9fe727-0000-46db-b94c-ef512e3e61d2"),
+        "the source is the session the tune opened, not a library ratingKey: {decision}");
+    assert_eq!(query_param(&decision, "directPlay"), Some("0"), "a conversion never copies as a direct play");
+    assert!(rx.recv_timeout(Duration::from_millis(400)).is_err(),
+        "the recording is the live timeline's to stop: the conversion requests nothing after its decision");
+}
+
 #[test]
 fn a_live_plan_abandoned_after_its_tune_still_stops_the_recording() {
     let live = plx_plex::plex::livetv::LiveSession { key: "/livetv/sessions/abcdef01".into(), rating_key: String::new() };

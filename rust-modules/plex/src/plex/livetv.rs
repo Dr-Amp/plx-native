@@ -12,8 +12,8 @@
 //! session of its own; the universal decision for that session, which names the playlist this
 //! client reads; and the timeline, whose `stopped` is what ends the recording and frees the tuner.
 
-use super::client::{Client, QueryBuilder};
-use super::models::{Dvr, EpgChannel, Metadata};
+use super::client::{Client, JsonStatusOutcome, QueryBuilder};
+use super::models::{Dvr, EpgChannel, MediaProvider, Metadata};
 use super::params::TimelineState;
 
 /// One channel as a Live TV row shows it.
@@ -39,6 +39,9 @@ pub struct LiveChannel {
     pub ends_at: i64,
 }
 
+/// `GET /media/providers`.
+pub const PROVIDERS_PATH: &str = "/media/providers";
+
 /// `GET /livetv/dvrs`.
 pub const DVRS_PATH: &str = "/livetv/dvrs";
 
@@ -63,6 +66,25 @@ pub fn on_now_path(epg: &str, now: i64) -> String {
         .int("beginsAt%3C", now)
         .int("endsAt%3E", now)
         .build()
+}
+
+/// The Live TV DVRs a `/media/providers` answer names: every provider whose `protocols` carry
+/// `livetv` and whose identifier is path-safe. The identifier IS the guide path prefix, and its
+/// numeric suffix is the `{dvr}` of the tune path — the same pair `/livetv/dvrs` reports as
+/// (`epgIdentifier`, `key`), which is why this read can stand in for that admin-only one.
+pub fn live_tv_providers(providers: &[MediaProvider]) -> Vec<Dvr> {
+    providers
+        .iter()
+        .filter(|p| p.protocols.split(',').any(|protocol| protocol.trim() == "livetv"))
+        .filter_map(|p| {
+            let epg = p.identifier.trim();
+            if !is_provider_id(epg) {
+                return None;
+            }
+            let key = epg.rsplit_once(':')?.1;
+            is_path_id(key).then(|| Dvr { key: key.to_owned(), epg_identifier: epg.to_owned(), ..Default::default() })
+        })
+        .collect()
 }
 
 /// Discovery status is historical, not tuner health (§10). Only path-safe DVRs/providers qualify.
@@ -323,18 +345,32 @@ pub fn update_on_now(rows: &mut [LiveChannel], on_now: &[Metadata]) {
 }
 
 impl Client {
-    /// `GET /livetv/dvrs` — every DVR with its tuners. `None` when the read failed; an empty list
-    /// is a server with no DVR.
-    pub fn live_tv_dvrs(&self) -> Option<Vec<Dvr>> {
-        self.get_json(DVRS_PATH).map(|c| c.dvr)
+    /// `GET /media/providers` — where Live TV is found, because `/livetv/dvrs` is an admin read: a
+    /// Home user who has been granted Live TV gets a `403` from the DVR list and only ever sees the
+    /// `livetv` provider here (PR #993 review, 2026-11-15). A server that cannot answer this read at
+    /// all — an older PMS, a 404 — falls back to the DVR list, which is what this used to read.
+    ///
+    /// Answers `(status, dvrs)`: the status of the read that produced the answer, and the DVRs
+    /// (`None` when neither read produced one, i.e. the transport or the server refused).
+    pub fn live_tv_dvrs(&self) -> (Option<i32>, Option<Vec<Dvr>>) {
+        if let JsonStatusOutcome::Response { status, parsed: Some(container) } = self.get_json_status(PROVIDERS_PATH) {
+            return (Some(status), Some(live_tv_providers(&container.media_provider)));
+        }
+        match self.get_json_status(DVRS_PATH) {
+            JsonStatusOutcome::Response { status, parsed } => (Some(status), parsed.map(|c| c.dvr)),
+            JsonStatusOutcome::Transport => (None, None),
+        }
     }
 
-    /// `GET /{epg}/lineups/dvr/channels` — one DVR's mapped channels.
-    pub fn epg_channels(&self, epg: &str) -> Option<Vec<EpgChannel>> {
+    /// `GET /{epg}/lineups/dvr/channels` — one DVR's mapped channels, with the read's status.
+    pub fn epg_channels(&self, epg: &str) -> (Option<i32>, Option<Vec<EpgChannel>>) {
         if !is_provider_id(epg) {
-            return None;
+            return (None, None);
         }
-        self.get_json(&epg_channels_path(epg)).map(|c| c.channel)
+        match self.get_json_status(&epg_channels_path(epg)) {
+            JsonStatusOutcome::Response { status, parsed } => (Some(status), parsed.map(|c| c.channel)),
+            JsonStatusOutcome::Transport => (None, None),
+        }
     }
 
     /// `GET /{epg}/grid` bounded to the airings on at `now` (Unix seconds).
@@ -414,6 +450,23 @@ mod tests {
         serde_json::from_slice::<super::super::models::Envelope>(json)
             .expect("live tv fixture")
             .media_container
+    }
+
+    /// `/media/providers` is how a token that `/livetv/dvrs` refuses still finds Live TV: the
+    /// provider whose `protocols` name livetv, whose identifier's suffix is the DVR the tune path
+    /// needs. The same DVR the admin read reports, found without it.
+    #[test]
+    fn the_live_tv_provider_names_the_dvr_the_tune_path_needs() {
+        let providers: &[u8] = br#"{"MediaContainer":{"size":3,"MediaProvider":[
+            {"identifier":"com.plexapp.plugins.library","protocols":"library","title":"Movies"},
+            {"identifier":"tv.plex.providers.epg.xmltv:5","protocols":"livetv","title":"Live TV & DVR"},
+            {"identifier":"tv.plex.providers.epg.xmltv:bad/id","protocols":"livetv","title":"malformed"}]}}"#;
+        let dvrs = live_tv_providers(&page(providers).media_provider);
+        assert_eq!(dvrs.len(), 1, "only the path-safe livetv provider is a DVR");
+        assert_eq!((dvrs[0].key.as_str(), dvrs[0].epg_identifier.as_str()),
+            ("5", "tv.plex.providers.epg.xmltv:5"));
+        assert!(live_tv_providers(&page(providers).media_provider[..1]).is_empty(),
+            "a library provider is not a tuner");
     }
 
     // Shapes measured on PMS 1.43.3 with an ErsatzTV tuner; hosts are documentation addresses.

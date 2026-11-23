@@ -206,17 +206,17 @@ impl Script {
     fn new() -> Self { Self { calls: Default::default(), second_dvr: false, fail_lineup: false.into(), fail_grid: false.into(), empty_grid: false, empty_lineup: false } }
 }
 impl LiveTvIo for Script {
-    fn dvrs(&self) -> Option<Vec<plx_plex::plex::Dvr>> {
+    fn dvrs(&self) -> (Option<i32>, Option<Vec<plx_plex::plex::Dvr>>) {
         self.calls.borrow_mut().push("dvrs".into());
-        Some((7..=if self.second_dvr { 8 } else { 7 }).map(|id| plx_plex::plex::Dvr {
+        (Some(200), Some((7..=if self.second_dvr { 8 } else { 7 }).map(|id| plx_plex::plex::Dvr {
             key: id.to_string(), epg_identifier: format!("tv.plex.providers.epg.xmltv:{id}"), ..Default::default()
-        }).collect())
+        }).collect()))
     }
-    fn channels(&self, provider: &str) -> Option<Vec<plx_plex::plex::EpgChannel>> {
+    fn channels(&self, provider: &str) -> (Option<i32>, Option<Vec<plx_plex::plex::EpgChannel>>) {
         self.calls.borrow_mut().push(format!("channels:{provider}"));
-        if self.fail_lineup.get() && provider.ends_with('8') { return None; }
-        if self.empty_lineup { return Some(Vec::new()); }
-        Some(vec![plx_plex::plex::EpgChannel { grid_key: "C2".into(), vcn: "2".into(), title: "2 Channel".into(), thumb: "/logo".into() }])
+        if self.fail_lineup.get() && provider.ends_with('8') { return (Some(404), None); }
+        if self.empty_lineup { return (Some(200), Some(Vec::new())); }
+        (Some(200), Some(vec![plx_plex::plex::EpgChannel { grid_key: "C2".into(), vcn: "2".into(), title: "2 Channel".into(), thumb: "/logo".into() }]))
     }
     fn on_now(&self, provider: &str, now: i64) -> Option<Vec<plx_plex::plex::Metadata>> {
         self.calls.borrow_mut().push(format!("grid:{provider}:{now}"));

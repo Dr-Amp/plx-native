@@ -1034,6 +1034,39 @@ mod tests {
         run(&mut machine(), refused(SHUT, if suspect { on_dts(f) } else { f })).1
     }
 
+    /// The facts of a Live TV tune whose own playlist could not be decoded.
+    fn live_facts() -> OpenFacts {
+        OpenFacts { live: true, ..OpenFacts::default() }
+    }
+
+    /// **The rung a channel has and a library item does not** (PR #993, the maintainer's webOS 4.5
+    /// run): a tune's cut can carry no parameter sets at all, so the demuxer fails before a codec is
+    /// fed and no later segment repairs it. The session is already recording, so the one route left
+    /// is the live universal transcode of that same session — asked once per request; a refused
+    /// conversion reads out instead of asking the server for another.
+    #[test]
+    fn a_live_channel_converts_once_and_a_refused_conversion_reads_out() {
+        let mut m = machine();
+        let cause = LoadRefusal::Refused { num: 601 };
+        let (handled, fx) = run(&mut m, refused(cause, live_facts()));
+        assert_eq!((handled, fx), (Handled::Yes, vec![RecoveryEffect::LiveTranscode { flight: 1 }]));
+        assert_eq!(m.phase(), Phase::Flight);
+        let (handled, fx) = run(&mut m, RecoveryEvent::FlightRefused);
+        assert_eq!((handled, fx), (Handled::Yes, vec![RecoveryEffect::ShowError { refusal: cause }]));
+        assert_eq!(m.phase(), Phase::Failed);
+    }
+
+    /// Forced Direct Play is the viewer's own answer: a channel is not converted behind it, and the
+    /// live rung is not spent on the way to saying so.
+    #[test]
+    fn a_live_channel_under_forced_direct_play_reads_out() {
+        let mut m = machine();
+        let facts = OpenFacts { forced: true, ..live_facts() };
+        let (_, fx) = run(&mut m, refused(SHUT, facts));
+        assert_eq!(fx, vec![RecoveryEffect::ShowError { refusal: SHUT }]);
+        assert_eq!(m.phase(), Phase::Failed);
+    }
+
     fn h264_4k() -> Option<StreamVideo> {
         Some(StreamVideo { codec: "h264".into(), width: 3840, height: 2160 })
     }

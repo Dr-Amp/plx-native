@@ -302,26 +302,70 @@ fn finish_with(port: &LiveTvPort, addr: Addr, req: LiveTvReq,
     port.done(addr, LiveTvAnswer { result, grid });
 }
 trait LiveTvIo {
-    fn dvrs(&self) -> Option<Vec<plx_plex::plex::Dvr>>;
-    fn channels(&self, provider: &str) -> Option<Vec<plx_plex::plex::EpgChannel>>;
+    fn dvrs(&self) -> (Option<i32>, Option<Vec<plx_plex::plex::Dvr>>);
+    fn channels(&self, provider: &str) -> (Option<i32>, Option<Vec<plx_plex::plex::EpgChannel>>);
     fn on_now(&self, provider: &str, now: i64) -> Option<Vec<plx_plex::plex::Metadata>>;
 }
 impl LiveTvIo for Client {
-    fn dvrs(&self) -> Option<Vec<plx_plex::plex::Dvr>> { self.live_tv_dvrs() }
-    fn channels(&self, provider: &str) -> Option<Vec<plx_plex::plex::EpgChannel>> { self.epg_channels(provider) }
+    fn dvrs(&self) -> (Option<i32>, Option<Vec<plx_plex::plex::Dvr>>) { self.live_tv_dvrs() }
+    fn channels(&self, provider: &str) -> (Option<i32>, Option<Vec<plx_plex::plex::EpgChannel>>) { self.epg_channels(provider) }
     fn on_now(&self, provider: &str, now: i64) -> Option<Vec<plx_plex::plex::Metadata>> { self.epg_on_now(provider, now) }
 }
+
+/// What one lineup read says its HTTP status was: `none` when the transport never answered (so the
+/// line cannot be mistaken for a refusal the server actually sent).
+fn status_str(status: Option<i32>) -> String {
+    status.map_or_else(|| "none".to_owned(), |s| s.to_string())
+}
+
+/// **One line per lineup read** (PR #993 review): a server, its HTTP status, how many DVRs and
+/// channels it answered with, and how many channels were dropped and why. Without it a tab that
+/// never appeared left nothing in the event log to say which read refused.
+fn log_lineup(sid: ServerId, dvr: &str, status: Option<i32>, mapped: usize, kept: usize) {
+    let dropped = mapped.saturating_sub(kept);
+    plx_base::eventlog::log(&format!(
+        "livetv: lineup sid={} dvr={dvr} status={} mapped={mapped} kept={kept} dropped={dropped}{}",
+        sid.raw(),
+        status_str(status),
+        if dropped > 0 { " (no grid key)" } else { "" },
+    ));
+}
+
 fn read(client: &impl LiveTvIo, req: &LiveTvReq) -> Option<ReadResult> {
     match &req.work {
         Work::Discover => {
-            let dvrs = client.dvrs()?;
+            let (status, dvrs) = client.dvrs();
+            let Some(dvrs) = dvrs else {
+                plx_base::eventlog::log(&format!(
+                    "livetv: dvrs sid={} status={} dvrs=none",
+                    req.sid.raw(),
+                    status_str(status),
+                ));
+                return None;
+            };
+            let total = dvrs.len();
             let dvrs: Vec<_> = livetv::usable_dvrs(&dvrs).collect();
+            plx_base::eventlog::log(&format!(
+                "livetv: dvrs sid={} status={} dvrs={total} usable={}",
+                req.sid.raw(),
+                status_str(status),
+                dvrs.len(),
+            ));
             let mut result = ReadResult { guides: Vec::new(), roster: Some(dvrs.iter().map(|d| d.key.clone()).collect()), complete: true, retry: false };
             for dvr in dvrs {
-                let Some(channels) = client.channels(&dvr.epg_identifier) else {
+                let (status, channels) = client.channels(&dvr.epg_identifier);
+                let Some(channels) = channels else {
+                    plx_base::eventlog::log(&format!(
+                        "livetv: lineup sid={} dvr={} status={} channels=none",
+                        req.sid.raw(),
+                        dvr.key,
+                        status_str(status),
+                    ));
                     result.complete = false; result.retry = true; continue;
                 };
+                let mapped = channels.len();
                 let mut channels = livetv::lineup(dvr, &channels, &[]);
+                log_lineup(req.sid, &dvr.key, status, mapped, channels.len());
                 if channels.is_empty() {
                     result.guides.push(Guide { dvr: dvr.key.clone(), provider: dvr.epg_identifier.clone(), channels,
                         refresh_at: i64::MAX, retry_cd: 0 });

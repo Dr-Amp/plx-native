@@ -3520,6 +3520,12 @@ class MockPms:
         lv = self.livetv
         segs = [s for s in p.split("/") if s]
         reads = method in ("GET", "HEAD")
+        if reads and p == "/media/providers":
+            # Where the app finds Live TV (a non-admin token gets 403 from `/livetv/dvrs`): the
+            # provider whose `protocols` name livetv, identified by the same string as `epgIdentifier`.
+            rows = [{"identifier": "com.plexapp.plugins.library", "protocols": "library", "title": "Movies"},
+                    {"identifier": lv.EPG_ID, "protocols": "livetv", "title": "Live TV & DVR"}]
+            return j(self.container(size=len(rows), MediaProvider=rows))
         if reads and p == "/livetv/dvrs":
             return j(self.container(size=1, Dvr=[lv.dvr()]))
         if reads and segs == [lv.EPG_ID, "lineups", "dvr", "channels"]:

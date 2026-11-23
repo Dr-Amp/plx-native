@@ -133,6 +133,26 @@ pub struct MediaContainer {
     /// `GET /{epg}/lineups/dvr/channels` only — a DVR's guide lineup (`livetv.rs`).
     #[serde(rename = "Channel", default, deserialize_with = "de_vec")]
     pub channel: Vec<EpgChannel>,
+    /// `GET /media/providers` only — the media providers this token may use, Live TV's among them
+    /// (`livetv.rs`).
+    #[serde(rename = "MediaProvider", default, deserialize_with = "de_vec")]
+    pub media_provider: Vec<MediaProvider>,
+}
+
+/// One row of `/media/providers`: what this token may read, not what the server holds. A Live TV
+/// provider names itself in `protocols` and its `identifier` is the guide path prefix
+/// (`tv.plex.providers.epg.xmltv:5`), the same string `/livetv/dvrs` calls `epgIdentifier`
+/// (`docs/pms-api.md` §10). This read is what a non-admin user CAN see: `/livetv/dvrs` answers that
+/// token with 403.
+#[derive(Deserialize, Default, Clone, Debug)]
+pub struct MediaProvider {
+    #[serde(default, deserialize_with = "de_str")]
+    pub identifier: String,
+    /// The protocols the provider serves for this token; `livetv` is the one Live TV is found by.
+    #[serde(default, deserialize_with = "de_str")]
+    pub protocols: String,
+    #[serde(default, deserialize_with = "de_str")]
+    pub title: String,
 }
 
 /// One DVR on `/livetv/dvrs`: a tuner the server owns plus the EPG provider that names its

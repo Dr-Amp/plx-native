@@ -1817,6 +1817,13 @@ XMLTV guide. The app's reads live in `rust-modules/plex/src/plex/livetv.rs`.
   moment. A tuner that was not answering at start-up stays `dead` until a later discovery, however
   healthy it is in between. `POST /media/grabbers/devices?uri=…` probes the tuner and updates its URI
   but leaves `status` as it was. Both are admin writes; the app sends neither.
+- **`GET /media/providers`** → `MediaProvider[]`: `identifier`, `protocols` (`library`, `livetv`, …)
+  and `title`. This is the read a NON-ADMIN token can make: a Home user who has been granted Live TV
+  gets `403` from `/livetv/dvrs` and sees only the `tv.plex.providers.epg.xmltv:{dvr}` provider here
+  (reported by the maintainer on webOS 4.5, 2026-11-15), so the app finds Live TV through this and
+  falls back to the DVR list only when the read is absent. The provider identifier is the same string
+  `/livetv/dvrs` reports as `epgIdentifier` and its suffix is the same DVR key, so the tune path is
+  unchanged.
 - **`GET /{epgIdentifier}/lineups/dvr/channels`** → `Channel[]`, only the channels the DVR mapped:
   `id` = `gridKey` (`C101.242.ersatztv.org`), `vcn` (`"101"`), `title` and `callSign` with the number
   in front (`"101 Some Channel"`), `thumb` — a URL on the TUNER's host. Fetched through
