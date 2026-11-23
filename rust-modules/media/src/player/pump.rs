@@ -271,6 +271,7 @@ fn open_facts(ps: &crate::route::PlaybackSession, native_audio: Option<plx_platf
         no_frames: ps.readout().raw().frames == 0,
         native_audio,
         forced: crate::route::forced_direct_play(ps),
+        live: crate::route::is_live(ps),
         direct: !crate::route::is_transcoding(ps),
         audio: crate::route::stream_audio(ps),
         video: crate::route::stream_video(ps),
@@ -405,6 +406,13 @@ fn drive_open_recovery(ps: &mut crate::route::PlaybackSession, first: super::rec
                     }
                     let secs = (ps.readout().raw().playpos_ns / 1_000_000_000).max(0);
                     crate::route::dispatch_unopened_auto_hls(ps, secs)
+                }
+                RecoveryEffect::LiveTranscode { flight } => {
+                    // A channel's own playlist could not be decoded as emitted (a tune's cut begins
+                    // wherever the tuner was, so it may carry no parameter sets at all). The server is
+                    // already recording that session: read it through the live universal transcoder.
+                    super::log(&format!("open recovery: converting the live channel (flight {flight}/1)"));
+                    crate::route::dispatch_live_refusal_conversion(ps)
                 }
                 RecoveryEffect::DecodeInApp { audio, refusal } => {
                     if let plx_platform::devcaps::Facet::Audio { codec, .. } = &audio {

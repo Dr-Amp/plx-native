@@ -242,6 +242,12 @@ pub struct OpenFacts {
     pub native_audio: Option<Facet>,
     /// Forced Direct Play (`route::forced_direct_play`): the viewer asked not to convert.
     pub forced: bool,
+    /// The request is a Live TV channel (`route::is_live`). The server is already recording the
+    /// session a tune opened, so a channel whose own playlist cannot be decoded has one rung no
+    /// library item has: the live universal transcode of that same session
+    /// ([`RecoveryEffect::LiveTranscode`]), planned from the session rather than from a `/decision`
+    /// this request already asked for.
+    pub live: bool,
     /// The route is a direct play: the file's own bytes, with no server session between
     /// (`!route::is_transcoding`). Only such a route can be re-opened with the app decoding its audio
     /// ([`RecoveryEffect::DecodeInApp`]).
@@ -302,6 +308,13 @@ pub enum RecoveryEffect {
     ConvertBoth { flight: u32 },
     /// Fly the HLS contingency a cold Auto Original retained (`dispatch_unopened_auto_hls`).
     StartAutoHls,
+    /// **A Live TV channel's own rung**: convert the session the tune is already recording through
+    /// the live universal transcoder (`dispatch_live_refusal_conversion`). A channel's playlist is
+    /// whatever the tuner emitted — a cut that begins mid-GOP with no parameter sets decodes to
+    /// nothing — and the server can always transcode that same session, which is the route the
+    /// official client and this app's own live conversion use. `flight` is the ordinal of the
+    /// flight among the request's.
+    LiveTranscode { flight: u32 },
     /// Reload the SAME direct play with the app decoding `audio` itself (stereo 48 kHz PCM) instead
     /// of the pipeline's decoder or the server: the app-decode rung (the very last one for a source of
     /// more than two channels, which the app would mix down; a stereo source's comes before the manual
@@ -360,6 +373,10 @@ pub enum Rung {
     /// The manual both-facets rung: a manual pick's encode with no video copy, planned from `start`
     /// less the same facets. It plays as the report's own class (`encode`), not as `Both`'s HLS.
     Encode,
+    /// The Live TV channel's own conversion (`RecoveryEffect::LiveTranscode`): the session the tune
+    /// already opened, read through the live universal transcoder. It is no refusal class of the
+    /// television's, so it is not reported ([`super::report`]).
+    Live,
 }
 
 #[derive(Clone, Debug)]
@@ -404,6 +421,9 @@ pub struct OpenRecovery {
     /// The codec the app-decode rung put in force ([`attempt_for`]); `Some` = the rung is spent, which
     /// is once per request.
     in_app: Option<String>,
+    /// The Live TV rung is spent: a channel is converted once per request, so a conversion that
+    /// fails reads out instead of asking the server for another one.
+    live_spent: bool,
     /// A refused attempt was an app decode: a later clean landing proves nothing about any facet.
     unprovable: bool,
     /// The request's first refusal that [`LoadRefusal::reports`], with the stream it named; kept for
@@ -458,6 +478,7 @@ impl OpenRecovery {
             flights: 0,
             pictured: false,
             in_app: None,
+            live_spent: false,
             unprovable: false,
             refused: None,
             rescue: None,
@@ -583,8 +604,10 @@ impl OpenRecovery {
         (!plx_platform::devcaps::is_pcm_codec(&a.codec) && !set_plays_it && !video_may_be_it).then(|| a.codec.clone())
     }
 
-    /// The rung `facts` select. The order is the proof that no rung of main is reordered: pending
-    /// rollback, Forced's app decode (a track of at most two channels) or read-out, the facet rung, a cold
+    /// The rung `facts` select. The order is the proof that no rung of main is reordered: a Live TV
+    /// channel's own conversion (its only rung: the session is already recording, so there is
+    /// nothing to re-plan from `/decision`), pending rollback, Forced's app decode (a track of at most
+    /// two channels) or read-out, the facet rung, a cold
     /// Auto Original's HLS rung, then for a track of at most two channels the app decode and a manual
     /// pick's encode, or for a surround track the encode and then the app decode (the owner's rule: the
     /// app mixes a surround source down only as the last rung), the read-out. The facet
@@ -593,6 +616,27 @@ impl OpenRecovery {
     fn decide(&mut self, refusal: LoadRefusal, facts: &OpenFacts, fx: &mut Vec<RecoveryEffect>) {
         let flight = |rung| State::Flight { rung, cause: refusal, facts: facts.clone() };
         self.note_refusal(refusal, facts);
+        if facts.live {
+            // A Live TV channel: the server is already recording the session the tune opened, so
+            // the route to fall back to is the live universal transcode of that same session,
+            // whatever this failure named — a cut with no parameter sets fails the demuxer before a
+            // codec is ever fed, which is the failure that used to end playback. Once per request,
+            // and never under Forced Direct Play (the viewer asked not to convert); a conversion
+            // that fails as well reads out.
+            if !self.live_spent && !facts.forced {
+                self.live_spent = true;
+                self.flights += 1;
+                fx.push(RecoveryEffect::LiveTranscode { flight: self.flights });
+                self.state = flight(Rung::Live);
+                // Not a rescue the report names: a channel's own conversion is no refusal class.
+                self.rescue = None;
+                return;
+            }
+            fx.push(RecoveryEffect::ShowError { refusal });
+            self.state = State::Failed;
+            self.rescue = None;
+            return;
+        }
         if facts.pending_original {
             // A refusal of native audio (the learner's write was queued earlier in this step)
             // narrows the rollback's profile too: the restored HLS route must not offer it natively
@@ -793,6 +837,13 @@ impl OpenRecovery {
                     Rung::Both | Rung::Encode => self.app_decode_or_error(cause, &facts, fx),
                     // A refused rollback stays terminal.
                     Rung::Rollback => {
+                        fx.push(RecoveryEffect::ShowError { refusal: cause });
+                        self.state = State::Failed;
+                        self.rescue = None;
+                    }
+                    // A refused live conversion holds the same: the channel's one extra route was
+                    // flown, so the failure it was rescued from stands.
+                    Rung::Live => {
                         fx.push(RecoveryEffect::ShowError { refusal: cause });
                         self.state = State::Failed;
                         self.rescue = None;

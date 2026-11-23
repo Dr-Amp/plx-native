@@ -5528,6 +5528,62 @@ pub fn dispatch_unopened_auto_hls(ps: &mut PlaybackSession, offset_secs: i64) ->
 /// The line a refused conversion settles with (never logged as another recovery's).
 pub(super) const REFUSAL_CONVERSION_REJECTED: &str = "the server could not convert the refused stream";
 
+/// The line a refused LIVE conversion settles with: the channel's own playlist failed to decode, and
+/// the conversion of the session it is recording failed as well.
+pub(super) const LIVE_CONVERSION_REJECTED: &str = "the server could not convert the live channel";
+
+/// **A Live TV channel's own recovery**: the session the tune is recording, read through the live
+/// universal transcoder (`RecoveryEffect::LiveTranscode`).
+///
+/// It differs from [`dispatch_refusal_conversion`] in exactly three ways, and each is a property of
+/// the source rather than a policy:
+///  1. There is nothing to re-plan from a `/decision`: the tune already opened the session, so the
+///     attempt's caps and the session are the whole input ([`prepare_retranscode_inputs`] with
+///     `live` set).
+///  2. The source is that session ([`plx_plex::plex::TranscodeSource::Live`]) at the live edge, not a
+///     Part at an offset.
+///  3. The session is the server's: this encode neither stops it when a decision is refused nor
+///     retires it when the route lands (`transcode_stop` would end the recording the channel plays
+///     from; the live timeline's `stopped` owns it).
+///
+/// The contract asks for the whole conversion (`no_video_copy`) because the whole point of the rung is
+/// that the channel's own bytes could not be decoded: keeping the video copy would hand the same
+/// undecodable bitstream to the pipeline again.
+pub fn dispatch_live_refusal_conversion(ps: &mut PlaybackSession) -> RecoveryDispatch {
+    if !is_live(ps) {
+        return RecoveryDispatch::Refused;
+    }
+    let expected = worker_ticket();
+    if !is_worker_ticket_current(&expected) {
+        return RecoveryDispatch::Refused;
+    }
+    let contract = plx_plex::plex::EncodeContract {
+        delivery: AUTO_HLS_DELIVERY,
+        no_video_copy: true,
+        ..Default::default()
+    };
+    let Some(inputs) = prepare_retranscode_inputs(ps, &expected, 0) else {
+        return RecoveryDispatch::Refused;
+    };
+    let Some(ticket) = begin_recovery_flight_start() else {
+        return RecoveryDispatch::Refused;
+    };
+    begin_recovery_flight(ticket.serial, 0);
+    if spawn_flight(
+        FlightOwner::Recovery(ticket),
+        0,
+        0,
+        Some(inputs),
+        ClaimWork::EncodeRecovery(contract, super::backend_policy::OfferId::URI_PMS_HLS),
+        RetranscodeFallback::RejectWith(LIVE_CONVERSION_REJECTED),
+    ) {
+        RecoveryDispatch::Flying { serial: ticket.serial }
+    } else {
+        let _ = reject_route_start_preparation(ticket);
+        RecoveryDispatch::Refused
+    }
+}
+
 /// What the refusal-conversion flight asks the server to do with the VIDEO.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VideoLane {
@@ -8393,7 +8449,15 @@ pub fn scrobble_stop(
         play_queue_item_id: pqi,
         audio_stream_id: aud,
         subtitle_stream_id: sub,
-        transcode_session: tsession,
+        transcode_session: if live.is_some() {
+            // A live route's encoder id IS the session the tune recorded (`/livetv/sessions/…`),
+            // which the timeline's `stopped` above already ended. Stopping it again as a transcode
+            // session only asked the server about an id it never registered one for, and logged the
+            // failure of an operation that should never have been sent.
+            String::new()
+        } else {
+            tsession
+        },
         reported_sid,
         reported_rk,
         timeline_stop,
@@ -12096,6 +12160,10 @@ pub(super) struct RetranscodeClaimInputs {
     src_dovi: plx_data::metadata::Dovi,
     src_dv_decision: plx_data::metadata::DvDecision,
     carried_audio: Option<CarriedAudio>,
+    /// The Live TV session this encode reads, when the route is a channel's own conversion
+    /// ([`dispatch_live_refusal_conversion`]): the source is the session the tune is recording, there
+    /// is no Part to select, and the session is the server's to stop — never this encode's.
+    live: Option<plx_plex::plex::livetv::LiveSession>,
 }
 
 /// What one accepted `/decision` attempt produced: the session the worker started and committed
@@ -12182,7 +12250,9 @@ fn retranscode_fallback_codecs(
 /// would send the identical PUT again. Skipped for a stale ticket, exactly as the attempt's own
 /// gate refuses to start.
 pub(super) fn select_streams_for_encode(off: &plx_base::task::OffFrame, inputs: &RetranscodeClaimInputs) {
-    if is_worker_ticket_current(&inputs.expected) {
+    // A channel has no Part to select streams on: the tune's session is the whole source, and the
+    // server is already recording it.
+    if inputs.live.is_none() && is_worker_ticket_current(&inputs.expected) {
         put_selection(off, inputs.sid, inputs.part_id, inputs.audio_sid, inputs.subtitle_sid);
     }
 }
@@ -12220,27 +12290,52 @@ pub(super) fn request_retranscode(
     }
     let plx_plex::plex::EncodeContract { audio, .. } = contract;
     let (fallback_vcodec, fallback_acodec) = retranscode_fallback_codecs(inputs, &contract);
-    let qsess = next_encoder_session(&inputs.namespace);
-    let sp = transcode_spec(
+    // A channel is read from the session the tune recorded: the encoder session IS that session, and
+    // its stop belongs to the live timeline, never to this encode (a `transcode_stop` here would end
+    // the recording the route came from).
+    let qsess = match &inputs.live {
+        Some(live) => live.key.clone(),
+        None => next_encoder_session(&inputs.namespace),
+    };
+    let source_name = match &inputs.live {
+        Some(live) => live.key.clone(),
+        None => qsess.clone(),
+    };
+    let mut sp = transcode_spec(
         &inputs.caps,
         &inputs.rk,
         inputs.media_index,
+        &source_name,
         &qsess,
-        &qsess,
-        plx_plex::plex::TranscodeOffset::from_seconds(inputs.offset_secs.max(0)),
+        // A channel is read at its live edge: there is no offset to seek in a recording that is
+        // still being written.
+        match inputs.live {
+            Some(_) => plx_plex::plex::TranscodeOffset::Fresh,
+            None => plx_plex::plex::TranscodeOffset::from_seconds(inputs.offset_secs.max(0)),
+        },
         inputs.audio_sid,
         inputs.subtitle_sid,
         contract,
     );
+    if let Some(live) = &inputs.live {
+        sp.source = plx_plex::plex::TranscodeSource::Live(&live.key);
+    }
+    // The encoder session this attempt may have registered, as its owner's to retire — a channel's
+    // session is not.
+    let retire_own_session = |qsess: &str| {
+        if inputs.live.is_none() {
+            let _ = inputs.client.transcode_stop(qsess);
+        }
+    };
     let Some(decision) = inputs.client.transcode_decision(off, &sp) else {
-        let _ = inputs.client.transcode_stop(&qsess);
+        retire_own_session(&qsess);
         return None;
     };
     // A live toggle the server refuses (or silently ignores — audio `copy` despite the params)
     // is a rejected action: the current stream is retained and the menu shows what plays.
     if enhancement_fallback(Some(&decision), audio) == Fallback::Retry {
         note_enhancement_refused("; current stream retained", audio);
-        let _ = inputs.client.transcode_stop(&qsess);
+        retire_own_session(&qsess);
         return None;
     }
     if let Some(reason) = refusal(&decision) {
@@ -12252,7 +12347,7 @@ pub(super) fn request_retranscode(
                 ": server supplied a reason"
             },
         ));
-        let _ = inputs.client.transcode_stop(&qsess);
+        retire_own_session(&qsess);
         return None;
     }
     let output_codecs = decision_codecs(&decision).unwrap_or((fallback_vcodec, fallback_acodec));
@@ -12361,8 +12456,11 @@ fn prepare_retranscode_inputs(
         return None;
     }
     let client = cur_client(ps)?;
+    let live = ps.cur_live.clone();
     let rk = cur_rk(ps);
-    if rk.is_empty() || !is_worker_ticket_current(expected) {
+    // A channel's route has no rating key: its source is the tuned session, which is what
+    // `live` carries.
+    if (rk.is_empty() && live.is_none()) || !is_worker_ticket_current(expected) {
         return None;
     }
     let logical = sess(ps);
@@ -12388,6 +12486,7 @@ fn prepare_retranscode_inputs(
         carried_audio: ps.cur_audio.clone(),
         rk,
         media_index: cur_media_index(ps),
+        live,
     })
 }
 

@@ -200,6 +200,54 @@ fn a_live_cursor_skips_unprimed_segments_then_starts_and_keeps_later_failures_st
 }
 
 #[test]
+fn a_fresh_tuner_cut_primes_on_its_first_valid_idr_and_discards_earlier_audio() {
+    let mut start = LiveCutStart::for_tuner_segment(true, false).unwrap();
+    assert!(LiveCutStart::for_tuner_segment(true, true).is_none(), "carried cuts already have a decoder anchor");
+    assert!(LiveCutStart::for_tuner_segment(false, false).is_none(), "independent/VOD segments stay strict");
+    assert!(!start.audio(Some(90)), "audio before video priming is discarded");
+
+    let mut params = H264ParamSets::default();
+    let mut out = Vec::new();
+    let mut clock = crate::hls::SegmentTimeline::default()
+        .begin(std::time::Duration::from_secs(1)).unwrap();
+    let non_idr = [0, 0, 1, 0x41, 4];
+    let key = ts_h264_access_unit(&non_idr, &mut params, &mut out).unwrap();
+    assert!(!key);
+    let first_video = clock.normalize_video(10_000_000_000);
+    assert!(!start.video(key, 100), "leading non-IDR access units are not fed");
+    assert!(!start.primed());
+    let first_audio = clock.normalize_audio(9_980_000_000);
+    assert_eq!(first_audio.0, 0, "a discarded audio packet still establishes its lane's clock origin");
+
+    let idr = [0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 2, 0, 0, 1, 0x65, 3];
+    let key = ts_h264_access_unit(&idr, &mut params, &mut out).unwrap();
+    assert!(key, "the existing parser requires a real IDR and valid SPS/PPS");
+    let idr_at = clock.normalize_video(10_500_000_000);
+    assert!(start.video(key, 200));
+    assert_eq!(first_video.0, 0);
+    assert_eq!(idr_at.0, 500, "the discarded prefix is not rebased into free playable buffer");
+    assert_eq!(clock.end().0 - idr_at.0, 500, "only the portion after the IDR contributes reserve");
+    assert!(start.primed());
+    assert!(!start.audio(Some(199)), "late packet order cannot leak pre-IDR audio");
+    assert!(start.audio(Some(200)));
+    assert!(start.audio(Some(220)));
+    assert!(start.video(false, 240), "later pictures belong to the now-primed stream");
+}
+
+#[test]
+fn a_fresh_tuner_cut_without_an_idr_remains_unprimed_and_uses_the_existing_error() {
+    let mut start = LiveCutStart::for_tuner_segment(true, false).unwrap();
+    let mut params = H264ParamSets::default();
+    let mut out = Vec::new();
+    for pts in [100, 140, 180] {
+        let key = ts_h264_access_unit(&[0, 0, 1, 0x41, 4], &mut params, &mut out).unwrap();
+        assert!(!key);
+        assert!(!start.video(key, pts));
+    }
+    assert!(!start.primed(), "a segment without a valid IDR cannot start playback");
+}
+
+#[test]
 fn a_library_cursor_still_refuses_an_unprimed_first_segment() {
     for error in ["HLS segment has invalid video dimensions", "HLS segment does not begin with an IDR"] {
         let mut net = net(vec![("start.m3u8", MASTER.into()), ("media.m3u8", media(12, "", true))],

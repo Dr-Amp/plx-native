@@ -4008,6 +4008,9 @@ pub unsafe fn hls_demux_segment(
         .filter(|c| c.scope == scope && c.raster.0 > 0 && c.raster.1 > 0)
         .map(|c| (c.params.clone(), c.raster, c.anchors));
     let continuing = carried.is_some();
+    // Only a direct tuner playlist arms carry state. Its first readable cut can begin mid-GOP;
+    // live transcoder variants have no carry and remain independently decodable at every segment.
+    let mut live_cut_start = LiveCutStart::for_tuner_segment(live, continuing);
     let request_started = runtime.request_started();
     let retry_budget = segment
         .duration
@@ -4229,12 +4232,20 @@ pub unsafe fn hls_demux_segment(
                 &mut aubuf,
             )
             .map_err(HlsExit::Failed)?;
+            // Keep the segment's real timeline origin even when its leading pictures are not
+            // published; otherwise clock.end() would credit the discarded prefix as buffer.
+            let pts = clock.normalize_video(raw_pts).0.saturating_mul(1_000_000);
+            if let Some(start) = live_cut_start.as_mut() {
+                if !start.video(is_key, raw_pts) {
+                    av_packet_unref(input.pkt);
+                    continue;
+                }
+            }
             // A continued live segment is a cut of the stream the decoder is already inside.
             if video_packets == 0 && !is_key && !continuing {
                 av_packet_unref(input.pkt);
                 return Err(HlsExit::Failed(HLS_MISSING_IDR));
             }
-            let pts = clock.normalize_video(raw_pts).0.saturating_mul(1_000_000);
             aus.push(HlsAu {
                 data: aubuf.clone(),
                 pts_ns: pts,
@@ -4262,6 +4273,17 @@ pub unsafe fn hls_demux_segment(
             });
             let raw =
                 std::slice::from_raw_parts((*input.pkt).data, (*input.pkt).size.max(0) as usize);
+            if live_cut_start
+                .as_ref()
+                .is_some_and(|start| !start.audio(raw_pts))
+            {
+                if let Some(raw_pts) = raw_pts {
+                    // Establish the audio lane's origin without publishing this pre-IDR packet.
+                    clock.normalize_audio(raw_pts);
+                }
+                av_packet_unref(input.pkt);
+                continue;
+            }
             let duration_ns = packet_duration
                 .or_else(|| adts_duration_ns(raw))
                 .or(aac_duration);
@@ -4310,6 +4332,9 @@ pub unsafe fn hls_demux_segment(
     }
 
     if video_packets == 0 {
+        if live_cut_start.as_ref().is_some_and(|start| !start.primed()) {
+            return Err(HlsExit::Failed(HLS_MISSING_IDR));
+        }
         return Err(HlsExit::Failed(
             "HLS segment produced no video access units",
         ));
@@ -4476,6 +4501,40 @@ pub struct HlsCursor {
 const HLS_MISSING_RASTER: &str = "HLS segment has invalid video dimensions";
 const HLS_MISSING_IDR: &str = "HLS segment does not begin with an IDR";
 const LIVE_START_SKIP_SEGMENTS: u8 = 3;
+
+/// A fresh tuner cut may start mid-GOP. Do not feed its leading pictures or audio; prime the
+/// decoder only at the first IDR, which `ts_h264_access_unit` has already validated with SPS/PPS.
+#[derive(Default)]
+struct LiveCutStart {
+    idr_pts_ns: Option<i64>,
+}
+
+impl LiveCutStart {
+    fn for_tuner_segment(live_playlist: bool, continuing: bool) -> Option<Self> {
+        (live_playlist && !continuing).then(Self::default)
+    }
+
+    fn video(&mut self, is_idr: bool, pts_ns: i64) -> bool {
+        if self.idr_pts_ns.is_some() {
+            return true;
+        }
+        if is_idr {
+            self.idr_pts_ns = Some(pts_ns);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn audio(&self, pts_ns: Option<i64>) -> bool {
+        self.idr_pts_ns
+            .is_some_and(|idr| pts_ns.is_none_or(|pts| pts >= idr))
+    }
+
+    fn primed(&self) -> bool {
+        self.idr_pts_ns.is_some()
+    }
+}
 
 impl HlsCursor {
     fn skip_live_start(&mut self, segment: &crate::hls::Segment, net: &HlsNet, error: HlsExit) -> bool {
