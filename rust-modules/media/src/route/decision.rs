@@ -5532,6 +5532,10 @@ pub(super) const REFUSAL_CONVERSION_REJECTED: &str = "the server could not conve
 /// the conversion of the session it is recording failed as well.
 pub(super) const LIVE_CONVERSION_REJECTED: &str = "the server could not convert the live channel";
 
+/// The Feed recipe a live channel's conversion lands on: a fixed-segment PMS HLS route.
+pub(super) const LIVE_CONVERSION_RECIPE: super::backend_policy::OfferId =
+    super::backend_policy::OfferId::FEED_PMS_HLS;
+
 /// **A Live TV channel's own recovery**: the session the tune is recording, read through the live
 /// universal transcoder (`RecoveryEffect::LiveTranscode`).
 ///
@@ -5549,8 +5553,21 @@ pub(super) const LIVE_CONVERSION_REJECTED: &str = "the server could not convert 
 /// The contract asks for the whole conversion (`no_video_copy`) because the whole point of the rung is
 /// that the channel's own bytes could not be decoded: keeping the video copy would hand the same
 /// undecodable bitstream to the pipeline again.
+///
+/// The landing reloads through Feed (the only backend that reads live HLS today), so the flight is
+/// named by the Feed recipe the start door will be asked for: [`LIVE_CONVERSION_RECIPE`], the same
+/// recipe [`PlaybackSession::installed_feed_recipe`] classifies a fixed-segment PMS route as. It was
+/// named `URI_PMS_HLS`, which no Feed start admits, so the converted channel was refused at the door
+/// ("no qualified feed offer for this resolved route", the maintainer's webOS 4.5 run). A request
+/// that has already spent that recipe (it opened on a live transcode) has nothing new to convert to
+/// and reads out without asking PMS for a decision it could not start.
 pub fn dispatch_live_refusal_conversion(ps: &mut PlaybackSession) -> RecoveryDispatch {
-    if !is_live(ps) {
+    if !is_live(ps) || !ps.backends.feed {
+        return RecoveryDispatch::Refused;
+    }
+    if ps.backend_policy.as_ref().is_some_and(|policy|
+        !policy.may_qualify(plx_playback_contract::BackendKind::Feed, LIVE_CONVERSION_RECIPE)) {
+        crate::player::log("open recovery: the live conversion's recipe is already spent");
         return RecoveryDispatch::Refused;
     }
     let expected = worker_ticket();
@@ -5574,7 +5591,7 @@ pub fn dispatch_live_refusal_conversion(ps: &mut PlaybackSession) -> RecoveryDis
         0,
         0,
         Some(inputs),
-        ClaimWork::EncodeRecovery(contract, super::backend_policy::OfferId::URI_PMS_HLS),
+        ClaimWork::EncodeRecovery(contract, LIVE_CONVERSION_RECIPE),
         RetranscodeFallback::RejectWith(LIVE_CONVERSION_REJECTED),
     ) {
         RecoveryDispatch::Flying { serial: ticket.serial }

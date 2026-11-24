@@ -294,3 +294,42 @@ fn carried_live_state_keeps_segment_failures_strict() {
     assert_eq!(cursor.live_start_skips_left, LIVE_START_SKIP_SEGMENTS);
     crate::aq::aq_destroy(&mut *aq);
 }
+
+/// **A live playlist that stops advancing fails the read instead of freezing the picture.** The
+/// maintainer's webOS 4.5 run (PR #993): a Threadfin channel's playlist kept answering with the
+/// same segments and no end marker from 4:19 on; the reader re-read it 53 times and would have
+/// kept going, the picture frozen and nothing said. Past the stall limit the read fails with
+/// [`HLS_LIVE_STALLED`], which the open recovery turns into the channel's conversion or a read-out.
+#[test]
+fn a_live_playlist_that_stops_advancing_fails_the_read_instead_of_polling_forever() {
+    let mut net = net(vec![("start.m3u8", MASTER.into()), ("media.m3u8", media(12, "", false))],
+        Arc::new(Observer::default()));
+    let mut aq = crate::aq::aq_new(1024);
+    let mut cursor = open(&mut aq, &mut net, LIVE_ENTRY);
+    for sequence in 9..12 {
+        assert_eq!(hls_cursor_next(&mut cursor, &mut *aq, &mut net, None).unwrap().unwrap().sequence, sequence);
+    }
+    // The playlist answers unchanged from here on; the clock says it has for longer than the limit.
+    let unchanged = (0..4).map(|_| ("media.m3u8", media(12, "", false)));
+    net.curl = Some(Box::new(Playlists { replies: unchanged.collect(), body: VecDeque::new(), size: 0 }));
+    cursor.live_unchanged_since = Some(std::time::Instant::now()
+        - live_stall_limit(cursor.target_duration_secs) - std::time::Duration::from_secs(1));
+    let read = hls_cursor_next(&mut cursor, &mut *aq, &mut net, None);
+    assert!(matches!(read, Err(HlsExit::Failed(HLS_LIVE_STALLED))), "{read:?}");
+    crate::aq::aq_destroy(&mut *aq);
+}
+
+#[test]
+fn the_live_stall_clock_starts_on_the_first_empty_read_and_growth_clears_it() {
+    let limit = live_stall_limit(1);
+    assert_eq!(limit, std::time::Duration::from_secs(15), "a short target duration keeps the 15 s floor");
+    assert_eq!(live_stall_limit(10), std::time::Duration::from_secs(30));
+    let t0 = std::time::Instant::now();
+    let mut since = None;
+    assert!(!live_playlist_stalled(&mut since, 0, t0, limit), "the first empty read only starts the clock");
+    assert_eq!(since, Some(t0));
+    assert!(!live_playlist_stalled(&mut since, 0, t0 + limit, limit), "exactly the limit is still waiting");
+    assert!(live_playlist_stalled(&mut since, 0, t0 + limit + std::time::Duration::from_millis(1), limit));
+    assert!(!live_playlist_stalled(&mut since, 2, t0 + limit * 2, limit), "a new segment is progress");
+    assert_eq!(since, None);
+}

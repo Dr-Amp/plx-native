@@ -1650,6 +1650,44 @@ fn a_live_channel_s_refused_own_playlist_converts_the_recording_it_opened() {
         "the recording is the live timeline's to stop: the conversion requests nothing after its decision");
 }
 
+/// **A live channel's conversion reopens through the Feed start door.** Maintainer's webOS 4.5 run
+/// on a Threadfin channel (PR #993): the demuxer refused the cut, the conversion flew and landed,
+/// and the reload's Start was refused with "no qualified feed offer for this resolved route",
+/// because the flight named the URI backend's HLS recipe and the start door only admits Feed
+/// recipes. The landing must install, and the reload it asks for must pass the door on the Feed
+/// HLS recipe, so playback actually restarts.
+#[test]
+fn a_live_channel_s_conversion_restarts_playback_through_the_feed_door() {
+    use std::time::Duration;
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let (port, rx) = live_pms(false);
+    let sid = plx_plex::plex::register_for_test("route-live-restart", "127.0.0.1", port, "tok-live", "cid-live");
+    let mut meta = plx_data::stores::metadata::MetadataStore::default();
+    assert!(request_live(&mut ps, &mut meta, plx_platform::devcaps::caps(), sid, "7",
+        "C101.242.ersatztv.org", "Channel one"));
+    assert!(wait_resolve_workers_for_test(Duration::from_secs(10)));
+    let plan = pump_play(&mut ps, &mut meta).expect("the tune lands");
+    settle_plan_start_in_unit_test(&mut ps, plan.route_start);
+    assert!(ps.backend_planned_feed_allowed(), "premise: the channel's own playlist started on Feed");
+    assert!(matches!(dispatch_live_refusal_conversion(&mut ps), RecoveryDispatch::Flying { .. }));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let landing = loop {
+        if let Some(landing) = take_ready_recovery_flight(&mut ps) {
+            break landing;
+        }
+        assert!(std::time::Instant::now() < deadline, "the conversion never landed");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert!(matches!(landing.verdict, RecoveryVerdict::Install), "the conversion installs its route");
+    assert!(ps.backend_planned_feed_allowed(),
+        "the converted channel's reload must pass the Feed start door, not be refused");
+    assert_eq!(ps.planned_feed_offer(), Some(crate::route::backend_policy::OfferId::FEED_PMS_HLS));
+    assert!(ps.backend_offer_admitted(plx_playback_contract::BackendKind::Feed,
+        crate::route::backend_policy::OfferId::FEED_PMS_HLS));
+    drop(rx);
+}
+
 #[test]
 fn a_live_plan_abandoned_after_its_tune_still_stops_the_recording() {
     let live = plx_plex::plex::livetv::LiveSession { key: "/livetv/sessions/abcdef01".into(), rating_key: String::new() };

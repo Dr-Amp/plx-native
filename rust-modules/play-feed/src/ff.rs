@@ -4496,11 +4496,37 @@ pub struct HlsCursor {
     pub live: bool,
     /// Fresh opens may pass at most this many undecodable cuts before failing closed.
     pub live_start_skips_left: u8,
+    /// When the live playlist last stopped bringing segments: `None` while it grows. A live
+    /// recording whose playlist stays unchanged past [`live_stall_limit`] fails the read with
+    /// [`HLS_LIVE_STALLED`] instead of polling forever on a frozen picture.
+    pub live_unchanged_since: Option<std::time::Instant>,
 }
 
 const HLS_MISSING_RASTER: &str = "HLS segment has invalid video dimensions";
 const HLS_MISSING_IDR: &str = "HLS segment does not begin with an IDR";
 const LIVE_START_SKIP_SEGMENTS: u8 = 3;
+/// The maintainer's webOS 4.5 run (PR #993): a Threadfin channel's playlist stopped growing at 4:19,
+/// with no end marker, and the reader re-read it every 500 ms for good while the picture froze and
+/// nothing told the viewer. The read fails instead, and the open recovery decides what follows.
+const HLS_LIVE_STALLED: &str = "HLS live playlist stopped advancing";
+/// How long a live playlist may bring nothing new: three target durations (RFC 8216 lets a server
+/// take up to one and a half to publish the next segment), and never under 15 s, so a slow tuner
+/// that is still recording is not cut off.
+fn live_stall_limit(target_duration_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(target_duration_secs.saturating_mul(3).max(15))
+}
+
+/// Whether a live playlist read that brought `new` segments has now been unchanged for longer than
+/// `limit`. Growth clears the clock; the first empty read starts it.
+fn live_playlist_stalled(since: &mut Option<std::time::Instant>, new: usize,
+    now: std::time::Instant, limit: std::time::Duration) -> bool {
+    if new > 0 {
+        *since = None;
+        return false;
+    }
+    let started = *since.get_or_insert(now);
+    now.saturating_duration_since(started) > limit
+}
 
 /// A fresh tuner cut may start mid-GOP. Do not feed its leading pictures or audio; prime the
 /// decoder only at the first IDR, which `ts_h264_access_unit` has already validated with SPS/PPS.
@@ -4938,6 +4964,7 @@ pub fn hls_cursor_open(
             start_applied: false,
             live: true,
             live_start_skips_left: LIVE_START_SKIP_SEGMENTS,
+            live_unchanged_since: None,
         });
     }
     let master = crate::hls::parse_master(&master_landed, &master_text).map_err(|e| {
@@ -4960,6 +4987,7 @@ pub fn hls_cursor_open(
         start_applied: false,
         live: is_live_session_source(path),
         live_start_skips_left: if is_live_session_source(path) { LIVE_START_SKIP_SEGMENTS } else { 0 },
+        live_unchanged_since: None,
     })
 }
 
@@ -5043,8 +5071,16 @@ fn hls_cursor_next(
                 total_ns / 1_000_000,
                 refresh.end_list
             ));
+            let new = refresh.new_segments.len();
             cursor.pending.extend(refresh.new_segments);
             cursor.ended = refresh.end_list;
+            if cursor.live && !cursor.ended && live_playlist_stalled(&mut cursor.live_unchanged_since,
+                new, std::time::Instant::now(), live_stall_limit(cursor.target_duration_secs)) {
+                plx_base::eventlog::log(&format!(
+                    "hls: live playlist unchanged for {}s with no end marker; giving up the read",
+                    live_stall_limit(cursor.target_duration_secs).as_secs()));
+                return Err(HlsExit::Failed(HLS_LIVE_STALLED));
+            }
         }
         if cursor.pending.is_empty() && !cursor.ended {
             let poll = playlist_poll(cursor.live, cursor.target_duration_secs);
