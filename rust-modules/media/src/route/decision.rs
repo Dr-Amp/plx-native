@@ -12307,17 +12307,17 @@ pub(super) fn request_retranscode(
     }
     let plx_plex::plex::EncodeContract { audio, .. } = contract;
     let (fallback_vcodec, fallback_acodec) = retranscode_fallback_codecs(inputs, &contract);
-    // A channel is read from the session the tune recorded: the encoder session IS that session, and
-    // its stop belongs to the live timeline, never to this encode (a `transcode_stop` here would end
-    // the recording the route came from).
+    // A channel is read from the session the tune recorded: that session is the `path` (the
+    // `TranscodeSource::Live` below), and the encoder is the playback session's bare id, exactly as
+    // the planned live transcode names it (`plan.rs`). PMS writes `session=` into the master's
+    // variant URI (`session/{id}/base/index.m3u8`), so the DVR path there gives `session//livetv/…`,
+    // which the HLS reader rejects (PR #993, webOS 4.5). Its stop belongs to the live timeline, never
+    // to this encode (a `transcode_stop` here would end the recording the route came from).
     let qsess = match &inputs.live {
-        Some(live) => live.key.clone(),
+        Some(_) => inputs.namespace.clone(),
         None => next_encoder_session(&inputs.namespace),
     };
-    let source_name = match &inputs.live {
-        Some(live) => live.key.clone(),
-        None => qsess.clone(),
-    };
+    let source_name = qsess.clone();
     let mut sp = transcode_spec(
         &inputs.caps,
         &inputs.rk,

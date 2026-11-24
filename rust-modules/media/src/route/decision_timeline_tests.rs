@@ -1688,6 +1688,60 @@ fn a_live_channel_s_conversion_restarts_playback_through_the_feed_door() {
     drop(rx);
 }
 
+/// **The converted channel's master opens.** Maintainer's webOS 4.5 retest of `d430c7e61` (PR #993):
+/// the conversion passed the Feed door, then the reader refused PMS's master with `invalid playlist
+/// URI: empty path component`, because the flight sent the DVR path as `session=` too and PMS names
+/// the variant `session/{session}/base/index.m3u8`. The DVR source stays in `path`, `session=` is the
+/// bare encoder id the planned live transcode uses, and the master PMS builds from that request is
+/// followed through the real HLS reader to the variant it plays.
+#[test]
+fn a_live_conversion_names_a_bare_encoder_and_its_master_variant_opens() {
+    use std::time::Duration;
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let (port, rx) = live_pms(false);
+    let sid = plx_plex::plex::register_for_test("route-live-variant", "127.0.0.1", port, "tok-live", "cid-live");
+    let mut meta = plx_data::stores::metadata::MetadataStore::default();
+    assert!(request_live(&mut ps, &mut meta, plx_platform::devcaps::caps(), sid, "7",
+        "C101.242.ersatztv.org", "Channel one"));
+    assert!(wait_resolve_workers_for_test(Duration::from_secs(10)));
+    let plan = pump_play(&mut ps, &mut meta).expect("the tune lands");
+    settle_plan_start_in_unit_test(&mut ps, plan.route_start);
+    let playback = sess(&ps);
+    assert!(!playback.is_empty() && !playback.contains('/'), "premise: a bare playback id: {playback}");
+    assert!(matches!(dispatch_live_refusal_conversion(&mut ps), RecoveryDispatch::Flying { .. }));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(landing) = take_ready_recovery_flight(&mut ps) {
+            assert!(matches!(landing.verdict, RecoveryVerdict::Install), "the conversion installs its route");
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the conversion never landed");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    const DVR: &str = "%2Flivetv%2Fsessions%2F9b9fe727-0000-46db-b94c-ef512e3e61d2";
+    let decision = std::iter::from_fn(|| rx.recv_timeout(Duration::from_millis(500)).ok())
+        .filter(|line| line.starts_with("GET /video/:/transcode/universal/decision?"))
+        .find(|line| query_param(line, "directPlay") == Some("0"))
+        .expect("the conversion's decision");
+    assert_eq!(query_param(&decision, "path"), Some(DVR), "{decision}");
+    assert_eq!(query_param(&decision, "session"), Some(playback.as_str()), "{decision}");
+    let master_url = url(&ps);
+    let master_path = &master_url[master_url.find("/video/").expect("a PMS transcode URL")..];
+    assert!(master_path.starts_with("/video/:/transcode/universal/start.m3u8?"), "{master_path}");
+    assert_eq!(query_param(master_path, "path"), Some(DVR), "the DVR source stays in path");
+    let encoder = query_param(master_path, "session").expect("an encoder id");
+    assert_eq!(encoder, playback, "session= is the bare encoder id, never the DVR path");
+    // What PMS answers for that request (`tests/mock_pms.py`, the measured live master).
+    let master = format!("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=4000000,RESOLUTION=1280x720,\
+        CODECS=\"avc1.64001f,mp4a.40.2\"\nsession/{encoder}/base/index.m3u8\n");
+    use plx_play_feed::hls::{parse_master, Resource};
+    let source = Resource::new(plx_net::net::origin::Origin::http("127.0.0.1", port), master_path).expect("the master URL is readable");
+    let parsed = parse_master(&source, &master).expect("the reader accepts the converted channel's master");
+    assert_eq!(parsed.variant.resource.path,
+        format!("/video/:/transcode/universal/session/{encoder}/base/index.m3u8"));
+}
+
 #[test]
 fn a_live_plan_abandoned_after_its_tune_still_stops_the_recording() {
     let live = plx_plex::plex::livetv::LiveSession { key: "/livetv/sessions/abcdef01".into(), rating_key: String::new() };
