@@ -243,7 +243,9 @@ pub const LIVE_PROFILE_EXTRA: &str = "add-transcode-target(type=videoProfile&con
 const LIVE_EDGE: &str = "?offset=-1.000000";
 
 /// The session's own playlist for one playback, the shape every measured part had. No decision
-/// named its codecs, so they stay unknown and the plan converts rather than guess a direct play.
+/// named its codecs, so they stay unknown: Auto asks for the conversion first and reads the playlist
+/// as H.264/AAC only when that is refused, Forced reads it as recorded without asking, and Disabled
+/// never reads it.
 pub fn session_playlist(session: &LiveSession, playback: &str) -> Option<LivePlay> {
     is_path_id(playback).then(|| LivePlay {
         part: format!("{}/{playback}/index.m3u8{LIVE_EDGE}", session.key),
@@ -261,9 +263,14 @@ pub fn session_playlist(session: &LiveSession, playback: &str) -> Option<LivePla
 /// The part's query is replaced by the official client's `offset=-1.000000`. The decision's own
 /// (`offset={first}&X-Plex-Incomplete-Segments=1`, measured on the TV 2026-10-21) lists the segment
 /// still being written with `#EXTINF:0`, which `hls::parse_media` refuses as a whole playlist.
+///
+/// The Media PMS marks `selected` is read first, as [`super::Metadata::decided_media`] reads a
+/// library decision; one that marks none, or whose pick names no session playlist, keeps the first
+/// Media that has one.
 pub fn live_part_of(session: &LiveSession, decision: &super::MediaContainer) -> Option<LivePlay> {
     let prefix = format!("{}/", session.key);
-    decision.metadata.iter().flat_map(|m| &m.media).find_map(|media| {
+    let medias = || decision.metadata.iter().flat_map(|m| &m.media);
+    medias().filter(|media| media.selected).chain(medias()).find_map(|media| {
         media
             .part
             .iter()
@@ -765,6 +772,30 @@ mod tests {
             let play = live_part_of(&session(), &decided(facts)).unwrap();
             assert_eq!((play.width, play.height, play.channels), expected);
         }
+    }
+
+    /// A decision may list a version it did not pick ahead of the one it did (PR #993 review): the
+    /// Load must describe the SELECTED Media, and one that marks none keeps the first playlist.
+    #[test]
+    fn the_live_part_is_the_selected_media_s_not_the_first_with_a_playlist() {
+        let key = |client: &str| format!("{}/{client}/index.m3u8", session().key);
+        let decided = |marks: (&str, &str)| page(format!(r#"{{"MediaContainer":{{"Metadata":[{{"Media":[
+            {{"videoCodec":"hevc","audioCodec":"eac3"{},"Part":[{{"key":"{}"}}]}},
+            {{"videoCodec":"h264","audioCodec":"aac"{},"Part":[{{"key":"{}"}}]}}
+        ]}}]}}}}"#, marks.0, key("first"), marks.1, key("second")).as_bytes());
+        let read = |marks| {
+            let play = live_part_of(&session(), &decided(marks)).unwrap();
+            (play.vcodec, play.acodec, play.part.contains("/second/"))
+        };
+        assert_eq!(read(("", r#","selected":true"#)), ("h264".into(), "aac".into(), true));
+        assert_eq!(read((r#","selected":true"#, "")), ("hevc".into(), "eac3".into(), false));
+        assert_eq!(read(("", "")), ("hevc".into(), "eac3".into(), false), "none marked: the first, as before");
+        // A selected Media that names no session playlist cannot be read; the fallback stands.
+        let stray = page(format!(r#"{{"MediaContainer":{{"Metadata":[{{"Media":[
+            {{"videoCodec":"h264","Part":[{{"key":"{}"}}]}},
+            {{"videoCodec":"hevc","selected":true,"Part":[{{"key":"/other/index.m3u8"}}]}}
+        ]}}]}}}}"#, key("first")).as_bytes());
+        assert_eq!(live_part_of(&session(), &stray).unwrap().vcodec, "h264");
     }
 
     #[test]

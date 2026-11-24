@@ -3060,13 +3060,13 @@ pub fn annexb_h264_access_unit(
     if is_key {
         if !has_sps {
             if params.sps.is_empty() {
-                return Err("IDR has no in-band or cached SPS");
+                return Err(H264_IDR_WITHOUT_SPS);
             }
             out.extend_from_slice(&params.sps);
         }
         if !has_pps {
             if params.pps.is_empty() {
-                return Err("IDR has no in-band or cached PPS");
+                return Err(H264_IDR_WITHOUT_PPS);
             }
             out.extend_from_slice(&params.pps);
         }
@@ -4180,6 +4180,9 @@ pub unsafe fn hls_demux_segment(
     let (mut params, carried_raster, anchors) = carried.unwrap_or_default();
     if continuing {
         clock.continue_stream(anchors);
+    } else if live_cut_start.is_some() {
+        // The cut every later one continues: its lanes anchor the tune on one origin.
+        clock.share_origin();
     }
     if video_width <= 0 || video_height <= 0 {
         // No SPS in this segment for the probe to read: the previous segment of this playlist
@@ -4500,8 +4503,15 @@ pub struct HlsCursor {
     /// recording whose playlist stays unchanged past [`live_stall_limit`] fails the read with
     /// [`HLS_LIVE_STALLED`] instead of polling forever on a frozen picture.
     pub live_unchanged_since: Option<std::time::Instant>,
+    /// Where the playlist ended (its media sequence plus its segments) at the last read the start
+    /// cushion held: the growth the stall clock measures before the tracker has seen a segment.
+    pub live_held_next: u64,
 }
 
+/// An IDR that arrived without a parameter set and with none cached from an earlier access unit
+/// ([`annexb_h264_access_unit`]). On a fresh tuner cut that is one more undecodable start.
+const H264_IDR_WITHOUT_SPS: &str = "IDR has no in-band or cached SPS";
+const H264_IDR_WITHOUT_PPS: &str = "IDR has no in-band or cached PPS";
 const HLS_MISSING_RASTER: &str = "HLS segment has invalid video dimensions";
 const HLS_MISSING_IDR: &str = "HLS segment does not begin with an IDR";
 const LIVE_START_SKIP_SEGMENTS: u8 = 3;
@@ -4567,7 +4577,8 @@ impl HlsCursor {
         let continuing = net.carry.as_ref().is_some_and(|carry|
             carry.scope == carry_scope(segment) && carry.raster.0 > 0 && carry.raster.1 > 0);
         if !self.live || self.live_start_skips_left == 0 || continuing
-            || !matches!(error, HlsExit::Failed(HLS_MISSING_RASTER | HLS_MISSING_IDR)) {
+            || !matches!(error, HlsExit::Failed(HLS_MISSING_RASTER | HLS_MISSING_IDR
+                | H264_IDR_WITHOUT_SPS | H264_IDR_WITHOUT_PPS)) {
             return false;
         }
         if self.live_start_skips_left == LIVE_START_SKIP_SEGMENTS {
@@ -4589,9 +4600,10 @@ const LIVE_START_CUSHION_NS: i64 = 3_000_000_000;
 /// these) each new segment was found up to a second late, a second the cushion then has to pay.
 const LIVE_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Whether a live playlist holding `total_ns` of recording may start delivering segments.
-fn live_start_ready(live: bool, start_applied: bool, total_ns: i64) -> bool {
-    !live || start_applied || total_ns >= LIVE_START_CUSHION_NS
+/// Whether a live playlist holding `total_ns` of recording may start delivering segments. One
+/// that `ended` will never grow into the cushion, so what it lists goes out and the read ends.
+fn live_start_ready(live: bool, start_applied: bool, total_ns: i64, ended: bool) -> bool {
+    !live || start_applied || ended || total_ns >= LIVE_START_CUSHION_NS
 }
 
 /// Whether a master playlist URL is the universal transcoder's output for a Live TV session: its
@@ -4965,6 +4977,7 @@ pub fn hls_cursor_open(
             live: true,
             live_start_skips_left: LIVE_START_SKIP_SEGMENTS,
             live_unchanged_since: None,
+            live_held_next: 0,
         });
     }
     let master = crate::hls::parse_master(&master_landed, &master_text).map_err(|e| {
@@ -4988,6 +5001,7 @@ pub fn hls_cursor_open(
         live: is_live_session_source(path),
         live_start_skips_left: if is_live_session_source(path) { LIVE_START_SKIP_SEGMENTS } else { 0 },
         live_unchanged_since: None,
+        live_held_next: 0,
     })
 }
 
@@ -5035,11 +5049,25 @@ fn hls_cursor_next(
         if cursor.publishes_duration && !cursor.live {
             net.observer.publish(DemuxCallbackEffect::DurationNs(total_ns));
         }
-        // Not one segment of a live recording leaves before the cushion exists; the tracker is left
+        // Not one segment of a growing live recording leaves before the cushion exists (an ended
+        // one has all it will ever list); the tracker is left
         // untouched, so the read that has it delivers from the edge index, not the first segment.
-        let holding = !live_start_ready(cursor.live, cursor.start_applied, total_ns);
+        let holding = !live_start_ready(cursor.live, cursor.start_applied, total_ns, media.end_list);
         if holding {
             plx_base::eventlog::log(&format!("hls: live start holds for its cushion total_ms={}", total_ns / 1_000_000));
+            // The tracker has seen nothing yet, so growth is read off the playlist's own end. Only a
+            // tuner's own playlist (the one that arms carry state) is judged here: a conversion's
+            // encoder may take its time to list a first segment, as it always could.
+            let next = media.media_sequence.saturating_add(media.segments.len() as u64);
+            let grown = next.saturating_sub(cursor.live_held_next);
+            cursor.live_held_next = next;
+            if net.carry.is_some() && live_playlist_stalled(&mut cursor.live_unchanged_since, usize::try_from(grown).unwrap_or(usize::MAX),
+                std::time::Instant::now(), live_stall_limit(cursor.target_duration_secs)) {
+                plx_base::eventlog::log(&format!(
+                    "hls: live playlist unchanged below its start cushion for {}s with no end marker; giving up the read",
+                    live_stall_limit(cursor.target_duration_secs).as_secs()));
+                return Err(HlsExit::Failed(HLS_LIVE_STALLED));
+            }
         }
         if !holding {
             let mut refresh = cursor.tracker.apply(&media).map_err(|e| {

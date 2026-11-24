@@ -1911,8 +1911,8 @@ pub mod page_id {
     pub const WATCHLIST: ScreenId = ScreenId(25);
     pub const LIBRARY_COLLECTIONS: ScreenId = ScreenId(28);
     pub const LIBRARY_RECOMMENDED: ScreenId = ScreenId(29);
-    /// 30, forward of Recommended's 29: the Live TV page.
-    pub const LIVETV: ScreenId = ScreenId(30);
+    /// 31, forward of the Versions panel's 30: the Live TV page.
+    pub const LIVETV: ScreenId = ScreenId(31);
 }
 
 /// **A screen argument: everything the container needs to mount one screen, and nothing else.**
@@ -2845,7 +2845,14 @@ mod arg_tests {
     #[test]
     fn two_different_surface_variants_never_share_a_screen_id() {
         use plx_ui::screen::ScreenArg;
-        let args = every_surface_arg();
+        let mut args = every_surface_arg();
+        // The flat pages share the id space with the surfaces: Live TV's page was handed the
+        // Versions panel's 30 while this swept the surfaces alone (PR #993 review).
+        args.extend([
+            AppArg::Login, AppArg::Profiles, AppArg::Onboard, AppArg::Home, AppArg::Library,
+            AppArg::LibraryCollections { section: 0 }, AppArg::LibraryRecommended { section: 0 },
+            AppArg::Search, AppArg::Watchlist, AppArg::LiveTv, AppArg::Player,
+        ]);
         for (i, a) in args.iter().enumerate() {
             for b in args.iter().skip(i + 1) {
                 if a.id() == b.id() {
@@ -2858,6 +2865,19 @@ mod arg_tests {
                 }
             }
         }
+    }
+
+    /// **The Live TV page is not the Versions panel.** Both answered `ScreenId(30)`, and
+    /// `same_instance` is derived from the id, so the container could take a mounted panel for the
+    /// page (PR #993 review).
+    #[test]
+    fn the_live_tv_page_and_the_versions_panel_are_different_instances() {
+        use plx_ui::screen::ScreenArg;
+        let panel = every_surface_arg().into_iter()
+            .find(|a| matches!(a, AppArg::VersionsPanel(_))).expect("the Versions panel is a surface");
+        assert_ne!(AppArg::LiveTv.id(), panel.id());
+        assert!(!AppArg::LiveTv.same_instance(&panel) && !panel.same_instance(&AppArg::LiveTv));
+        assert_eq!(panel.id(), ScreenId(30), "an allocated id is never renumbered");
     }
 
     // ---- the bar-wearing alphabet -------------------------------------------------------------

@@ -362,6 +362,7 @@ fn the_lookahead_wiring_aborts_through_the_shared_reducer_when_the_guard_is_arme
         live: false,
         live_start_skips_left: 0,
         live_unchanged_since: None,
+        live_held_next: 0,
     };
     let n1 = plx_play_feed::hls::Segment {
         sequence: 11,
@@ -1299,6 +1300,7 @@ fn a_zero_byte_abort_reaches_the_controller_as_an_abandoned_sample() {
         live: false,
         live_start_skips_left: 0,
         live_unchanged_since: None,
+        live_held_next: 0,
     };
     let segment = plx_play_feed::hls::Segment {
         sequence: 11,

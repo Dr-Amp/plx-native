@@ -105,6 +105,7 @@ impl SegmentTimeline {
             audio_origin_ns: None,
             video_stream: None,
             audio_stream: None,
+            shared_origin: false,
         })
     }
 
@@ -134,6 +135,8 @@ pub struct SegmentClock {
     /// began, and its timestamps are read against that one's anchors instead of its own first packet.
     video_stream: Option<StreamAnchor>,
     audio_stream: Option<StreamAnchor>,
+    /// Set by [`Self::share_origin`]: both lanes read their timestamps against ONE raw origin.
+    shared_origin: bool,
 }
 
 /// One lane's anchor in a continuous stream: the raw timestamp of the first packet of the segment
@@ -159,17 +162,43 @@ impl SegmentClock {
     /// two streams may be physically interleaved in either order, so anchoring both lanes to the
     /// first packet observed makes the later-discovered lane inherit an arbitrary packet-order
     /// offset. The controller consumes only this content timeline, never raw FFmpeg PTS.
+    /// (A tuner's first cut is the exception, [`Self::share_origin`]: its lanes are one continuous
+    /// clock, not two streams an encoder started together on the boundary.)
     pub fn normalize_video(&mut self, raw_ns: i64) -> MediaTimeMs {
         match self.video_stream {
             Some(anchor) => anchor.place(raw_ns),
-            None => Self::normalize_from(self.base_ns, &mut self.video_origin_ns, raw_ns),
+            None => {
+                self.adopt_shared_origin(raw_ns);
+                Self::normalize_from(self.base_ns, &mut self.video_origin_ns, raw_ns)
+            }
         }
     }
 
     pub fn normalize_audio(&mut self, raw_ns: i64) -> MediaTimeMs {
         match self.audio_stream {
             Some(anchor) => anchor.place(raw_ns),
-            None => Self::normalize_from(self.base_ns, &mut self.audio_origin_ns, raw_ns),
+            None => {
+                self.adopt_shared_origin(raw_ns);
+                Self::normalize_from(self.base_ns, &mut self.audio_origin_ns, raw_ns)
+            }
+        }
+    }
+
+    /// Read this segment as the FIRST cut of a continuous stream — a tuner recording, whose two
+    /// lanes run on one clock from the tune to the stop. Their per-lane origins would become the
+    /// stream's anchors ([`Self::stream_anchors`]) and keep whatever distance the first video and
+    /// audio packets of this cut happened to have for the whole tune: equal raw timestamps 20 ms
+    /// apart on the content timeline, a constant A/V offset. One origin, the first packet of
+    /// either lane, places equal timestamps together. A PMS transcode's segment keeps a lane origin
+    /// each: its lanes both begin on the boundary and are re-anchored every segment.
+    pub fn share_origin(&mut self) {
+        self.shared_origin = true;
+    }
+
+    fn adopt_shared_origin(&mut self, raw_ns: i64) {
+        if self.shared_origin {
+            let origin = *self.video_origin_ns.or(self.audio_origin_ns).get_or_insert(raw_ns);
+            (self.video_origin_ns, self.audio_origin_ns) = (Some(origin), Some(origin));
         }
     }
 
@@ -515,15 +544,18 @@ impl std::error::Error for Error {}
 /// is one: PMS serves `/livetv/sessions/{uuid}/{client}/index.m3u8` with no master in front of it
 /// (`docs/pms-api.md` §10), so the URL a route hands over is its own single variant. Shape only;
 /// [`parse_media`] still validates every line.
+///
+/// A recording read before its first cut lists no segment yet: the target duration, which only a
+/// media playlist carries and [`parse_media`] requires, names the shape as well as an `EXTINF`.
 pub fn is_media_playlist(text: &str) -> bool {
     let mut lines = text.lines().map(str::trim);
     lines.next() == Some("#EXTM3U") && {
-        let (mut segments, mut variants) = (false, false);
+        let (mut media, mut variants) = (false, false);
         for line in lines {
-            segments |= line.starts_with("#EXTINF:");
+            media |= line.starts_with("#EXTINF:") || line.starts_with("#EXT-X-TARGETDURATION:");
             variants |= line.starts_with("#EXT-X-STREAM-INF:");
         }
-        segments && !variants
+        media && !variants
     }
 }
 
@@ -1161,6 +1193,35 @@ mod tests {
         assert_eq!(independent.normalize_video(10_760_000_000), MediaTimeMs(1_760));
     }
 
+    /// A tuner recording's lanes share one clock: equal raw timestamps land together on the
+    /// content timeline, in the first cut and in every cut that continues it, whichever lane's
+    /// packet came first (PR #993 review). A lane origin each kept the first packets' 20 ms apart.
+    #[test]
+    fn a_tuner_stream_s_lanes_share_one_raw_to_content_mapping() {
+        for (first_is_video, at_raw_10s) in [(true, 0), (false, 20)] {
+            let mut timeline = SegmentTimeline::default();
+            let mut first = timeline.begin(Duration::from_millis(760)).unwrap();
+            first.share_origin();
+            if first_is_video {
+                assert_eq!(first.normalize_video(10_000_000_000), MediaTimeMs(0));
+                assert_eq!(first.normalize_audio(9_980_000_000), MediaTimeMs(0), "before the origin: on the cut");
+            } else {
+                assert_eq!(first.normalize_audio(9_980_000_000), MediaTimeMs(0));
+                assert_eq!(first.normalize_video(10_000_000_000), MediaTimeMs(20));
+            }
+            assert_eq!(first.normalize_audio(10_000_000_000), MediaTimeMs(at_raw_10s));
+            assert_eq!(first.normalize_video(10_000_000_000), MediaTimeMs(at_raw_10s));
+            timeline.commit(first);
+            let anchors = first.stream_anchors();
+            assert_eq!(anchors.0, anchors.1, "one anchor for the whole tune");
+
+            let mut second = timeline.begin(Duration::from_secs(1)).unwrap();
+            second.continue_stream(anchors);
+            assert_eq!(second.normalize_video(10_800_000_000), second.normalize_audio(10_800_000_000));
+            assert_eq!(second.normalize_audio(10_800_000_000), MediaTimeMs(800 + at_raw_10s));
+        }
+    }
+
     #[test]
     fn a_live_session_playlist_is_its_own_variant_and_parses_as_growing_media() {
         assert!(is_media_playlist(LIVE));
@@ -1168,12 +1229,18 @@ mod tests {
             "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nsession/index.m3u8\n"
         ));
         assert!(!is_media_playlist("#EXTINF:1.0,\n00000.ts\n"), "no header");
+        // A recording that has not cut its first segment yet is still the media playlist.
+        let empty = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n";
+        assert!(is_media_playlist(empty), "no EXTINF yet");
+        assert!(!is_media_playlist("#EXTM3U\n#EXT-X-VERSION:3\n"), "neither shape");
         let at = source("/livetv/sessions/9b9fe727-0000/clientid/index.m3u8?offset=-1.000000&X-Plex-Token=secret");
         let media = parse_media(&at, LIVE).unwrap();
         assert_eq!((media.media_sequence, media.segments.len(), media.end_list), (0, 3, false));
         assert_eq!(media.playlist_type, None);
         assert_eq!(media.segments[1].resource.path, "/livetv/sessions/9b9fe727-0000/clientid/00001.ts");
         assert_eq!(media.preferred_start_index().unwrap(), 0);
+        let media = parse_media(&at, empty).unwrap();
+        assert_eq!((media.media_sequence, media.segments.len(), media.end_list), (0, 0, false));
     }
 
     #[test]

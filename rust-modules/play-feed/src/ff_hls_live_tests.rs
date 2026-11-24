@@ -210,6 +210,7 @@ fn a_fresh_tuner_cut_primes_on_its_first_valid_idr_and_discards_earlier_audio() 
     let mut out = Vec::new();
     let mut clock = crate::hls::SegmentTimeline::default()
         .begin(std::time::Duration::from_secs(1)).unwrap();
+    clock.share_origin();
     let non_idr = [0, 0, 1, 0x41, 4];
     let key = ts_h264_access_unit(&non_idr, &mut params, &mut out).unwrap();
     assert!(!key);
@@ -217,7 +218,7 @@ fn a_fresh_tuner_cut_primes_on_its_first_valid_idr_and_discards_earlier_audio() 
     assert!(!start.video(key, 100), "leading non-IDR access units are not fed");
     assert!(!start.primed());
     let first_audio = clock.normalize_audio(9_980_000_000);
-    assert_eq!(first_audio.0, 0, "a discarded audio packet still establishes its lane's clock origin");
+    assert_eq!(first_audio.0, 0, "a discarded audio packet timed before the cut's origin sits on the cut");
 
     let idr = [0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 2, 0, 0, 1, 0x65, 3];
     let key = ts_h264_access_unit(&idr, &mut params, &mut out).unwrap();
@@ -332,4 +333,100 @@ fn the_live_stall_clock_starts_on_the_first_empty_read_and_growth_clears_it() {
     assert!(live_playlist_stalled(&mut since, 0, t0 + limit + std::time::Duration::from_millis(1), limit));
     assert!(!live_playlist_stalled(&mut since, 2, t0 + limit * 2, limit), "a new segment is progress");
     assert_eq!(since, None);
+}
+
+/// A cut whose first IDR arrives without its parameter sets (the PPS, or the SPS, was in the
+/// part of the recording before the cut) is the same undecodable start as one with no IDR at all:
+/// skipped inside the same bounded budget, not the end of the startup read (PR #993 review).
+#[test]
+fn a_live_start_skips_a_cut_whose_idr_has_no_parameter_sets() {
+    let mut params = H264ParamSets::default();
+    let mut out = Vec::new();
+    let no_sps = ts_h264_access_unit(&[0, 0, 1, 0x68, 2, 0, 0, 1, 0x65, 3], &mut params, &mut out).unwrap_err();
+    let mut params = H264ParamSets::default();
+    let no_pps = ts_h264_access_unit(&[0, 0, 1, 0x67, 1, 0, 0, 1, 0x65, 3], &mut params, &mut out).unwrap_err();
+    assert_ne!(no_sps, no_pps);
+
+    let mut net = net(vec![("start.m3u8", MASTER.into()),
+        ("media.m3u8", media(12, "", false)), ("media.m3u8", media(13, "", false))],
+        Arc::new(Observer::default()));
+    let mut aq = crate::aq::aq_new(1024);
+    let mut cursor = open(&mut aq, &mut net, LIVE_ENTRY);
+    let mut read = Vec::new();
+    let result = hls_read_active_with(&mut cursor, &mut net, Default::default(),
+        &mut None, &mut *aq, None, |segment, _, _, _, _| {
+            read.push(segment.sequence);
+            match segment.sequence {
+                9 => Err(HlsExit::Failed(no_pps)),
+                10 => Err(HlsExit::Failed(no_sps)),
+                _ => Ok(decoded_segment()),
+            }
+        });
+    assert_eq!(result.expect("skip to the first decodable segment").unwrap().0.sequence, 11);
+    assert_eq!(read, [9, 10, 11]);
+    crate::aq::aq_destroy(&mut *aq);
+
+    // Bounded by the same budget as the other undecodable starts, and a library cursor stays strict.
+    for (entry, expected_reads) in [(LIVE_ENTRY, 4), (LIBRARY_ENTRY, 1)] {
+        let mut net = self::net(vec![("start.m3u8", MASTER.into()),
+            ("media.m3u8", media(12, "", entry == LIBRARY_ENTRY)), ("media.m3u8", media(13, "", false))],
+            Arc::new(Observer::default()));
+        let mut aq = crate::aq::aq_new(1024);
+        let mut cursor = open(&mut aq, &mut net, entry);
+        let mut reads = 0;
+        let result = hls_read_active_with(&mut cursor, &mut net, Default::default(),
+            &mut None, &mut *aq, None, |_, _, _, _, _| { reads += 1; Err(HlsExit::Failed(no_pps)) });
+        assert!(matches!(result, Err(HlsExit::Failed(e)) if e == no_pps));
+        assert_eq!(reads, expected_reads, "{entry}");
+        crate::aq::aq_destroy(&mut *aq);
+    }
+}
+
+/// A recording that ended with less than the start cushion in its playlist can never grow into
+/// it: its ENDLIST bypasses the hold, what it lists is delivered, then the read ends (PR #993
+/// review). It used to hold for the cushion on every read and poll for ever.
+#[test]
+fn an_ended_live_playlist_shorter_than_the_cushion_drains_and_ends() {
+    let mut net = net(vec![("start.m3u8", media(2, "", true)), ("start.m3u8", media(2, "", true))],
+        Arc::new(Observer::default()));
+    let mut aq = crate::aq::aq_new(1024);
+    let mut cursor = open(&mut aq, &mut net, LIVE_ENTRY);
+    for sequence in 0..2 {
+        assert_eq!(hls_cursor_next(&mut cursor, &mut *aq, &mut net, None).unwrap().unwrap().sequence, sequence);
+    }
+    assert!(hls_cursor_next(&mut cursor, &mut *aq, &mut net, None).unwrap().is_none(), "end of stream");
+    crate::aq::aq_destroy(&mut *aq);
+}
+
+/// The stall rule covers the hold as well: a playlist frozen below the cushion with no end marker
+/// fails the read like one frozen after the start, instead of holding for a cushion that never comes.
+#[test]
+fn a_live_playlist_frozen_below_its_cushion_fails_the_read() {
+    let frozen = || ("start.m3u8", media(2, "", false));
+    let mut net = net(vec![frozen(), frozen(), frozen(), frozen()], Arc::new(Observer::default()));
+    let mut aq = crate::aq::aq_new(1024);
+    let mut cursor = open(&mut aq, &mut net, LIVE_ENTRY);
+    assert!(cursor.pending.is_empty());
+    // The playlist held these two segments at the last read, longer ago than the limit.
+    cursor.live_held_next = 2;
+    cursor.live_unchanged_since = Some(std::time::Instant::now()
+        - live_stall_limit(cursor.target_duration_secs) - std::time::Duration::from_secs(1));
+    let read = hls_cursor_next(&mut cursor, &mut *aq, &mut net, None);
+    assert!(matches!(read, Err(HlsExit::Failed(HLS_LIVE_STALLED))), "{read:?}");
+    crate::aq::aq_destroy(&mut *aq);
+}
+
+/// A tune's playlist read before the recording cut its first segment has the media tags and no
+/// EXTINF. It is the session's media playlist, not a master with no variant: the cursor opens on
+/// it and starts once the cushion exists (PR #993 review).
+#[test]
+fn a_live_entry_with_no_segment_yet_opens_as_media_and_starts_when_it_grows() {
+    let mut net = net(vec![("start.m3u8", media(0, "", false)), ("start.m3u8", media(0, "", false)),
+        ("start.m3u8", media(4, "", false))], Arc::new(Observer::default()));
+    let mut aq = crate::aq::aq_new(1024);
+    let mut cursor = open(&mut aq, &mut net, LIVE_ENTRY);
+    assert!(cursor.live && net.carry.is_some(), "a tuner's own playlist");
+    assert_eq!(hls_cursor_next(&mut cursor, &mut *aq, &mut net, None).unwrap().unwrap().sequence, 1,
+        "three seconds behind the edge of the first read that holds the cushion");
+    crate::aq::aq_destroy(&mut *aq);
 }

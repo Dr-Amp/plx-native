@@ -1886,6 +1886,16 @@ video codec. A playlist whose codecs no decision named converts too. Only when t
 refused as well is the session's own playlist read as H.264/AAC, the shape of every measured
 session: PMS 1.43.3 refused both decisions on the owner's TV while that playlist played.
 
+The Direct Play setting is a permission on top of those codec facts. **Disabled** never reads the
+session's own playlist: a channel the set decodes is converted, and a refused conversion reads out (the
+server's reason, else "Direct Play is Disabled" when the original is what would have played)
+instead of falling back to the playlist as recorded. **Forced** never asks for a conversion: a lane
+the decision named and the reader cannot take is refused with the Forced read-out, and a playlist
+with nothing named wrong is read as recorded. The
+as-recorded read is the original route (no encoder id, no fixed-HLS contract), so the channel's
+conversion is still there to try if that playlist then fails to decode. When a decision lists
+several `Media`, the one PMS marks `selected` is the playlist read; with none marked, the first.
+
 `TranscodeSpec::source` now supports either a library rating key or the tuned
 `/livetv/sessions/{uuid}` key. Live re-encode requests reuse the **same** universal-transcoder
 query, capability profile, decision and fixed-segment HLS delivery (`start.m3u8`, the library's

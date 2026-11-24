@@ -1650,6 +1650,136 @@ fn a_live_channel_s_refused_own_playlist_converts_the_recording_it_opened() {
         "the recording is the live timeline's to stop: the conversion requests nothing after its decision");
 }
 
+/// One live resolve under `mode`: the plan, and every request it put on the wire.
+fn live_plan_under(mode: plx_plex::plex::session::DirectPlayMode, decision_refused: bool, video: &str, audio: &str)
+    -> (Plan, Vec<String>) {
+    let mut ps = PlaybackSession::IDLE;
+    let _guard = fresh_registry(&mut ps);
+    let (port, rx) = live_pms_with_codecs(decision_refused, video, audio);
+    let sid = plx_plex::plex::register_for_test("live-mode", "127.0.0.1", port, "tok", "cid");
+    let mut env = ResolveEnv::snapshot(&ps, plx_data::stores::metadata::MetadataStore::default().view(), sid, "");
+    let mut caps = (*env.caps).clone();
+    caps.hevc = true;
+    caps.audio = "aac,ac3,eac3".into();
+    env.caps = std::sync::Arc::new(caps);
+    env.direct_play_mode = mode;
+    env.live = Some(LiveTune { dvr: "7".into(), channel: "C101.242.ersatztv.org".into() });
+    let plan = build_stream(&plx_base::task::OffFrame::for_test(), "", "", "", "", &env);
+    let mut requests = Vec::new();
+    while let Ok(line) = rx.recv_timeout(std::time::Duration::from_millis(400)) {
+        requests.push(line);
+    }
+    (plan, requests)
+}
+
+/// **Direct Play: Disabled is a permission, not a codec fact** (PR #993 review). A channel the set
+/// decodes still goes through the transcoder, and the "read it as recorded" fallback for an
+/// undescribed playlist is a direct play too, so a refused conversion reads out instead. The
+/// recording stays the plan's either way, so its stop frees the tuner.
+#[test]
+fn a_live_channel_never_direct_plays_while_direct_play_is_disabled() {
+    use plx_plex::plex::session::DirectPlayMode;
+    let (plan, requests) = live_plan_under(DirectPlayMode::Disabled, false, "h264", "aac");
+    assert!(plan.source_decodable, "the codecs are still the set's to decode");
+    assert!(plan.url.contains("/start.m3u8?"), "{}", plan.url);
+    assert_eq!(plan.tsession, plan.sess);
+    assert!(!plan.contract.no_video_copy, "the contract does not forbid the copy the reader could take");
+    assert_eq!(requests.len(), 3, "the tune, its decision, the conversion's: {requests:?}");
+    assert_eq!(query_param(&requests[2], "directPlay"), Some("0"), "the conversion, not the original");
+    assert!(plan.live.is_some());
+
+    let (plan, _) = live_plan_under(DirectPlayMode::Disabled, true, "h264", "aac");
+    assert!(plan.url.is_empty(), "no as-recorded read: {}", plan.url);
+    assert_eq!(plan.verdict, Some(PlayVerdict::DirectPlayDisabled));
+    assert!(plan.live.is_some(), "the refused plan still owns the recording it tuned");
+
+    // A cut the set could not play anyway is not the setting's doing: no "turn it off" read-out.
+    let mut ps = PlaybackSession::IDLE;
+    let _guard = fresh_registry(&mut ps);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port() as i32;
+    let decided = String::from_utf8_lossy(LIVE_DECIDED).replace("\"h264\"", "\"mpeg2video\"");
+    let server = std::thread::spawn(move || {
+        for served in 0..3 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut socket = loop {
+                if let Ok((socket, _)) = plx_base::testnet::accept(&listener) { break socket; }
+                assert!(std::time::Instant::now() < deadline, "request {served} never came");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            };
+            let first = drain_http(&mut socket);
+            match served {
+                0 => write_json(&mut socket, LIVE_TUNED),
+                1 => write_json(&mut socket, decided.as_bytes()),
+                _ => { assert!(first.contains("directPlay=0"), "{first}"); write_status(&mut socket, 400) }
+            }
+        }
+    });
+    let sid = plx_plex::plex::register_for_test("live-disabled-undecodable", "127.0.0.1", port, "tok", "cid");
+    let mut env = ResolveEnv::snapshot(&ps, plx_data::stores::metadata::MetadataStore::default().view(), sid, "");
+    env.direct_play_mode = DirectPlayMode::Disabled;
+    env.live = Some(LiveTune { dvr: "7".into(), channel: "C101.242.ersatztv.org".into() });
+    let plan = build_stream(&plx_base::task::OffFrame::for_test(), "", "", "", "", &env);
+    server.join().unwrap();
+    assert!(plan.url.is_empty() && plan.verdict.is_none(), "{:?}", plan.verdict);
+    assert!(plan.live.is_some());
+}
+
+/// **Force Direct Play never asks for a conversion** (PR #993 review): a cut the reader cannot
+/// take is refused with the Forced read-out and nothing more goes on the wire, a supported one
+/// plays, and an undescribed playlist is read as recorded, which is the original.
+#[test]
+fn a_forced_live_channel_plays_the_original_or_refuses_without_a_conversion() {
+    use plx_plex::plex::session::DirectPlayMode;
+    for (video, audio, failure) in [
+        ("mpeg2video", "ac3", ForcedFailure::Video),
+        // A decision that names only the video still names a cut the reader cannot take.
+        ("mpeg2video", "", ForcedFailure::Video),
+        ("h264", "ac3", ForcedFailure::Audio { codec: "Dolby Digital".into() }),
+    ] {
+        let (plan, requests) = live_plan_under(DirectPlayMode::Forced, false, video, audio);
+        assert_eq!(plan.verdict, Some(PlayVerdict::Forced(failure)), "{video}/{audio}");
+        assert!(plan.url.is_empty() && plan.tsession.is_empty());
+        assert_eq!(requests.len(), 2, "the tune and its decision only: {requests:?}");
+        assert!(plan.live.is_some(), "the refused plan still owns the recording it tuned");
+    }
+    let (plan, _) = live_plan_under(DirectPlayMode::Forced, false, "h264", "aac");
+    assert!(plan.verdict.is_none() && plan.url.contains("/cid-live/index.m3u8?"), "{}", plan.url);
+
+    let (plan, requests) = live_plan_under(DirectPlayMode::Forced, true, "h264", "aac");
+    assert!(plan.verdict.is_none() && plan.url.contains("/index.m3u8?offset=-1.000000&"), "{}", plan.url);
+    assert!(plan.tsession.is_empty());
+    assert_eq!(requests.len(), 2, "the tune and its refused decision only: {requests:?}");
+}
+
+/// **The as-recorded fallback is the original route, and says so** (PR #993 review). The refused
+/// conversion left its encoder id and fixed-HLS contract on the plan, so the session's own playlist
+/// installed as the PMS HLS recipe: a later failure of that playlist found the channel's
+/// conversion already spent and read out. It installs as the original, and that rung stays.
+#[test]
+fn the_as_recorded_live_fallback_installs_the_original_route_and_keeps_its_conversion() {
+    use std::time::Duration;
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let (port, rx) = live_pms(true);
+    let sid = plx_plex::plex::register_for_test("route-live-as-recorded", "127.0.0.1", port, "tok-live", "cid-live");
+    let mut meta = plx_data::stores::metadata::MetadataStore::default();
+    assert!(request_live(&mut ps, &mut meta, plx_platform::devcaps::caps(), sid, "7",
+        "C101.242.ersatztv.org", "Channel one"));
+    assert!(wait_resolve_workers_for_test(Duration::from_secs(10)));
+    let plan = pump_play(&mut ps, &mut meta).expect("the tune lands");
+    assert!(ps.url.contains("/index.m3u8?offset=-1.000000&"), "premise: the session's own playlist: {}", ps.url);
+    assert_eq!(ps.planned_feed_offer(), Some(crate::route::backend_policy::OfferId::FEED_ORIGINAL));
+    assert!(ps.tsession.is_empty() && ps.cur_contract == plx_plex::plex::EncodeContract::default(),
+        "no encoder runs for a playlist read as recorded");
+    assert!(is_live(&ps), "the recording is still the session's to stop");
+    settle_plan_start_in_unit_test(&mut ps, plan.route_start);
+    assert!(matches!(dispatch_live_refusal_conversion(&mut ps), RecoveryDispatch::Flying { .. }),
+        "the channel's conversion is still there to try when the playlist fails to decode");
+    drop(rx);
+}
+
 /// **A live channel's conversion reopens through the Feed start door.** Maintainer's webOS 4.5 run
 /// on a Threadfin channel (PR #993): the demuxer refused the cut, the conversion flew and landed,
 /// and the reload's Start was refused with "no qualified feed offer for this resolved route",

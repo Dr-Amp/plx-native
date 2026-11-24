@@ -3279,6 +3279,13 @@ pub(super) fn video_copy_fps(contract: &plx_plex::plex::EncodeContract, src_fps:
 
 /// Tune once, then use the same decoder predicates and universal-transcoder contract as library
 /// playback. The live session remains owned even when the decision refuses its conversion.
+///
+/// What the set decodes and what the Direct Play setting permits are separate questions.
+/// Disabled never reads the session's own playlist, the "as recorded" fallback included: a
+/// decodable channel is converted and a refused conversion reads out. Forced never asks for a
+/// conversion: a lane the decision named and the reader cannot take is refused with the Forced
+/// read-out, and a playlist with nothing named wrong is read as recorded, as the library's Forced
+/// takes an unnamed codec.
 fn build_live_stream(
     off: &plx_base::task::OffFrame, tune: &LiveTune, client: &plx_plex::plex::Client,
     env: &ResolveEnv, plan: &mut Plan,
@@ -3305,15 +3312,46 @@ fn build_live_stream(
         && hls_accepts_codecs(&play.vcodec, None);
     let audio = audio_direct_plays_with(&env.caps, env.direct_play_mode,
         &play.acodec, play.channels, 0);
-    // A playlist no decision described has unknown codecs: never direct played on a guess.
+    // A playlist no decision described has unknown codecs: not `source_decodable`; who may still
+    // read it as recorded is the mode's call, below.
     let unknown = play.vcodec.is_empty() || play.acodec.is_empty();
     plan.source_decodable = !unknown && video && audio && hls_accepts_codecs(&play.vcodec, Some(&play.acodec));
     plan.src_vcodec = play.vcodec.clone();
     plan.src_acodec = play.acodec.clone();
     plan.vcodec = play.vcodec;
     plan.acodec = audio_declaration(&play.acodec);
-    if plan.source_decodable {
+    let mode = env.direct_play_mode;
+    // The session's own playlist with no encoder behind it: the original route's identity, so a
+    // later failure of this playlist still has the channel's conversion to try.
+    let as_recorded = |plan: &mut Plan| {
+        plan.vcodec = "h264".into();
+        plan.acodec = "aac".into();
+        plan.src_vcodec = plan.vcodec.clone();
+        plan.src_acodec = plan.acodec.clone();
+        plan.tsession.clear();
+        plan.contract = plx_plex::plex::EncodeContract::default();
         plan.url = client.direct_play_url(&play.part, &session).to_url();
+    };
+    if plan.source_decodable && mode != DirectPlayMode::Disabled {
+        plan.url = client.direct_play_url(&play.part, &session).to_url();
+        return;
+    }
+    if mode == DirectPlayMode::Forced {
+        // A half-described decision is judged on the lane it did name (an unnamed video is
+        // read as the H.264 every measured session carried).
+        let named_video = if plan.src_vcodec.is_empty() { "h264" } else { plan.src_vcodec.as_str() };
+        let failure = if !plan.src_vcodec.is_empty() && !video { Some(ForcedFailure::Video) }
+            else if !plan.src_acodec.is_empty() && !(audio && hls_accepts_codecs(named_video, Some(&plan.src_acodec))) {
+                Some(ForcedFailure::Audio { codec: plx_data::metadata::friendly_codec(&plan.src_acodec) })
+            } else { None };
+        if let Some(failure) = failure {
+            crate::player::log(&format!(
+                "playback_policy: Force Direct Play refused the live cut {}/{}", plan.src_vcodec, plan.src_acodec));
+            plan.verdict = Some(PlayVerdict::Forced(failure));
+        } else {
+            crate::player::log("livetv: Force Direct Play reads an undescribed playlist as recorded");
+            as_recorded(plan);
+        }
         return;
     }
     plan.contract = plx_plex::plex::EncodeContract {
@@ -3324,21 +3362,25 @@ fn build_live_stream(
     let mut spec = transcode_spec_carrying_burn(&env.caps, "", 0, &session, &session,
         plx_plex::plex::TranscodeOffset::Fresh, 0, 0, true, plan.contract);
     spec.source = plx_plex::plex::TranscodeSource::Live(&live.key);
-    // The decision may register resources even on refusal; both owners must survive for cleanup.
+    // The decision may register resources even on refusal; both owners must survive for cleanup
+    // (they are one id here, so the as-recorded read below keeps it as the playback session).
     plan.tsession = session.clone();
     let decision = client.transcode_decision(off, &spec);
     let refused = decision.as_ref().map_or(Some(None), |d| refusal(d).map(Some));
     if let Some(reason) = refused {
-        if unknown {
+        if unknown && mode != DirectPlayMode::Disabled {
             // PMS 1.43.3 refused both decisions on the owner's TV (2026-10-21) while the
             // session's own playlist played: every measured live session is H.264/AAC, so that
             // stays the fallback once a conversion cannot be had.
             crate::player::log("livetv: no conversion for an undescribed playlist; reading it as recorded");
-            plan.vcodec = "h264".into();
-            plan.acodec = "aac".into();
-            plan.url = client.direct_play_url(&play.part, &session).to_url();
+            as_recorded(plan);
         } else if let (Some(reason), Some(decision)) = (reason, decision.as_ref()) {
             plan.verdict = Some(PlayVerdict::Server(reason, DecisionCodes::of(decision)));
+        } else if mode == DirectPlayMode::Disabled && (unknown || plan.source_decodable) {
+            // The original is what would have played, and the setting forbids it; a cut the set
+            // cannot decode stays the plain failure it is under Auto. The plan keeps its ids so
+            // the refusal's cleanup still reaches whatever the decision registered.
+            plan.verdict = Some(PlayVerdict::DirectPlayDisabled);
         }
         return;
     }

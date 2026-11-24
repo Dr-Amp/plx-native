@@ -133,11 +133,12 @@ fn a_live_segment_without_parameter_sets_inherits_them_from_its_own_playlist_onl
 /// VOD transcode's playlist keeps the VOD cadence and starts at once.
 #[test]
 fn a_live_playlist_starts_behind_its_edge_and_is_polled_faster() {
-    assert!(!live_start_ready(true, false, 760_000_000), "one segment is no cushion");
-    assert!(!live_start_ready(true, false, 2_760_000_000));
-    assert!(live_start_ready(true, false, 3_760_000_000));
-    assert!(live_start_ready(true, true, 0), "once started, every segment goes as it lands");
-    assert!(live_start_ready(false, false, 0), "a PMS transcode is never held");
+    assert!(!live_start_ready(true, false, 760_000_000, false), "one segment is no cushion");
+    assert!(!live_start_ready(true, false, 2_760_000_000, false));
+    assert!(live_start_ready(true, false, 3_760_000_000, false));
+    assert!(live_start_ready(true, true, 0, false), "once started, every segment goes as it lands");
+    assert!(live_start_ready(true, false, 760_000_000, true), "an ended recording never grows into the cushion");
+    assert!(live_start_ready(false, false, 0, false), "a PMS transcode is never held");
     assert_eq!(playlist_poll(true, 3), std::time::Duration::from_millis(500));
     assert_eq!(playlist_poll(false, 3), std::time::Duration::from_millis(1_000));
     assert_eq!(playlist_poll(false, 0), std::time::Duration::from_millis(250));
