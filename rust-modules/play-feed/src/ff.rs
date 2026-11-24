@@ -3903,8 +3903,9 @@ struct AudioStamp {
 
 /// MPEG-TS may put a PES timestamp on the second AAC access unit while the first unit carries
 /// only its frame duration. Resolve those holes inside one complete segment before mapping the
-/// audio lane onto the normalized content timeline. We never borrow video PTS or wall time.
-fn resolve_audio_stamps(stamps: &mut [AudioStamp]) -> Result<usize, &'static str> {
+/// audio lane onto the normalized content timeline. We never borrow wall time, and video PTS only
+/// as `start_ns`: where a segment with no audio timestamp at all begins its frame clock.
+fn resolve_audio_stamps(stamps: &mut [AudioStamp], start_ns: i64) -> Result<usize, &'static str> {
     let missing = stamps.iter().filter(|stamp| stamp.raw_ns.is_none()).count();
     if stamps.is_empty() || missing == 0 {
         return Ok(missing);
@@ -3931,9 +3932,9 @@ fn resolve_audio_stamps(stamps: &mut [AudioStamp]) -> Result<usize, &'static str
         }
     }
     // A segment with no PES timestamp at all still has an exact AAC frame clock. Anchor its
-    // first frame locally at zero; SegmentClock supplies the content-time base.
+    // first frame at `start_ns`; SegmentClock supplies the content-time base.
     if stamps[0].raw_ns.is_none() && stamps.iter().all(|stamp| stamp.raw_ns.is_none()) {
-        stamps[0].raw_ns = Some(0);
+        stamps[0].raw_ns = Some(start_ns);
         for index in 1..stamps.len() {
             if let (Some(previous), Some(duration)) =
                 (stamps[index - 1].raw_ns, stamps[index - 1].duration_ns)
@@ -3952,6 +3953,32 @@ fn resolve_audio_stamps(stamps: &mut [AudioStamp]) -> Result<usize, &'static str
         return Err("AAC timestamps move backwards");
     }
     Ok(missing)
+}
+
+/// Resolve a complete segment's audio stamps and write each access unit's content time; returns
+/// how many were synthesized and the lane's tail.
+///
+/// `stream_start_ns` is where a segment with NO audio timestamp starts its frame clock. An
+/// independent segment (VOD, a PMS transcode) passes `None`: its lane origin is its own first
+/// stamp, so a zero-based clock lands on the segment boundary. A cut of a continuous tuner stream
+/// passes the raw PTS of the first video access unit it published (the IDR, on the first cut): its
+/// audio is read against the stream's raw origin ([`crate::hls::SegmentClock::share_origin`], then
+/// the carried anchors), where a zero-based clock sits a whole stream clock before that origin and
+/// every frame clamped onto one content time (PR #993 review). Both lanes of a tuner stream run on
+/// one clock, so that picture's PTS is this cut's own position on it, within the reorder depth.
+fn stamp_segment_audio(stamps: &mut [AudioStamp], stream_start_ns: Option<i64>,
+    clock: &mut crate::hls::SegmentClock, aus: &mut [HlsAu]) -> Result<(usize, Option<i64>), &'static str> {
+    let synthesized = resolve_audio_stamps(stamps, stream_start_ns.unwrap_or(0))?;
+    let mut tail = None;
+    for stamp in stamps.iter() {
+        let pts = clock
+            .normalize_audio(stamp.raw_ns.expect("audio stamps resolved"))
+            .0
+            .saturating_mul(1_000_000);
+        aus[stamp.au].pts_ns = pts;
+        tail = Some(tail.map_or(pts, |tail: i64| tail.max(pts)));
+    }
+    Ok((synthesized, tail))
 }
 
 pub struct HlsSegmentOutput {
@@ -4204,7 +4231,7 @@ pub unsafe fn hls_demux_segment(
     let mut first_au_at = None;
     let mut aus = Vec::new();
     let mut video_tail_ns = -1;
-    let mut audio_tail_ns = None;
+    let mut first_video_raw_ns = None;
 
     loop {
         input.state.io_failed = false;
@@ -4256,6 +4283,7 @@ pub unsafe fn hls_demux_segment(
                 es: 1,
             });
             video_tail_ns = video_tail_ns.max(pts);
+            first_video_raw_ns.get_or_insert(raw_pts);
             video_packets += 1;
             first_au_at.get_or_insert_with(std::time::Instant::now);
             av_packet_unref(input.pkt);
@@ -4342,15 +4370,8 @@ pub unsafe fn hls_demux_segment(
             "HLS segment produced no video access units",
         ));
     }
-    let synthesized_audio = resolve_audio_stamps(&mut audio_stamps).map_err(HlsExit::Failed)?;
-    for stamp in &audio_stamps {
-        let pts = clock
-            .normalize_audio(stamp.raw_ns.expect("audio stamps resolved"))
-            .0
-            .saturating_mul(1_000_000);
-        aus[stamp.au].pts_ns = pts;
-        audio_tail_ns = Some(audio_tail_ns.map_or(pts, |tail: i64| tail.max(pts)));
-    }
+    let (synthesized_audio, mut audio_tail_ns) = stamp_segment_audio(&mut audio_stamps,
+        first_video_raw_ns.filter(|_| live), clock, &mut aus).map_err(HlsExit::Failed)?;
     // Every AU in this independently decodable segment has been read successfully. Buffer health
     // is the end of decoded content, not the start timestamp of the final video frame; using the
     // latter made a complete 2 s / 24 fps segment look 42 ms short and forced an immediate drop.
@@ -4524,6 +4545,17 @@ const HLS_LIVE_STALLED: &str = "HLS live playlist stopped advancing";
 /// that is still recording is not cut off.
 fn live_stall_limit(target_duration_secs: u64) -> std::time::Duration {
     std::time::Duration::from_secs(target_duration_secs.saturating_mul(3).max(15))
+}
+
+/// The same bound while the start cushion still holds ([`live_start_ready`]). A tuner's own
+/// playlist (`tuner`) is already recording when it is first read, so it keeps [`live_stall_limit`].
+/// A conversion's is read from before its encoder has listed anything, and the stall clock starts on
+/// that first held read: the wait spans the encoder's whole start (attaching to the recording,
+/// probing it, its first GOP), which the limit after the start never has to cover. Four times the
+/// limit (60 s at the encoder's 1-2 s targets) is far past a slow server's few seconds and still ends
+/// a playlist that froze below the cushion with no end marker, which used to be polled for ever.
+fn live_hold_stall_limit(tuner: bool, target_duration_secs: u64) -> std::time::Duration {
+    live_stall_limit(target_duration_secs) * if tuner { 1 } else { 4 }
 }
 
 /// Whether a live playlist read that brought `new` segments has now been unchanged for longer than
@@ -5055,17 +5087,18 @@ fn hls_cursor_next(
         let holding = !live_start_ready(cursor.live, cursor.start_applied, total_ns, media.end_list);
         if holding {
             plx_base::eventlog::log(&format!("hls: live start holds for its cushion total_ms={}", total_ns / 1_000_000));
-            // The tracker has seen nothing yet, so growth is read off the playlist's own end. Only a
-            // tuner's own playlist (the one that arms carry state) is judged here: a conversion's
-            // encoder may take its time to list a first segment, as it always could.
+            // The tracker has seen nothing yet, so growth is read off the playlist's own end. A
+            // tuner's own playlist (the one that arms carry state) is judged on the stall limit, a
+            // conversion's on the longer one its encoder's start needs ([`live_hold_stall_limit`]).
             let next = media.media_sequence.saturating_add(media.segments.len() as u64);
             let grown = next.saturating_sub(cursor.live_held_next);
             cursor.live_held_next = next;
-            if net.carry.is_some() && live_playlist_stalled(&mut cursor.live_unchanged_since, usize::try_from(grown).unwrap_or(usize::MAX),
-                std::time::Instant::now(), live_stall_limit(cursor.target_duration_secs)) {
+            let limit = live_hold_stall_limit(net.carry.is_some(), cursor.target_duration_secs);
+            if live_playlist_stalled(&mut cursor.live_unchanged_since, usize::try_from(grown).unwrap_or(usize::MAX),
+                std::time::Instant::now(), limit) {
                 plx_base::eventlog::log(&format!(
                     "hls: live playlist unchanged below its start cushion for {}s with no end marker; giving up the read",
-                    live_stall_limit(cursor.target_duration_secs).as_secs()));
+                    limit.as_secs()));
                 return Err(HlsExit::Failed(HLS_LIVE_STALLED));
             }
         }

@@ -14,7 +14,7 @@ fn take(stores: &mut Stores) -> (Job<LiveTvReq>, LiveTvPort) {
     (job, port)
 }
 fn guide(numbers: &[&str], end: i64) -> Guide {
-    Guide { dvr: "7".into(), provider: "tv.plex.providers.epg.xmltv:7".into(), refresh_at: end, retry_cd: 0, channels: numbers.iter()
+    Guide { dvr: "7".into(), provider: "tv.plex.providers.epg.xmltv:7".into(), refresh_at: end, retry_cd: 0, strikes: 0, channels: numbers.iter()
         .map(|number| LiveChannel { dvr: "7".into(), channel: format!("C{number}"), vcn: number.to_string(),
             name: "Channel".into(), thumb: "/logo".into(), now: "Show".into(), now_thumb: "/show".into(), ends_at: end }).collect() }
 }
@@ -152,6 +152,47 @@ fn livetv_airing_end_emits_one_grid_only_refresh_and_failure_keeps_lineup() {
     assert!(stores.livetv_view().revision() > revision);
     assert_eq!(stores.livetv_view().channels.len(), 2);
     assert!(stores.livetv_view().channels.iter().any(|c| c.now == "Next show"));
+}
+
+/// **A grid that keeps failing is not asked every two seconds for ever.** A failed grid read was
+/// retried at a fixed [`RETRY_FRAMES`] for as long as it failed, with the page closed too; only the
+/// lineup read backed off. Consecutive failures double the wait like the lineup's, and a good read
+/// starts over (PR #993).
+#[test]
+fn livetv_consecutive_grid_failures_double_the_wait_and_a_good_read_resets_it() {
+    let mut stores = Stores::default(); let keys = keys(1);
+    stores.livetv_pump(&keys, 100);
+    answer(&mut stores, Some(vec![guide(&["10"], 200)]));
+    stores.livetv_pump(&keys, 200);
+    // Each failed read lands on one pump, then waits `frames` pumps for the next job.
+    let fail_then_wait = |stores: &mut Stores, frames: u32| {
+        let (job, port) = take(stores);
+        assert!(matches!(job.req.work, Work::Grid(_)));
+        finish_with(&port, job.addr, job.req, |_| None);
+        stores.livetv_pump(&keys, 210);
+        for _ in 0..frames - 1 {
+            stores.livetv_pump(&keys, 210);
+            assert!(!stores.has_jobs(), "the grid is not asked again inside {frames} frames");
+        }
+        stores.livetv_pump(&keys, 210);
+    };
+    fail_then_wait(&mut stores, RETRY_FRAMES);
+    fail_then_wait(&mut stores, 2 * RETRY_FRAMES);
+    fail_then_wait(&mut stores, 4 * RETRY_FRAMES);
+    for _ in 0..RETRY_DOUBLINGS { let (job, port) = take(&mut stores); port.refused(job.addr);
+        for _ in 0..=RETRY_FRAMES << RETRY_DOUBLINGS { stores.livetv_pump(&keys, 210); } }
+    let (job, port) = take(&mut stores);
+    port.refused(job.addr);
+    stores.livetv_pump(&keys, 210);
+    for _ in 0..(RETRY_FRAMES << RETRY_DOUBLINGS) - 1 {
+        stores.livetv_pump(&keys, 210);
+        assert!(!stores.has_jobs(), "the wait is capped, not shortened");
+    }
+    stores.livetv_pump(&keys, 210);
+    answer(&mut stores, Some(vec![guide(&["10"], 205)]));
+    stores.livetv_pump(&keys, 205);
+    fail_then_wait(&mut stores, RETRY_FRAMES);
+    assert!(stores.has_jobs());
 }
 
 #[test]

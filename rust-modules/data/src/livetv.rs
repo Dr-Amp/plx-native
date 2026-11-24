@@ -80,8 +80,16 @@ impl<'a> LiveTvView<'a> {
 pub enum LiveTvCmd { Reset, Retry }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Guide { dvr: String, provider: String, channels: Vec<LiveChannel>, refresh_at: i64, retry_cd: u32 }
+struct Guide { dvr: String, provider: String, channels: Vec<LiveChannel>, refresh_at: i64, retry_cd: u32,
+    /// Consecutive failed grid reads, which set the next wait ([`Guide::backoff`]).
+    strikes: u32 }
 impl Guide {
+    /// A grid that keeps failing is asked again at the lineup's doubling interval
+    /// ([`RETRY_DOUBLINGS`]), not every [`RETRY_FRAMES`] for as long as the server is down.
+    fn backoff(&mut self) {
+        self.retry_cd = RETRY_FRAMES << self.strikes.min(RETRY_DOUBLINGS);
+        self.strikes = self.strikes.saturating_add(1);
+    }
     fn due(&self, now: i64) -> bool { self.retry_cd == 0 && now >= self.refresh_at }
     fn next_refresh(channels: &[LiveChannel], now: i64) -> i64 {
         channels.iter().filter_map(|c| (c.ends_at > now).then_some(c.ends_at)).min()
@@ -147,7 +155,7 @@ impl Source {
     fn failed(&mut self) {
         self.failed = true;
         if let Some(dvr) = self.reading_grid.take() {
-            if let Some(guide) = self.guides.iter_mut().find(|g| g.dvr == dvr) { guide.retry_cd = RETRY_FRAMES; }
+            if let Some(guide) = self.guides.iter_mut().find(|g| g.dvr == dvr) { guide.backoff(); }
         } else { self.backoff(); }
     }
     fn backoff(&mut self) {
@@ -368,14 +376,14 @@ fn read(client: &impl LiveTvIo, req: &LiveTvReq) -> Option<ReadResult> {
                 log_lineup(req.sid, &dvr.key, status, mapped, channels.len());
                 if channels.is_empty() {
                     result.guides.push(Guide { dvr: dvr.key.clone(), provider: dvr.epg_identifier.clone(), channels,
-                        refresh_at: i64::MAX, retry_cd: 0 });
+                        refresh_at: i64::MAX, retry_cd: 0, strikes: 0 });
                     continue;
                 }
                 let airings = client.on_now(&dvr.epg_identifier, req.now);
                 if let Some(airings) = airings.as_deref() { livetv::update_on_now(&mut channels, airings); }
                 let refresh_at = if airings.is_some() { Guide::next_refresh(&channels, req.now) }
                     else { result.retry = true; req.now };
-                result.guides.push(Guide { dvr: dvr.key.clone(), provider: dvr.epg_identifier.clone(), channels, refresh_at, retry_cd: if airings.is_some() { 0 } else { RETRY_FRAMES } });
+                result.guides.push(Guide { dvr: dvr.key.clone(), provider: dvr.epg_identifier.clone(), channels, refresh_at, retry_cd: if airings.is_some() { 0 } else { RETRY_FRAMES }, strikes: 0 });
             }
             Some(result)
         }
@@ -384,6 +392,7 @@ fn read(client: &impl LiveTvIo, req: &LiveTvReq) -> Option<ReadResult> {
             let mut updated = guide.clone();
             livetv::update_on_now(&mut updated.channels, &now);
             updated.refresh_at = Guide::next_refresh(&updated.channels, req.now);
+            updated.strikes = 0;
             Some(ReadResult { guides: vec![updated], roster: None, complete: true, retry: false })
         }
     }

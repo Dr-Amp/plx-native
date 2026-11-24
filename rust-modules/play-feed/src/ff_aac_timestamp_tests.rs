@@ -42,7 +42,7 @@ fn a_leading_missing_aac_timestamp_is_backfilled_from_frame_duration() {
             duration_ns: Some(21_333_333),
         },
     ];
-    assert_eq!(resolve_audio_stamps(&mut stamps), Ok(2));
+    assert_eq!(resolve_audio_stamps(&mut stamps, 0), Ok(2));
     assert_eq!(stamps[0].raw_ns, Some(878_666_667));
     assert_eq!(stamps[2].raw_ns, Some(921_333_333));
 }
@@ -66,7 +66,7 @@ fn a_timestamp_free_aac_segment_uses_only_its_frame_clock() {
             duration_ns: Some(20_000_000),
         },
     ];
-    assert_eq!(resolve_audio_stamps(&mut stamps), Ok(3));
+    assert_eq!(resolve_audio_stamps(&mut stamps, 0), Ok(3));
     assert_eq!(
         stamps.iter().map(|stamp| stamp.raw_ns).collect::<Vec<_>>(),
         [Some(0), Some(20_000_000), Some(40_000_000)]
@@ -88,7 +88,7 @@ fn an_unanchored_aac_timestamp_hole_fails_closed() {
         },
     ];
     assert_eq!(
-        resolve_audio_stamps(&mut stamps),
+        resolve_audio_stamps(&mut stamps, 0),
         Err("AAC timestamp hole has no duration anchor")
     );
 }
@@ -250,3 +250,44 @@ fn without_parameters_only_adts_is_usable() {
     assert_eq!(adts_framed(&raw, None), None, "raw AAC with nothing to frame it with");
 }
 
+
+/// **A tuner cut with no audio timestamp keeps its frame spacing.** A tuner stream's lanes are read
+/// against the stream's raw origin (ten seconds here), and a frame clock synthesized from zero sat
+/// before that origin: every frame clamped onto one content time (PR #993 review). The clock starts
+/// at the cut's first published picture instead; an independent segment stays zero-based.
+#[test]
+fn a_timestamp_free_tuner_cut_keeps_its_aac_frame_spacing() {
+    fn placed(clock: &mut crate::hls::SegmentClock, stream_start_ns: Option<i64>) -> Vec<i64> {
+        let mut stamps: Vec<AudioStamp> = (0..3)
+            .map(|au| AudioStamp { au, raw_ns: None, duration_ns: Some(21_333_333) })
+            .collect();
+        let mut aus: Vec<HlsAu> = (0..3)
+            .map(|_| HlsAu { data: Vec::new(), pts_ns: 0, key: 1, es: 2 })
+            .collect();
+        let (synthesized, tail) = stamp_segment_audio(&mut stamps, stream_start_ns, clock, &mut aus).unwrap();
+        assert_eq!(synthesized, 3);
+        assert_eq!(tail, aus.iter().map(|au| au.pts_ns).max());
+        aus.iter().map(|au| au.pts_ns / 1_000_000).collect()
+    }
+    let mut timeline = crate::hls::SegmentTimeline::default();
+
+    // The tune's first cut: a discarded picture at 10 s is the shared origin, the IDR is at 10.5 s.
+    let mut first = timeline.begin(std::time::Duration::from_secs(1)).unwrap();
+    first.share_origin();
+    first.normalize_video(10_000_000_000);
+    assert_eq!(first.normalize_video(10_500_000_000).0, 500);
+    assert_eq!(placed(&mut first, Some(10_500_000_000)), [500, 521, 542], "from the IDR, a frame apart");
+    timeline.commit(first);
+
+    // A cut that continues it, whose first picture is at 11 s of the stream's clock.
+    let mut second = timeline.begin(std::time::Duration::from_secs(1)).unwrap();
+    second.continue_stream(first.stream_anchors());
+    assert_eq!(second.normalize_video(11_000_000_000).0, 1_000);
+    assert_eq!(placed(&mut second, Some(11_000_000_000)), [1_000, 1_021, 1_042]);
+    timeline.commit(second);
+
+    // An independent segment (VOD, a PMS transcode): zero-based on its own boundary, as before.
+    let mut independent = timeline.begin(std::time::Duration::from_secs(1)).unwrap();
+    independent.normalize_video(77_000_000_000);
+    assert_eq!(placed(&mut independent, None), [2_000, 2_021, 2_042]);
+}

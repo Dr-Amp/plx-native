@@ -416,6 +416,41 @@ fn a_live_playlist_frozen_below_its_cushion_fails_the_read() {
     crate::aq::aq_destroy(&mut *aq);
 }
 
+/// **A conversion's playlist frozen below the cushion fails the read too.** Only a tuner's own
+/// playlist was judged during the hold, so a transcoder playlist that stopped below the cushion with
+/// no end marker was polled every 500 ms for ever (PR #993 review). It gets a longer limit, because
+/// its clock runs from before the encoder's first segment: past the tuner's limit it still waits.
+#[test]
+fn a_conversion_playlist_frozen_below_its_cushion_fails_the_read_after_a_longer_wait() {
+    let tuner = live_hold_stall_limit(true, 1);
+    let conversion = live_hold_stall_limit(false, 1);
+    assert_eq!(tuner, live_stall_limit(1));
+    assert_eq!(conversion, std::time::Duration::from_secs(60));
+    let second = std::time::Duration::from_secs(1);
+    let frozen = || ("media.m3u8", media(2, "", false));
+
+    let mut net = net(vec![("start.m3u8", MASTER.into()), frozen()], Arc::new(Observer::default()));
+    let mut aq = crate::aq::aq_new(1024);
+    let mut cursor = open(&mut aq, &mut net, LIVE_ENTRY);
+    assert!(cursor.live && net.carry.is_none(), "a conversion: live, and no tuner carry");
+    cursor.live_held_next = 2;
+    cursor.live_unchanged_since = Some(std::time::Instant::now() - conversion - second);
+    let read = hls_cursor_next(&mut cursor, &mut *aq, &mut net, None);
+    assert!(matches!(read, Err(HlsExit::Failed(HLS_LIVE_STALLED))), "{read:?}");
+    crate::aq::aq_destroy(&mut *aq);
+
+    // Past the tuner's limit a slow encoder is still waited for, and growth starts the read.
+    let mut net = self::net(vec![("start.m3u8", MASTER.into()), frozen(), ("media.m3u8", media(4, "", false))],
+        Arc::new(Observer::default()));
+    let mut aq = crate::aq::aq_new(1024);
+    let mut cursor = open(&mut aq, &mut net, LIVE_ENTRY);
+    cursor.live_held_next = 2;
+    cursor.live_unchanged_since = Some(std::time::Instant::now() - tuner - second);
+    assert_eq!(hls_cursor_next(&mut cursor, &mut *aq, &mut net, None).unwrap().unwrap().sequence, 1);
+    assert_eq!(cursor.live_unchanged_since, None, "growth cleared the clock");
+    crate::aq::aq_destroy(&mut *aq);
+}
+
 /// A tune's playlist read before the recording cut its first segment has the media tags and no
 /// EXTINF. It is the session's media playlist, not a master with no variant: the cursor opens on
 /// it and starts once the cushion exists (PR #993 review).
