@@ -165,20 +165,20 @@ fn livetv_consecutive_grid_failures_double_the_wait_and_a_good_read_resets_it() 
     answer(&mut stores, Some(vec![guide(&["10"], 200)]));
     stores.livetv_pump(&keys, 200);
     // Each failed read lands on one pump, then waits `frames` pumps for the next job.
-    let fail_then_wait = |stores: &mut Stores, frames: u32| {
+    let fail_then_wait = |stores: &mut Stores, frames: u32, now: i64| {
         let (job, port) = take(stores);
         assert!(matches!(job.req.work, Work::Grid(_)));
         finish_with(&port, job.addr, job.req, |_| None);
-        stores.livetv_pump(&keys, 210);
+        stores.livetv_pump(&keys, now);
         for _ in 0..frames - 1 {
-            stores.livetv_pump(&keys, 210);
+            stores.livetv_pump(&keys, now);
             assert!(!stores.has_jobs(), "the grid is not asked again inside {frames} frames");
         }
-        stores.livetv_pump(&keys, 210);
+        stores.livetv_pump(&keys, now);
     };
-    fail_then_wait(&mut stores, RETRY_FRAMES);
-    fail_then_wait(&mut stores, 2 * RETRY_FRAMES);
-    fail_then_wait(&mut stores, 4 * RETRY_FRAMES);
+    fail_then_wait(&mut stores, RETRY_FRAMES, 210);
+    fail_then_wait(&mut stores, 2 * RETRY_FRAMES, 210);
+    fail_then_wait(&mut stores, 4 * RETRY_FRAMES, 210);
     for _ in 0..RETRY_DOUBLINGS { let (job, port) = take(&mut stores); port.refused(job.addr);
         for _ in 0..=RETRY_FRAMES << RETRY_DOUBLINGS { stores.livetv_pump(&keys, 210); } }
     let (job, port) = take(&mut stores);
@@ -189,9 +189,18 @@ fn livetv_consecutive_grid_failures_double_the_wait_and_a_good_read_resets_it() 
         assert!(!stores.has_jobs(), "the wait is capped, not shortened");
     }
     stores.livetv_pump(&keys, 210);
-    answer(&mut stores, Some(vec![guide(&["10"], 205)]));
-    stores.livetv_pump(&keys, 205);
-    fail_then_wait(&mut stores, RETRY_FRAMES);
+    // The good read goes through the production `read`, whose own answer starts the count over: a
+    // hand-built guide here would carry `strikes: 0` whatever `read` did.
+    let io = Script::new();
+    execute(&mut stores, &io);
+    assert_eq!(io.calls.borrow().as_slice(), ["grid:tv.plex.providers.epg.xmltv:7:210"]);
+    stores.livetv_pump(&keys, 210);
+    assert!(!stores.has_jobs(), "a good read is not retried");
+    // Past whatever the good read scheduled, the grid is due again; its next failure waits the
+    // first step, not the cap it had reached.
+    const LATER: i64 = 1_000_000;
+    stores.livetv_pump(&keys, LATER);
+    fail_then_wait(&mut stores, RETRY_FRAMES, LATER);
     assert!(stores.has_jobs());
 }
 

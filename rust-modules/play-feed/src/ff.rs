@@ -4520,9 +4520,10 @@ pub struct HlsCursor {
     pub live: bool,
     /// Fresh opens may pass at most this many undecodable cuts before failing closed.
     pub live_start_skips_left: u8,
-    /// When the live playlist last stopped bringing segments: `None` while it grows. A live
-    /// recording whose playlist stays unchanged past [`live_stall_limit`] fails the read with
-    /// [`HLS_LIVE_STALLED`] instead of polling forever on a frozen picture.
+    /// When the live playlist last stopped bringing segments: `None` while it grows. Until
+    /// [`live_stall_limit`] has passed the same cursor keeps polling the same playlist (no reopen,
+    /// no new session; the pump holds the clock on "Buffering" once the fed media runs out); past
+    /// it the read fails with [`HLS_LIVE_STALLED`] instead of polling forever.
     pub live_unchanged_since: Option<std::time::Instant>,
     /// Where the playlist ended (its media sequence plus its segments) at the last read the start
     /// cushion held: the growth the stall clock measures before the tracker has seen a segment.
@@ -4538,24 +4539,48 @@ const HLS_MISSING_IDR: &str = "HLS segment does not begin with an IDR";
 const LIVE_START_SKIP_SEGMENTS: u8 = 3;
 /// The maintainer's webOS 4.5 run (PR #993): a Threadfin channel's playlist stopped growing at 4:19,
 /// with no end marker, and the reader re-read it every 500 ms for good while the picture froze and
-/// nothing told the viewer. The read fails instead, and the open recovery decides what follows.
+/// nothing told the viewer. The read fails instead. It is not a decode failure: the recording has
+/// no input, so converting that same recording meets the same gap. [`hls_failure_effects`] names it
+/// to the player ([`DemuxEffect::LiveStalled`]), which reads it out without spending the channel's
+/// conversion.
 const HLS_LIVE_STALLED: &str = "HLS live playlist stopped advancing";
+/// The least a live playlist is given to bring something new. PROVISIONAL (PR #993 review): on the
+/// maintainer's webOS 4.5 runs Plex waited 29.8 s and 30.3 s for DVR input on two Pluto channels and
+/// then resumed on the same encoder, 14-15 s after the 15 s this floor used to be had given up. 45 s
+/// is those gaps plus half again; it is a measurement of two channels, not a protocol bound.
+const LIVE_STALL_FLOOR_SECS: u64 = 45;
 /// How long a live playlist may bring nothing new: three target durations (RFC 8216 lets a server
-/// take up to one and a half to publish the next segment), and never under 15 s, so a slow tuner
-/// that is still recording is not cut off.
+/// take up to one and a half to publish the next segment), and never under
+/// [`LIVE_STALL_FLOOR_SECS`], so a recording whose input paused and resumes is not cut off.
 fn live_stall_limit(target_duration_secs: u64) -> std::time::Duration {
-    std::time::Duration::from_secs(target_duration_secs.saturating_mul(3).max(15))
+    std::time::Duration::from_secs(target_duration_secs.saturating_mul(3).max(LIVE_STALL_FLOOR_SECS))
 }
 
 /// The same bound while the start cushion still holds ([`live_start_ready`]). A tuner's own
-/// playlist (`tuner`) is already recording when it is first read, so it keeps [`live_stall_limit`].
+/// playlist (`tuner`) is already recording when it is first read, and an input gap is no shorter
+/// below the cushion than after the start, so it keeps [`live_stall_limit`] and its floor.
 /// A conversion's is read from before its encoder has listed anything, and the stall clock starts on
 /// that first held read: the wait spans the encoder's whole start (attaching to the recording,
-/// probing it, its first GOP), which the limit after the start never has to cover. Four times the
-/// limit (60 s at the encoder's 1-2 s targets) is far past a slow server's few seconds and still ends
-/// a playlist that froze below the cushion with no end marker, which used to be polled for ever.
+/// probing it, its first GOP), which the limit after the start never has to cover. Its bound is the
+/// one it had before the floor was raised, four times three target durations and never under 60 s:
+/// at every target duration that is still at least [`live_stall_limit`] plus 15 s for the encoder's
+/// start, so a 30 s input gap met during the start is covered without the hold growing to minutes,
+/// and a playlist that froze below the cushion with no end marker still ends.
 fn live_hold_stall_limit(tuner: bool, target_duration_secs: u64) -> std::time::Duration {
-    live_stall_limit(target_duration_secs) * if tuner { 1 } else { 4 }
+    if tuner {
+        return live_stall_limit(target_duration_secs);
+    }
+    std::time::Duration::from_secs(target_duration_secs.saturating_mul(3).max(15).saturating_mul(4))
+}
+
+/// What a failed HLS read ends the session with, in publication order: a live playlist that stopped
+/// advancing is named first ([`DemuxEffect::LiveStalled`]), then the failure flag every such exit
+/// raises (the transport's once anything was delivered, the open's before that). The name precedes
+/// the flag because the pump reads both from the one sample the flag gates.
+fn hls_failure_effects(why: &'static str, pushed_any: bool) -> impl Iterator<Item = DemuxEffect> {
+    let stalled = (why == HLS_LIVE_STALLED).then_some(DemuxEffect::LiveStalled);
+    let flag = if pushed_any { DemuxEffect::IoFailed } else { DemuxEffect::FailFault(DemuxFault::HlsFailed) };
+    stalled.into_iter().chain([flag])
 }
 
 /// Whether a live playlist read that brought `new` segments has now been unchanged for longer than
@@ -5089,7 +5114,7 @@ fn hls_cursor_next(
             plx_base::eventlog::log(&format!("hls: live start holds for its cushion total_ms={}", total_ns / 1_000_000));
             // The tracker has seen nothing yet, so growth is read off the playlist's own end. A
             // tuner's own playlist (the one that arms carry state) is judged on the stall limit, a
-            // conversion's on the longer one its encoder's start needs ([`live_hold_stall_limit`]).
+            // conversion's on the one its encoder's start needs ([`live_hold_stall_limit`]).
             let next = media.media_sequence.saturating_add(media.segments.len() as u64);
             let grown = next.saturating_sub(cursor.live_held_next);
             cursor.live_held_next = next;
@@ -6315,10 +6340,8 @@ pub fn demux(
             Ok(Ok(())) | Ok(Err(HlsExit::Aborted)) => {}
             Ok(Err(HlsExit::Failed(why))) => {
                 session.media().record(&format!("hls: demux failed: {why}"));
-                if PUSHED_ANY.load(Ordering::Relaxed) {
-                    session.media().publish(DemuxEffect::IoFailed);
-                } else {
-                    session.media().publish(DemuxEffect::FailFault(DemuxFault::HlsFailed));
+                for effect in hls_failure_effects(why, PUSHED_ANY.load(Ordering::Relaxed)) {
+                    session.media().publish(effect);
                 }
             }
             Ok(Err(HlsExit::NotReady)) => {

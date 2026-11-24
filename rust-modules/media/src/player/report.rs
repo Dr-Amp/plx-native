@@ -366,7 +366,7 @@ fn refusal_recovered_context(recovered: &super::recovery::Recovered) -> Option<R
         LoadRefusal::Refused { num } => RefusalError::Number(num),
         LoadRefusal::TimedOut => RefusalError::Timeout,
         LoadRefusal::Stalled => RefusalError::Stall,
-        LoadRefusal::SourceFailed => return None,
+        LoadRefusal::SourceFailed | LoadRefusal::LiveStalled => return None,
     };
     // The codec class and, for audio, the channel bucket: the facet's raster and exact layout stay
     // in the machine.

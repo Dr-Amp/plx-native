@@ -165,6 +165,11 @@ pub enum DemuxEffect {
     FailFault(DemuxFault),
     IoFailed,
     Failed,
+    /// A live playlist brought nothing new for its whole no-progress allowance and the read gave
+    /// up. Published BEFORE the failure flag that ends the session ([`Self::IoFailed`] or
+    /// [`Self::FailFault`]), which it explains: the recording has no input, so the player reads it
+    /// out instead of converting the same recording ([`crate::feed::FeedRaw::live_stalled`]).
+    LiveStalled,
     NoVideo,
     /// The codec the file ACTUALLY carries, in the `dg_load_v` / `dg_load_a` code spaces, published
     /// only when the demuxer refuses a Load whose bytes disagree with its declared codec. The

@@ -1896,6 +1896,22 @@ as-recorded read is the original route (no encoder id, no fixed-HLS contract), s
 conversion is still there to try if that playlist then fails to decode. When a decision lists
 several `Media`, the one PMS marks `selected` is the playlist read; with none marked, the first.
 
+**A live playlist that brings nothing new is waited out, not converted.** A recording whose DVR
+input pauses keeps answering with the same playlist and no end marker. Measured by the maintainer on
+webOS 4.5 (PR #993, two Pluto channels): Plex waited 29.8 s and 30.3 s for input and then produced
+segments again on the same encoder. So the reader keeps polling the playlist it opened (no reopen,
+no second tune, no new session), and once the delivered media has played out the player holds its
+clock and shows **Buffering**, a channel read as recorded included; the first new segment that
+covers the measured runway gives play back. The no-progress allowance is three target durations
+and never under 45 s, a **provisional** floor taken from those two gaps, not a protocol bound. While
+the start cushion still holds, a tuner's own playlist gets the same allowance and a conversion's
+gets four times three target durations and never under 60 s (its clock runs from before the
+encoder has listed anything). Past the allowance the read fails as a stall, which is a different
+outcome from a decode failure: it ends in the playback error and does **not** take the channel's
+conversion (which reads that same recording and would meet the same gap), and the conversion stays
+unspent for a later decode failure. A cut that cannot be decoded (no SPS/IDR, a refused demux)
+still converts.
+
 `TranscodeSpec::source` now supports either a library rating key or the tuned
 `/livetv/sessions/{uuid}` key. Live re-encode requests reuse the **same** universal-transcoder
 query, capability profile, decision and fixed-segment HLS delivery (`start.m3u8`, the library's

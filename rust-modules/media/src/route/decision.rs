@@ -10519,6 +10519,13 @@ pub fn request_live(
     )
 }
 
+/// Make `ps` a playback of a Live TV channel, for a pump rig that installs no tune.
+#[cfg(all(test, feature = "hostsim"))]
+pub(crate) fn mark_live_for_test(ps: &mut PlaybackSession) {
+    ps.cur_live = Some(plx_plex::plex::livetv::LiveSession {
+        key: "/livetv/sessions/9b9fe727-0000-46db-b94c-ef512e3e61d2".into(), rating_key: String::new() });
+}
+
 /// This playback watches a Live TV channel: there is no timeline to seek in and nothing to resume.
 pub fn is_live(ps: &PlaybackSession) -> bool {
     ps.cur_live.is_some() || ps.request.as_ref().is_some_and(|r| r.live.is_some())

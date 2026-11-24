@@ -300,7 +300,8 @@ fn carried_live_state_keeps_segment_failures_strict() {
 /// maintainer's webOS 4.5 run (PR #993): a Threadfin channel's playlist kept answering with the
 /// same segments and no end marker from 4:19 on; the reader re-read it 53 times and would have
 /// kept going, the picture frozen and nothing said. Past the stall limit the read fails with
-/// [`HLS_LIVE_STALLED`], which the open recovery turns into the channel's conversion or a read-out.
+/// [`HLS_LIVE_STALLED`], which is named to the player as a stall and reads out: the recording has no
+/// input, so it is not converted ([`a_stalled_live_read_is_named_before_its_failure_flag`]).
 #[test]
 fn a_live_playlist_that_stops_advancing_fails_the_read_instead_of_polling_forever() {
     let mut net = net(vec![("start.m3u8", MASTER.into()), ("media.m3u8", media(12, "", false))],
@@ -320,11 +321,52 @@ fn a_live_playlist_that_stops_advancing_fails_the_read_instead_of_polling_foreve
     crate::aq::aq_destroy(&mut *aq);
 }
 
+/// **A 30 s gap in the recording's input is waited out on the same session.** The maintainer's webOS
+/// 4.5 runs (PR #993 review): on two Pluto channels Plex waited 29.8 s and 30.3 s for DVR input and
+/// then produced segments again on the same encoder, 14-15 s after the 15 s floor had failed the
+/// read. The cursor keeps polling the one playlist it opened (the fake refuses any other request, so
+/// a reopen or a second session would panic here), and delivers the segment the gap ended with.
+#[test]
+fn a_live_playlist_unchanged_for_thirty_seconds_resumes_on_the_same_session() {
+    let observer = Arc::new(Observer::default());
+    let mut net = net(vec![("start.m3u8", MASTER.into()), ("media.m3u8", media(12, "", false))], observer.clone());
+    let mut aq = crate::aq::aq_new(1024);
+    let mut cursor = open(&mut aq, &mut net, LIVE_ENTRY);
+    for sequence in 9..12 {
+        assert_eq!(hls_cursor_next(&mut cursor, &mut *aq, &mut net, None).unwrap().unwrap().sequence, sequence);
+    }
+    // Unchanged for 30 s already, unchanged once more, then the recording's input is back.
+    net.curl = Some(Box::new(Playlists { replies: vec![("media.m3u8", media(12, "", false)),
+        ("media.m3u8", media(13, "", false))].into(), body: VecDeque::new(), size: 0 }));
+    cursor.live_unchanged_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(30));
+    let read = hls_cursor_next(&mut cursor, &mut *aq, &mut net, None);
+    assert_eq!(read.expect("a 30 s gap is not a failure").expect("nor an end").sequence, 12);
+    assert_eq!(cursor.live_unchanged_since, None, "growth clears the stall clock");
+    assert!(!cursor.ended);
+    crate::aq::aq_destroy(&mut *aq);
+}
+
+/// **A stall is named before the flag that ends the session**, so the pump reads both from one
+/// sample and does not take it for a decode failure (which converts the channel). Every other
+/// failure keeps the two flags it had: the transport's once anything was delivered, the open's before.
+#[test]
+fn a_stalled_live_read_is_named_before_its_failure_flag() {
+    let effects = |why, pushed| hls_failure_effects(why, pushed).collect::<Vec<_>>();
+    assert!(matches!(effects(HLS_LIVE_STALLED, true)[..], [DemuxEffect::LiveStalled, DemuxEffect::IoFailed]));
+    assert!(matches!(effects(HLS_LIVE_STALLED, false)[..],
+        [DemuxEffect::LiveStalled, DemuxEffect::FailFault(DemuxFault::HlsFailed)]));
+    assert!(matches!(effects(HLS_MISSING_IDR, true)[..], [DemuxEffect::IoFailed]));
+    assert!(matches!(effects(H264_IDR_WITHOUT_SPS, false)[..], [DemuxEffect::FailFault(DemuxFault::HlsFailed)]));
+}
+
 #[test]
 fn the_live_stall_clock_starts_on_the_first_empty_read_and_growth_clears_it() {
     let limit = live_stall_limit(1);
-    assert_eq!(limit, std::time::Duration::from_secs(15), "a short target duration keeps the 15 s floor");
-    assert_eq!(live_stall_limit(10), std::time::Duration::from_secs(30));
+    // Was 15 s and 30 s: the floor is now the provisional 45 s (PR #993 review), and a longer
+    // target duration keeps its three-target-durations allowance.
+    assert_eq!(limit, std::time::Duration::from_secs(45), "a short target duration keeps the 45 s floor");
+    assert_eq!(live_stall_limit(10), std::time::Duration::from_secs(45));
+    assert_eq!(live_stall_limit(20), std::time::Duration::from_secs(60), "three target durations past the floor");
     let t0 = std::time::Instant::now();
     let mut since = None;
     assert!(!live_playlist_stalled(&mut since, 0, t0, limit), "the first empty read only starts the clock");
@@ -426,6 +468,14 @@ fn a_conversion_playlist_frozen_below_its_cushion_fails_the_read_after_a_longer_
     let conversion = live_hold_stall_limit(false, 1);
     assert_eq!(tuner, live_stall_limit(1));
     assert_eq!(conversion, std::time::Duration::from_secs(60));
+    // The hold is never shorter than it was under the 15 s floor, and always leaves the encoder's
+    // start 15 s past the in-play allowance.
+    for (target, was) in [(1, 60), (2, 60), (6, 72), (10, 120), (20, 240)] {
+        let hold = live_hold_stall_limit(false, target);
+        assert_eq!(hold, std::time::Duration::from_secs(was), "target {target}");
+        assert!(hold >= live_stall_limit(target) + std::time::Duration::from_secs(15), "target {target}");
+        assert!(live_hold_stall_limit(true, target) >= std::time::Duration::from_secs(45), "target {target}");
+    }
     let second = std::time::Duration::from_secs(1);
     let frozen = || ("media.m3u8", media(2, "", false));
 

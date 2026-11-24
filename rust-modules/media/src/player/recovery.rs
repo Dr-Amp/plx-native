@@ -104,20 +104,26 @@ pub enum LoadRefusal {
     Stalled,
     /// Not the pipeline: the demuxer or the transport died before a picture.
     SourceFailed,
+    /// Not the pipeline and not the stream's bytes: a Live TV playlist brought nothing new for its
+    /// whole no-progress allowance (`FeedRaw::live_stalled`). The recording has no input, so no
+    /// route that reads that same recording can do better; it only reads out.
+    LiveStalled,
 }
 
 impl LoadRefusal {
     /// Whether the refusal is the pipeline's, so the stream it was fed is a suspect. A timeout
-    /// names no facet (the pipeline said nothing) and a source failure is not the pipeline's.
+    /// names no facet (the pipeline said nothing) and a source failure or a stalled live playlist
+    /// is not the pipeline's.
     pub fn names_pipeline(self) -> bool {
         matches!(self, Self::Refused { .. } | Self::Stalled)
     }
 
     /// Whether a rescue of this refusal is reported: the television's pipeline refused the Load
     /// (a number, or the surround stall) or answered nothing within the Load budget. A source
-    /// failure is the demuxer's or the transport's, not the television's refusal.
+    /// failure is the demuxer's or the transport's, and a stalled live playlist the recording's,
+    /// not the television's refusal.
     pub fn reports(self) -> bool {
-        !matches!(self, Self::SourceFailed)
+        !matches!(self, Self::SourceFailed | Self::LiveStalled)
     }
 }
 
@@ -128,6 +134,7 @@ impl std::fmt::Display for LoadRefusal {
             Self::TimedOut => f.write_str("Load timed out"),
             Self::Stalled => f.write_str("native audio stall"),
             Self::SourceFailed => f.write_str("source failed"),
+            Self::LiveStalled => f.write_str("live playlist stalled"),
         }
     }
 }
@@ -309,7 +316,8 @@ pub enum RecoveryEffect {
     /// Fly the HLS contingency a cold Auto Original retained (`dispatch_unopened_auto_hls`).
     StartAutoHls,
     /// **A Live TV channel's own rung**: convert the session the tune is already recording through
-    /// the live universal transcoder (`dispatch_live_refusal_conversion`). A channel's playlist is
+    /// the live universal transcoder (`dispatch_live_refusal_conversion`). Never for
+    /// [`LoadRefusal::LiveStalled`], which reads out with the rung unspent. A channel's playlist is
     /// whatever the tuner emitted — a cut that begins mid-GOP with no parameter sets decodes to
     /// nothing — and the server can always transcode that same session, which is the route the
     /// official client and this app's own live conversion use. `flight` is the ordinal of the
@@ -606,7 +614,8 @@ impl OpenRecovery {
 
     /// The rung `facts` select. The order is the proof that no rung of main is reordered: a Live TV
     /// channel's own conversion (its only rung: the session is already recording, so there is
-    /// nothing to re-plan from `/decision`), pending rollback, Forced's app decode (a track of at most
+    /// nothing to re-plan from `/decision`; a stalled playlist is not converted and spends nothing),
+    /// pending rollback, Forced's app decode (a track of at most
     /// two channels) or read-out, the facet rung, a cold
     /// Auto Original's HLS rung, then for a track of at most two channels the app decode and a manual
     /// pick's encode, or for a surround track the encode and then the app decode (the owner's rule: the
@@ -623,7 +632,12 @@ impl OpenRecovery {
             // codec is ever fed, which is the failure that used to end playback. Once per request,
             // and never under Forced Direct Play (the viewer asked not to convert); a conversion
             // that fails as well reads out.
-            if !self.live_spent && !facts.forced {
+            //
+            // A playlist that stopped advancing is the one failure it is not for: the recording
+            // has no input, and its conversion reads that same recording (the maintainer's webOS 4.5
+            // run, PR #993: the direct play's stall converted the recording, which met the same
+            // gap). It reads out with the rung unspent.
+            if refusal != LoadRefusal::LiveStalled && !self.live_spent && !facts.forced {
                 self.live_spent = true;
                 self.flights += 1;
                 fx.push(RecoveryEffect::LiveTranscode { flight: self.flights });
@@ -1065,6 +1079,28 @@ mod tests {
         let (_, fx) = run(&mut m, refused(SHUT, facts));
         assert_eq!(fx, vec![RecoveryEffect::ShowError { refusal: SHUT }]);
         assert_eq!(m.phase(), Phase::Failed);
+    }
+
+    /// **A playlist that stopped advancing is not a decode failure** (PR #993 review, the
+    /// maintainer's webOS 4.5 run: the direct play's stall converted the recording, and the
+    /// conversion met the same input gap). It reads out and spends nothing: the channel's conversion
+    /// is still there for a decode failure of the next open.
+    #[test]
+    fn a_stalled_live_playlist_reads_out_without_converting_or_spending_the_rung() {
+        let mut m = machine();
+        let (handled, fx) = run(&mut m, refused(LoadRefusal::LiveStalled, live_facts()));
+        assert_eq!((handled, fx), (Handled::Yes, vec![RecoveryEffect::ShowError { refusal: LoadRefusal::LiveStalled }]));
+        assert_eq!(m.phase(), Phase::Failed);
+        assert!(!LoadRefusal::LiveStalled.names_pipeline() && !LoadRefusal::LiveStalled.reports());
+        // Try Again: the next Load of the request re-opens the ladder, with the rung unspent.
+        run(&mut m, RecoveryEvent::LoadStarted);
+        let (_, fx) = run(&mut m, refused(LoadRefusal::SourceFailed, live_facts()));
+        assert_eq!(fx, vec![RecoveryEffect::LiveTranscode { flight: 1 }], "a decode failure still converts");
+        // And the conversion's own playlist stalling reads out as well.
+        run(&mut m, RecoveryEvent::FlightLanded { lanes: None });
+        run(&mut m, RecoveryEvent::LoadStarted);
+        let (_, fx) = run(&mut m, refused(LoadRefusal::LiveStalled, live_facts()));
+        assert_eq!(fx, vec![RecoveryEffect::ShowError { refusal: LoadRefusal::LiveStalled }]);
     }
 
     fn h264_4k() -> Option<StreamVideo> {
