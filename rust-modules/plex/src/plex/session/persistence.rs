@@ -3,18 +3,31 @@
 //! This module owns the distinction between the versioned canonical record and the legacy
 //! filename candidates. Canonical helper loads, typed migration, and exact readback share this
 //! adapter; no unavailable helper response authorizes a file-backend fallback.
+//!
+//! **Which store is canonical is the platform's statement**, [`plx_os::tv::authority::authority`]:
+//! the storage helper ([`Authority::Helper`], webOS) or the 0600 record files ([`Authority::Files`],
+//! the desktop, a host test and a platform with no helper). Every dispatcher here reads it once per
+//! call, in its public form, and hands it to a `*_via(authority, helper, ..)` form that takes the
+//! authority and the helper's transport as parameters, so a host test grades the helper arm with a
+//! fake transport and the files arm with a transport that fails the test if it is touched. The one
+//! exception is `cleanup_temporaries`, which dispatches through `cleanup_temporaries_for(authority)`
+//! with no transport, because the helper arm sweeps nothing. The helper's real transport
+//! (`NativeTransport`) is named by the other dispatchers' public forms and by
+//! two helpers that have no `_via` seam: `reset_cleared_language()`, which `clear_for_erase` calls
+//! under `Helper` (device-only), and `helper_commit`, which has no caller in this crate.
 
-use plx_platform::storage::{
+use plx_os::storage::{
     CommitReceipt, CommitStage, Record, RecordKey, RecordState, RecordStore, StoreError,
 };
 use std::path::{Path, PathBuf};
 
-use plx_platform::storage::wire::ProtectionRequest;
-use plx_platform::storage::{
+use plx_os::storage::wire::ProtectionRequest;
+use plx_os::storage::{
     client::{self, Load as HelperLoad},
     state::{self, Generation, MigrationProgress, Status},
     wire::{AuthLoad, CommitStatus, MigrationMutation, Response, WireMutation},
 };
+use plx_os::tv::authority::{authority as storage_authority, Authority};
 
 pub enum CanonicalRead {
     Missing,
@@ -39,7 +52,7 @@ pub enum CanonicalRead {
     Locked {
         revision: u64,
         public: super::Session,
-        protection: Option<plx_platform::storage::wire::ProtectionOutcome>,
+        protection: Option<plx_os::storage::wire::ProtectionOutcome>,
     },
     /// An earlier canonical migration already owns these opaque bytes. Never search other files.
     Pending {
@@ -51,20 +64,20 @@ pub enum CanonicalRead {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProtectionFailure {
-    pub failure: plx_platform::storage::wire::KeymanagerFailure,
-    pub preservation: plx_platform::storage::wire::AuthPreservation,
+    pub failure: plx_os::storage::wire::KeymanagerFailure,
+    pub preservation: plx_os::storage::wire::AuthPreservation,
     pub db8_commit_verified: bool,
 }
 
 /// Payload-free evidence owned by the completion, including any legacy candidate errno numbers.
-pub type HelperEvidence = (plx_platform::storage::wire::failure::HelperFailure, [Option<i32>; 8]);
+pub type HelperEvidence = (plx_os::storage::wire::failure::HelperFailure, [Option<i32>; 8]);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CanonicalCommit {
     Durable {
         revision: u64,
         verified: bool,
-        protection: Option<plx_platform::storage::wire::ProtectionOutcome>,
+        protection: Option<plx_os::storage::wire::ProtectionOutcome>,
     },
     Uncertain {
         stage: CommitStage,
@@ -84,35 +97,25 @@ pub fn path() -> PathBuf {
 }
 
 pub fn cleanup_temporaries() -> Result<(), StoreError> {
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "arm",
-        not(feature = "hostsim"),
-        not(any(test, feature = "test-support"))
-    ))]
-    {
+    cleanup_temporaries_for(storage_authority())
+}
+
+fn cleanup_temporaries_for(authority: Authority) -> Result<(), StoreError> {
+    match authority {
         // DB8 has no app-owned rename temporaries. Legacy paths are retired explicitly after the
         // helper has verified the committed destination; absence of the old app/state directory
         // is normal on a fresh install and must not turn sign-out into a cleanup failure.
-        Ok(())
-    }
-    #[cfg(not(all(
-        target_os = "linux",
-        target_arch = "arm",
-        not(feature = "hostsim"),
-        not(any(test, feature = "test-support"))
-    )))]
-    {
-        store()?.cleanup(RecordKey::Session)
+        Authority::Helper => Ok(()),
+        Authority::Files => store()?.cleanup(RecordKey::Session),
     }
 }
 
 fn store() -> Result<impl RecordStore, StoreError> {
     plx_base::paths::ensure_persistent_state_root().map_err(|error| StoreError::Io {
-        stage: plx_platform::storage::CommitStage::ParentOpen,
+        stage: plx_os::storage::CommitStage::ParentOpen,
         errno: error.raw_os_error().unwrap_or(0),
     })?;
-    plx_platform::storage::open(root())
+    plx_os::storage::open(root())
 }
 
 /// Read the versioned JSON record used by the pre-DB8 0.6.6 candidates without creating it.
@@ -130,7 +133,7 @@ fn load_legacy_json_at(root: PathBuf) -> CanonicalRead {
         }),
         Ok(metadata) if !metadata.is_dir() => CanonicalRead::Blocked(StoreError::RootNotDirectory),
         Ok(_) => {
-            let store = match plx_platform::storage::open(root) {
+            let store = match plx_os::storage::open(root) {
                 Ok(store) => store,
                 Err(error) => return CanonicalRead::Blocked(error),
             };
@@ -158,45 +161,44 @@ std::thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// The canonical record from the platform's store.
 pub fn load() -> CanonicalRead {
+    load_via(storage_authority(), &mut client::NativeTransport)
+}
+
+/// [`load`] with the authority and the helper's transport as parameters. The transport is touched
+/// only by [`Authority::Helper`].
+pub(super) fn load_via(authority: Authority, helper: &mut dyn client::Transport) -> CanonicalRead {
+    match authority {
+        Authority::Helper => load_helper_with(helper),
+        Authority::Files => load_file(),
+    }
+}
+
+/// The record files' read. A test may substitute it (`READ_FOR_TEST`), which only ever stands in
+/// for this store: the helper arm is read through its transport.
+fn load_file() -> CanonicalRead {
     #[cfg(any(test, feature = "test-support"))]
     if let Some(read) = READ_FOR_TEST.with(|hook| hook.get()) {
         return read();
     }
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "arm",
-        not(feature = "hostsim"),
-        not(any(test, feature = "test-support"))
-    ))]
-    {
-        return load_helper();
-    }
-    #[cfg(not(all(
-        target_os = "linux",
-        target_arch = "arm",
-        not(feature = "hostsim"),
-        not(any(test, feature = "test-support"))
-    )))]
-    {
-        let store = match store() {
-            Ok(store) => store,
-            Err(error) => return CanonicalRead::Blocked(error),
-        };
-        match store.load(RecordKey::Session) {
-            Ok(None) => CanonicalRead::Missing,
-            Ok(Some(record)) => match record.state {
-                RecordState::Data { payload } => CanonicalRead::Data {
-                    revision: record.revision,
-                    payload,
-                },
-                RecordState::Cleared => CanonicalRead::Cleared {
-                    revision: record.revision,
-                    kept: super::install_preferences::load().unwrap_or_default(),
-                },
+    let store = match store() {
+        Ok(store) => store,
+        Err(error) => return CanonicalRead::Blocked(error),
+    };
+    match store.load(RecordKey::Session) {
+        Ok(None) => CanonicalRead::Missing,
+        Ok(Some(record)) => match record.state {
+            RecordState::Data { payload } => CanonicalRead::Data {
+                revision: record.revision,
+                payload,
             },
-            Err(error) => CanonicalRead::Blocked(error),
-        }
+            RecordState::Cleared => CanonicalRead::Cleared {
+                revision: record.revision,
+                kept: super::install_preferences::load().unwrap_or_default(),
+            },
+        },
+        Err(error) => CanonicalRead::Blocked(error),
     }
 }
 
@@ -209,8 +211,8 @@ fn helper_error(error: client::ClientError) -> StoreError {
     }
 }
 
-fn helper_rejection(code: plx_platform::storage::wire::ErrorCode) -> StoreError {
-    use plx_platform::storage::wire::ErrorCode;
+fn helper_rejection(code: plx_os::storage::wire::ErrorCode) -> StoreError {
+    use plx_os::storage::wire::ErrorCode;
     match code {
         ErrorCode::Unavailable | ErrorCode::Timeout | ErrorCode::Capability => {
             StoreError::HelperUnavailable
@@ -219,10 +221,6 @@ fn helper_rejection(code: plx_platform::storage::wire::ErrorCode) -> StoreError 
         ErrorCode::Protocol => StoreError::HelperProtocol,
         ErrorCode::Invalid | ErrorCode::Corrupt => StoreError::InvalidSchema,
     }
-}
-
-fn load_helper() -> CanonicalRead {
-    load_helper_with(&mut client::NativeTransport)
 }
 
 pub fn load_helper_with(transport: &mut dyn client::Transport) -> CanonicalRead {
@@ -286,73 +284,79 @@ fn commit(record: Record) -> CanonicalCommit {
 }
 
 pub fn commit_data(payload: String) -> CanonicalCommit {
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "arm",
-        not(feature = "hostsim"),
-        not(any(test, feature = "test-support"))
-    ))]
-    {
-        let session = match serde_json::from_str::<super::Session>(&payload) {
-            Ok(session) => session,
-            Err(_) => return CanonicalCommit::Failed(StoreError::InvalidSchema),
-        };
-        return commit_session(&session, false, super::SaveAuthority::Routine);
-    }
-    #[cfg(not(all(
-        target_os = "linux",
-        target_arch = "arm",
-        not(feature = "hostsim"),
-        not(any(test, feature = "test-support"))
-    )))]
-    {
-        let revision = match load() {
-            CanonicalRead::Data { revision, .. }
-            | CanonicalRead::Opened { revision, .. }
-            | CanonicalRead::Cleared { revision, .. }
-            | CanonicalRead::Locked { revision, .. }
-            | CanonicalRead::Pending { revision, .. } => match revision.checked_add(1) {
-                Some(revision) => revision,
-                None => return CanonicalCommit::Failed(StoreError::InvalidSchema),
-            },
-            CanonicalRead::Missing => 1,
-            CanonicalRead::Blocked(error) => return CanonicalCommit::Failed(error),
-        };
-        commit(Record::data(revision, payload))
+    commit_data_via(storage_authority(), &mut client::NativeTransport, payload)
+}
+
+/// [`commit_data`] with the authority and the helper's transport as parameters. The helper takes
+/// the decoded session as a routine write; the files take the payload as it is.
+pub(super) fn commit_data_via(
+    authority: Authority,
+    helper: &mut dyn client::Transport,
+    payload: String,
+) -> CanonicalCommit {
+    match authority {
+        Authority::Helper => {
+            let session = match serde_json::from_str::<super::Session>(&payload) {
+                Ok(session) => session,
+                Err(_) => return CanonicalCommit::Failed(StoreError::InvalidSchema),
+            };
+            commit_session_with(
+                &session,
+                false,
+                super::SaveAuthority::Routine,
+                plx_os::tv::device::info().major,
+                helper,
+            )
+        }
+        Authority::Files => commit_data_file(payload),
     }
 }
 
+fn commit_data_file(payload: String) -> CanonicalCommit {
+    let revision = match load_file() {
+        CanonicalRead::Data { revision, .. }
+        | CanonicalRead::Opened { revision, .. }
+        | CanonicalRead::Cleared { revision, .. }
+        | CanonicalRead::Locked { revision, .. }
+        | CanonicalRead::Pending { revision, .. } => match revision.checked_add(1) {
+            Some(revision) => revision,
+            None => return CanonicalCommit::Failed(StoreError::InvalidSchema),
+        },
+        CanonicalRead::Missing => 1,
+        CanonicalRead::Blocked(error) => return CanonicalCommit::Failed(error),
+    };
+    commit(Record::data(revision, payload))
+}
+
 pub fn commit_cleared() -> CanonicalCommit {
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "arm",
-        not(feature = "hostsim"),
-        not(any(test, feature = "test-support"))
-    ))]
-    {
-        return commit_clear();
+    commit_cleared_via(storage_authority(), &mut client::NativeTransport)
+}
+
+/// [`commit_cleared`] with the authority and the helper's transport as parameters.
+pub(super) fn commit_cleared_via(
+    authority: Authority,
+    helper: &mut dyn client::Transport,
+) -> CanonicalCommit {
+    match authority {
+        Authority::Helper => commit_clear_with(helper),
+        Authority::Files => commit_cleared_file(),
     }
-    #[cfg(not(all(
-        target_os = "linux",
-        target_arch = "arm",
-        not(feature = "hostsim"),
-        not(any(test, feature = "test-support"))
-    )))]
-    {
-        let revision = match load() {
-            CanonicalRead::Data { revision, .. }
-            | CanonicalRead::Opened { revision, .. }
-            | CanonicalRead::Cleared { revision, .. }
-            | CanonicalRead::Locked { revision, .. }
-            | CanonicalRead::Pending { revision, .. } => match revision.checked_add(1) {
-                Some(revision) => revision,
-                None => return CanonicalCommit::Failed(StoreError::InvalidSchema),
-            },
-            CanonicalRead::Missing => 1,
-            CanonicalRead::Blocked(_) => 1,
-        };
-        commit(Record::cleared(revision))
-    }
+}
+
+fn commit_cleared_file() -> CanonicalCommit {
+    let revision = match load_file() {
+        CanonicalRead::Data { revision, .. }
+        | CanonicalRead::Opened { revision, .. }
+        | CanonicalRead::Cleared { revision, .. }
+        | CanonicalRead::Locked { revision, .. }
+        | CanonicalRead::Pending { revision, .. } => match revision.checked_add(1) {
+            Some(revision) => revision,
+            None => return CanonicalCommit::Failed(StoreError::InvalidSchema),
+        },
+        CanonicalRead::Missing => 1,
+        CanonicalRead::Blocked(_) => 1,
+    };
+    commit(Record::cleared(revision))
 }
 
 /// Exact-payload migration. The caller owns keymanager semantics and legacy cleanup; this helper
@@ -372,13 +376,25 @@ pub fn migrate_exact(source: &Path, payload: &[u8]) -> (CanonicalCommit, PathBuf
 
 /// Import an already decoded migration input through the same backend used by bootstrap.
 pub fn migrate_session(session: &super::Session) -> CanonicalCommit {
-    #[cfg(all(target_os = "linux", target_arch = "arm", not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
-    {
-        commit_session(session, true, super::SaveAuthority::Routine)
-    }
-    #[cfg(not(all(target_os = "linux", target_arch = "arm", not(feature = "hostsim"), not(any(test, feature = "test-support")))))]
-    {
-        write_session(session, super::SaveAuthority::Routine)
+    migrate_session_via(storage_authority(), &mut client::NativeTransport, session)
+}
+
+/// [`migrate_session`] with the authority and the helper's transport as parameters. Only the helper
+/// distinguishes a migration from a routine write (it advances the migration ledger).
+pub(super) fn migrate_session_via(
+    authority: Authority,
+    helper: &mut dyn client::Transport,
+    session: &super::Session,
+) -> CanonicalCommit {
+    match authority {
+        Authority::Helper => commit_session_with(
+            session,
+            true,
+            super::SaveAuthority::Routine,
+            plx_os::tv::device::info().major,
+            helper,
+        ),
+        Authority::Files => write_session_file(session),
     }
 }
 
@@ -541,7 +557,7 @@ const GCM_TAG: usize = 16;
 ///
 /// The two were once folded into one "whichever is larger, plus 512" figure, which overstated an
 /// ACL write (every credential change on a 4.x set) by the base64 expansion, and so evicted memory
-/// from a write the platform would have stored.
+/// from a write the os layer would have stored.
 pub(super) fn sealed_envelope_estimate(state: &state::CanonicalState, plaintext: &str, seal: Seal) -> usize {
     use serde_json::{json, Value};
     let mut context = state.auth_context();
@@ -661,7 +677,7 @@ pub(super) fn projected_document(
 /// **The document guard.** DB8 keeps the whole state in one document that may not pass
 /// `MAX_LOGICAL_BYTES`, and past it EVERY write fails (`LogicalTooLarge`): quality, pins, consent,
 /// all of it, because per-profile memory grew. So before a write that carries `public` is sent, its
-/// projected document is measured with the platform's own counting rule (`state::logical_size`;
+/// projected document is measured with the os layer's own counting rule (`state::logical_size`;
 /// the loaded envelope, ledger and any pending refresh are in hand, and future preference keys
 /// preserved above count), and if it would not fit, per-profile memory is shed from the payload —
 /// `track_memory`, then `subtitle_offsets`, then `library_sorts`, each oldest-first from the record
@@ -669,7 +685,7 @@ pub(super) fn projected_document(
 ///
 /// Returns the lists that lost entries and how many. Nothing is ever refused here: if everything
 /// sheddable is gone and the document still does not fit, the write goes out as it would have and
-/// the platform refuses it as before. A stored document already over the cap never reaches this
+/// the os layer refuses it as before. A stored document already over the cap never reaches this
 /// (it fails to load), and the file backend has no cap and no guard.
 pub(super) fn fit_document(
     state: &state::CanonicalState,
@@ -689,7 +705,7 @@ pub(super) fn fit_document(
 }
 
 /// The one line that reports what a write is about to put in DB8: the whole projected document
-/// and the share `track_memory` holds of it, both in the platform's logical bytes, against the
+/// and the share `track_memory` holds of it, both in the os layer's logical bytes, against the
 /// cap. It is what the device check reads to see how close memory sits to the budget; the write's
 /// own latency is the line `session.rs` logs after the helper answers.
 pub(super) fn document_size_line(total: usize, preferences: &serde_json::Value) -> String {
@@ -715,7 +731,7 @@ pub(super) fn projected_size(
     };
     let projected = size(write)?;
     if write == DocumentWrite::Staged {
-        // The platform also validates the document the pending refresh WOULD become
+        // The os layer also validates the document the pending refresh WOULD become
         // (`pending_candidate`), and that is what stands once it is promoted.
         return Some(projected.max(size(DocumentWrite::Replace(Seal::Keymanager))?));
     }
@@ -752,20 +768,6 @@ fn protection_for_auth_write(
 
 fn expected(snapshot: &client::Snapshot) -> Option<(&str, state::Expected)> {
     Some((&snapshot.db_rev, snapshot.state.expected()))
-}
-
-fn commit_session(
-    session: &super::Session,
-    migration: bool,
-    authority: super::SaveAuthority,
-) -> CanonicalCommit {
-    commit_session_with(
-        session,
-        migration,
-        authority,
-        plx_platform::tv::device::info().major,
-        &mut client::NativeTransport,
-    )
 }
 
 pub fn commit_session_with(
@@ -824,7 +826,7 @@ pub fn commit_session_with(
                     Ok(value) => value,
                     Err(_) => return CanonicalCommit::Failed(StoreError::InvalidSchema),
                 },
-                auth_plaintext: plx_platform::storage::wire::SecretString(protected),
+                auth_plaintext: plx_os::storage::wire::SecretString(protected),
                 protection: protection_for_auth_write(major, true, false, false),
             },
         },
@@ -836,7 +838,7 @@ pub fn commit_session_with(
                 Ok(value) => value,
                 Err(_) => return CanonicalCommit::Failed(StoreError::InvalidSchema),
             },
-            payload: plx_platform::storage::wire::SecretString(protected),
+            payload: plx_os::storage::wire::SecretString(protected),
             protection: protection_for_auth_write(major, may_fallback, false, false),
         },
         HelperLoad::Present(_) if migration => WireMutation::AdvanceMigration {
@@ -845,7 +847,7 @@ pub fn commit_session_with(
                     Ok(value) => value,
                     Err(_) => return CanonicalCommit::Failed(StoreError::InvalidSchema),
                 },
-                auth_plaintext: plx_platform::storage::wire::SecretString(protected),
+                auth_plaintext: plx_os::storage::wire::SecretString(protected),
                 protection: protection_for_auth_write(major, true, false, false),
             },
         },
@@ -873,7 +875,7 @@ pub fn commit_session_with(
                         Ok(value) => value,
                         Err(_) => return CanonicalCommit::Failed(StoreError::InvalidSchema),
                     },
-                    payload: plx_platform::storage::wire::SecretString(protected),
+                    payload: plx_os::storage::wire::SecretString(protected),
                     protection: protection_for_auth_write(
                         major,
                         may_fallback,
@@ -899,17 +901,6 @@ pub fn commit_session_with(
         HelperLoad::Present(snapshot) => expected(snapshot),
     };
     helper_commit_for_app_with(transport, expectation, operation, mutation)
-}
-
-pub fn commit_session_with_authority(
-    session: &super::Session,
-    authority: super::SaveAuthority,
-) -> CanonicalCommit {
-    commit_session(session, false, authority)
-}
-
-fn commit_clear() -> CanonicalCommit {
-    commit_clear_with(&mut client::NativeTransport)
 }
 
 pub(super) fn commit_clear_with(transport: &mut dyn client::Transport) -> CanonicalCommit {
@@ -991,7 +982,7 @@ fn helper_commit_with(
     operation: Generation,
     mutation: WireMutation,
 ) -> CanonicalCommit {
-    plx_platform::storage::wire::failure::clear();
+    plx_os::storage::wire::failure::clear();
     match client::commit_with(transport, expected, operation, mutation) {
         Ok(Response::Commit {
             status: CommitStatus::Committed,
@@ -1012,7 +1003,7 @@ fn helper_commit_with(
             None => CanonicalCommit::Failed(StoreError::InvalidSchema),
         },
         Ok(Response::Reconcile {
-            status: plx_platform::storage::wire::ReconcileStatus::Applied,
+            status: plx_os::storage::wire::ReconcileStatus::Applied,
             applied: Some(applied),
             protection,
             ..
@@ -1030,12 +1021,12 @@ fn helper_commit_with(
             ..
         })
         | Ok(Response::Reconcile {
-            status: plx_platform::storage::wire::ReconcileStatus::Unknown,
+            status: plx_os::storage::wire::ReconcileStatus::Unknown,
             ..
         }) => CanonicalCommit::Uncertain {
             stage: CommitStage::Readback,
             errno: 0,
-            helper: plx_platform::storage::wire::failure::last().map(|failure| (failure, [None; 8])),
+            helper: plx_os::storage::wire::failure::last().map(|failure| (failure, [None; 8])),
         },
         Ok(Response::Error { code }) => {
             plx_base::eventlog::log(&format!(
@@ -1079,11 +1070,11 @@ mod db8_policy_tests {
     #[test]
     fn helper_timeout_is_unavailable_not_invalid_schema() {
         assert_eq!(
-            helper_rejection(plx_platform::storage::wire::ErrorCode::Timeout),
+            helper_rejection(plx_os::storage::wire::ErrorCode::Timeout),
             StoreError::HelperUnavailable
         );
         assert_eq!(
-            helper_rejection(plx_platform::storage::wire::ErrorCode::Corrupt),
+            helper_rejection(plx_os::storage::wire::ErrorCode::Corrupt),
             StoreError::InvalidSchema
         );
     }
@@ -1156,7 +1147,7 @@ mod db8_policy_tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let store = plx_platform::storage::open(root.clone()).unwrap();
+        let store = plx_os::storage::open(root.clone()).unwrap();
         let payload = r#"{"client_id":"legacy-client","account_token":"legacy-token"}"#;
         assert_eq!(
             store.commit(RecordKey::Session, &Record::data(7, payload.into())),
@@ -1184,22 +1175,38 @@ mod db8_policy_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// `bootstrap()` and `cleanup_after_confirmed_clear()` must search and sweep the pre-DB8
-    /// canonical JSON wrapper identically on ARM, so both funnel through this one helper rather
-    /// than each carrying its own `insert(0, path())`. This is callable unconditionally (it is
-    /// pure path arithmetic), so a host test can prove the shared assembly directly instead of
-    /// only trusting that the two ARM-gated call sites still agree.
+    /// A television's helper keeps no app-owned rename temporaries, so there is nothing to sweep and
+    /// the root is left as it is; a files platform sweeps the abandoned ones its own commits left.
     #[test]
-    fn arm_candidate_assembly_puts_the_canonical_wrapper_first() {
+    fn the_helper_keeps_no_app_temporaries_and_the_files_sweep_theirs() {
+        let _serial = plx_base::testlock::serial();
+        let root = TempPersistenceRoot::new("cleanup-temporaries");
+        plx_base::paths::ensure_persistent_state_root().expect("a writable state root");
+        let abandoned = root.dir.join(".session.json.new-0123456789abcdef0123456789abcdef");
+        std::fs::write(&abandoned, b"temporary").unwrap();
+        std::fs::set_permissions(&abandoned, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(cleanup_temporaries_for(Authority::Helper), Ok(()));
+        assert!(abandoned.exists(), "the helper arm sweeps nothing in the app's root");
+        assert_eq!(cleanup_temporaries_for(Authority::Files), Ok(()));
+        assert!(!abandoned.exists(), "the files arm removes the abandoned temporary");
+    }
+
+    /// `bootstrap()` and `cleanup_after_confirmed_clear()` must search and sweep the pre-DB8
+    /// canonical JSON wrapper identically where the helper is canonical, so both funnel through
+    /// this one helper rather than each carrying its own `insert(0, path())`. It is pure path
+    /// arithmetic, so a host test proves the shared assembly directly for either authority. Under
+    /// `Files` the wrapper is the store itself, so it is no migration source.
+    #[test]
+    fn the_candidates_a_platform_searches_follow_its_authority() {
         // `path()` reads the process-global persistent state root, which every redirecting test in
         // this binary moves under the lock. Two unlocked reads can straddle one of those moves, so
         // this takes the same lock: both reads then see one root.
         let _serial = plx_base::testlock::serial();
-        let mut candidates = vec![PathBuf::from("/some/legacy/auth.json")];
-        insert_arm_canonical_wrapper(&mut candidates);
-        assert_eq!(candidates[0], path());
-        assert_eq!(candidates.len(), 2);
-        assert_eq!(candidates[1], PathBuf::from("/some/legacy/auth.json"));
+        let legacy = vec![PathBuf::from("/some/legacy/auth.json")];
+        let helper = migration_candidates(Authority::Helper, legacy.clone());
+        assert_eq!(helper, vec![path(), PathBuf::from("/some/legacy/auth.json")]);
+        let files = migration_candidates(Authority::Files, legacy.clone());
+        assert_eq!(files, legacy, "the files platform's own store is never one of its migration sources");
     }
 
     /// Point the canonical persistence root at a directory of this test's own; restore the
@@ -1330,7 +1337,7 @@ mod db8_policy_tests {
     /// leave at that shared path. **RED observed live, not simulated:** with the original
     /// `redirect_for_test(None)` restored and, immediately before the first assertion, a stray
     /// file written to `super::super::fallback_file()` with permissive (group/other-writable)
-    /// mode bits — plausible residue, since `plx_platform::storage::read_owned_bytes` treats such a mode
+    /// mode bits — plausible residue, since `plx_os::storage::read_owned_bytes` treats such a mode
     /// as untrusted — `cargo test --lib
     /// plex::session::persistence::db8_policy_tests::cleanup_after_confirmed_clear_distinguishes_an_unconfirmed_authority_from_a_confirmed_one`
     /// failed the SECOND assertion: `left: LegacyRetireFailed, right: Confirmed`. That is this
@@ -1397,32 +1404,39 @@ pub fn write_session_timed(
     commit
 }
 
-/// The authority-selected write used by the shared worker. ARM has exactly one authority: DB8.
+/// The authority-selected write used by the shared worker. The platform has exactly one canonical
+/// store at a time: the storage helper where it states one, the record files everywhere else.
 pub fn write_session(
     session: &super::Session,
     authority: super::SaveAuthority,
 ) -> CanonicalCommit {
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "arm",
-        not(feature = "hostsim"),
-        not(any(test, feature = "test-support"))
-    ))]
-    {
-        commit_session_with_authority(session, authority)
+    write_session_via(storage_authority(), &mut client::NativeTransport, session, authority)
+}
+
+/// [`write_session`] with the storage authority and the helper's transport as parameters. `save` is
+/// how the caller may write ([`super::SaveAuthority`]); only the helper's protection rules read it.
+pub(super) fn write_session_via(
+    authority: Authority,
+    helper: &mut dyn client::Transport,
+    session: &super::Session,
+    save: super::SaveAuthority,
+) -> CanonicalCommit {
+    match authority {
+        Authority::Helper => commit_session_with(
+            session,
+            false,
+            save,
+            plx_os::tv::device::info().major,
+            helper,
+        ),
+        Authority::Files => write_session_file(session),
     }
-    #[cfg(not(all(
-        target_os = "linux",
-        target_arch = "arm",
-        not(feature = "hostsim"),
-        not(any(test, feature = "test-support"))
-    )))]
-    {
-        let _ = authority;
-        match serde_json::to_string(session) {
-            Ok(payload) => commit_data(payload),
-            Err(_) => CanonicalCommit::Failed(StoreError::InvalidSchema),
-        }
+}
+
+fn write_session_file(session: &super::Session) -> CanonicalCommit {
+    match serde_json::to_string(session) {
+        Ok(payload) => commit_data_file(payload),
+        Err(_) => CanonicalCommit::Failed(StoreError::InvalidSchema),
     }
 }
 
@@ -1491,7 +1505,7 @@ fn decode_legacy_at_depth(
         .remove(super::FALLBACK_MARKER);
     match value.get("format").and_then(serde_json::Value::as_str) {
         Some("plxnative-record") => {
-            match plx_platform::storage::parse_record(bytes, RecordKey::Session)?.state {
+            match plx_os::storage::parse_record(bytes, RecordKey::Session)?.state {
                 RecordState::Data { payload } => {
                     decode_legacy_at_depth(payload.as_bytes(), opener, depth + 1)
                 }
@@ -1580,16 +1594,13 @@ impl MigrationStore for HelperMigration<'_> {
 struct FileMigration;
 impl MigrationStore for FileMigration {
     fn load(&mut self) -> CanonicalRead {
-        load()
+        load_file()
     }
     fn import(&mut self, session: &super::Session) -> CanonicalCommit {
-        match serde_json::to_string(session) {
-            Ok(payload) => commit_data(payload),
-            Err(_) => CanonicalCommit::Failed(StoreError::InvalidSchema),
-        }
+        write_session_file(session)
     }
     fn clear(&mut self) -> CanonicalCommit {
-        commit_cleared()
+        commit_cleared_file()
     }
 }
 
@@ -1623,7 +1634,7 @@ pub fn bootstrap_with(
     }
     let fallback_revoked = super::fallback_revoked_at(candidates);
     for candidate in candidates {
-        let bytes = match plx_platform::storage::read_owned_bytes(candidate) {
+        let bytes = match plx_os::storage::read_owned_bytes(candidate) {
             Ok(None) => continue,
             Ok(Some((bytes, true))) => bytes,
             Ok(Some((_, false))) => return blocked_bootstrap(StoreError::RecordUnsafeMode),
@@ -1710,7 +1721,7 @@ fn blocked_bootstrap(error: StoreError) -> Bootstrap {
 }
 
 fn retire_exact_candidate(path: &Path, expected: &[u8]) -> bool {
-    if !matches!(plx_platform::storage::read_owned_bytes(path), Ok(Some((ref current,true))) if current == expected)
+    if !matches!(plx_os::storage::read_owned_bytes(path), Ok(Some((ref current,true))) if current == expected)
     {
         return false;
     }
@@ -1722,13 +1733,17 @@ fn retire_exact_candidate(path: &Path, expected: &[u8]) -> bool {
         .is_some_and(|directory| directory.sync_all().is_ok())
 }
 
-/// The previous canonical JSON wrapper (`path()`, the pre-DB8 `session.json`) outranks older
-/// bare candidates on ARM: it is a recognized migration source in its own right and must be
-/// searched (on boot) and swept (on sign-out) ahead of the plain legacy files. Both call sites
-/// that assemble an ARM candidate list must go through this one function so the two lists
-/// cannot drift apart again.
-fn insert_arm_canonical_wrapper(candidates: &mut Vec<PathBuf>) {
-    candidates.insert(0, path());
+/// The migration sources a platform searches (on boot) and sweeps (on sign-out), given the legacy
+/// files `base` names. Where the storage helper is canonical, the previous canonical JSON wrapper
+/// (`path()`, the pre-DB8 `session.json`) outranks the older bare candidates: it is a recognized
+/// migration source in its own right. Where the files are canonical it IS the store, never a
+/// source. Both call sites that assemble a candidate list go through this one function so the two
+/// lists cannot drift apart again.
+fn migration_candidates(authority: Authority, mut base: Vec<PathBuf>) -> Vec<PathBuf> {
+    if authority == Authority::Helper {
+        base.insert(0, path());
+    }
+    base
 }
 
 pub fn bootstrap(opener: &mut dyn LegacyOpener) -> Bootstrap {
@@ -1736,32 +1751,25 @@ pub fn bootstrap(opener: &mut dyn LegacyOpener) -> Bootstrap {
     let candidates = plx_base::paths::session_migration_candidates();
     #[cfg(any(test, feature = "test-support"))]
     let candidates = super::auth_paths();
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "arm",
-        not(feature = "hostsim"),
-        not(any(test, feature = "test-support"))
-    ))]
-    {
-        let mut candidates = candidates;
-        insert_arm_canonical_wrapper(&mut candidates);
-        bootstrap_with(
-            &mut HelperMigration {
-                transport: &mut client::NativeTransport,
-                major: plx_platform::tv::device::info().major,
-            },
+    bootstrap_via(storage_authority(), &mut client::NativeTransport, opener, candidates)
+}
+
+/// [`bootstrap`] with the authority, the helper's transport and the legacy files `base` as
+/// parameters. The canonical store is chosen here, before the loop, and never by a failed read.
+pub(super) fn bootstrap_via(
+    authority: Authority,
+    helper: &mut dyn client::Transport,
+    opener: &mut dyn LegacyOpener,
+    base: Vec<PathBuf>,
+) -> Bootstrap {
+    let candidates = migration_candidates(authority, base);
+    match authority {
+        Authority::Helper => bootstrap_with(
+            &mut HelperMigration { transport: helper, major: plx_os::tv::device::info().major },
             opener,
             &candidates,
-        )
-    }
-    #[cfg(not(all(
-        target_os = "linux",
-        target_arch = "arm",
-        not(feature = "hostsim"),
-        not(any(test, feature = "test-support"))
-    )))]
-    {
-        bootstrap_with(&mut FileMigration, opener, &candidates)
+        ),
+        Authority::Files => bootstrap_with(&mut FileMigration, opener, &candidates),
     }
 }
 
@@ -1793,31 +1801,35 @@ pub enum ClearCleanupOutcome {
 /// residues. Failed retirement remains visible: canonical Cleared shadows a residue only while
 /// the authority can answer, so a marked fallback must also be removed or neutralized.
 pub fn cleanup_after_confirmed_clear() -> ClearCleanupOutcome {
-    if !matches!(load(), CanonicalRead::Cleared { .. }) {
-        return ClearCleanupOutcome::AuthorityNotConfirmed;
-    }
     #[cfg(not(any(test, feature = "test-support")))]
     let candidates = plx_base::paths::session_migration_candidates();
     #[cfg(any(test, feature = "test-support"))]
     let candidates = super::auth_paths();
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "arm",
-        not(feature = "hostsim"),
-        not(any(test, feature = "test-support"))
-    ))]
-    let candidates = {
-        let mut candidates = candidates;
-        insert_arm_canonical_wrapper(&mut candidates);
-        candidates
-    };
+    cleanup_after_confirmed_clear_via(
+        storage_authority(),
+        &mut client::NativeTransport,
+        candidates,
+    )
+}
+
+/// [`cleanup_after_confirmed_clear`] with the authority, the helper's transport and the legacy
+/// files `base` as parameters.
+pub(super) fn cleanup_after_confirmed_clear_via(
+    authority: Authority,
+    helper: &mut dyn client::Transport,
+    base: Vec<PathBuf>,
+) -> ClearCleanupOutcome {
+    if !matches!(load_via(authority, helper), CanonicalRead::Cleared { .. }) {
+        return ClearCleanupOutcome::AuthorityNotConfirmed;
+    }
+    let candidates = migration_candidates(authority, base);
     let mut complete = super::retry_pending_retirements_locked();
     for candidate in candidates {
-        match plx_platform::storage::read_owned_bytes(&candidate) {
+        match plx_os::storage::read_owned_bytes(&candidate) {
             Ok(None) => {}
             Ok(Some((bytes, true))) => {
                 // Preserve the exact-source fence used by migration retirement.
-                complete &= matches!(plx_platform::storage::read_owned_bytes(&candidate),
+                complete &= matches!(plx_os::storage::read_owned_bytes(&candidate),
                     Ok(Some((ref current, true))) if current == &bytes)
                     && super::retire_session_candidate(&candidate);
             }
@@ -1833,9 +1845,9 @@ pub fn cleanup_after_confirmed_clear() -> ClearCleanupOutcome {
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn uncertain_helper_reply_for_test(reconcile: bool) -> super::async_persistence::CompletionOutcome {
-    use plx_platform::storage::wire::{failure, ReconcileStatus};
+    use plx_os::storage::wire::{failure, ReconcileStatus};
     let mut transport = |request| {
-        if reconcile && matches!(request, plx_platform::storage::wire::Request::Commit { .. }) {
+        if reconcile && matches!(request, plx_os::storage::wire::Request::Commit { .. }) {
             return Err(client::ClientError::Unavailable);
         }
         failure::remember(failure::Stage::Wire, None);
@@ -1888,7 +1900,7 @@ mod commit_flavor_tests {
 
     #[test]
     fn uncertain_reply_without_evidence_does_not_borrow_a_previous_failure() {
-        use plx_platform::storage::wire::failure::{self, Stage};
+        use plx_os::storage::wire::failure::{self, Stage};
         failure::remember(Stage::Db8, Some(-3963));
         let mut transport = |_request| Ok(Response::Commit { status: CommitStatus::Unavailable,
             db_rev: None, state: None, applied: None, verified: false, protection: None });
@@ -1902,7 +1914,7 @@ mod commit_flavor_tests {
         let mut transport = |request| {
             assert!(matches!(
                 request,
-                plx_platform::storage::wire::Request::Commit { .. }
+                plx_os::storage::wire::Request::Commit { .. }
             ));
             Ok(Response::Commit {
                 status: CommitStatus::Committed,

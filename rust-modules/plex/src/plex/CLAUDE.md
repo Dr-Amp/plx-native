@@ -300,8 +300,15 @@ be registered. Direct identity candidates settle as one race, and a relay fallba
 local/remote probe opportunity. **The race does not wait for a route that cannot change the
 answer** (`auth::race_decided`): once a verified, credential-eligible winner exists, a candidate
 that cannot outrank it (`candidate_score` is a function of the candidate alone) is left behind, and
-a better-ranked one that has not answered gets `ProbeDeadlines::grace` (1.5 s) from the first
-win, not its own 5 s/10 s deadline. Waiting for every candidate made a healthy sign-in cost a
+a higher-scored or better-tier route that has not answered gets `ProbeDeadlines::grace`
+(1.5 s) from the first verified answer, not its own 5 s/10 s deadline. An IPv6
+route at the same location, scheme and score as the current IPv4 winner gets only
+250 ms **from that IPv4 route's own verified reply**, even if a different higher
+tier remains outstanding. Another address of the same family and score cannot
+displace the accepted route or extend its window. These are per-route eligibility
+deadlines, enforced both when a reply arrives and while deciding which pending
+routes to wait for. Candidate ranking is IPv6-first within location/scheme,
+with both families retained and no user preference. Waiting for every candidate made a healthy sign-in cost a
 dead public address's full deadline, so "taking longer than usual" ran on every sign-in
 (`screens/login.rs`'s `DISCOVERY_ESCAPE_AFTER_MS` derives its number from this cost). A race with
 no winner still runs every candidate to its deadline, and the relay phase still starts only then. Authenticated fallback attempts share a separate 20-second budget,
@@ -529,7 +536,7 @@ a dead source is **absent** from Home and states itself in its own library secti
   FIELD's derived default (here and in `Session`) is OFF while an ABSENT key reads on, so the canonical
   record's own `Default` sets it. `plaintext_consent` is written as `[]` in the legacy file but
   omitted from the canonical record while empty (`split_public` drops the key). `prefs_tests` holds
-  the table to the struct (T-fields), to platform's `ACCOUNT_BOUND_PREFERENCES` (T-account) and to
+  the table to the struct (T-fields), to the os layer's `ACCOUNT_BOUND_PREFERENCES` (T-account) and to
   each row's parse policy (T-parse), both ways; a field with no row, or a row with no field, fails
   there.
   The two memory-door lists (`track_memory`: each profile's remembered audio and subtitle picks per
@@ -620,9 +627,30 @@ a dead source is **absent** from Home and states itself in its own library secti
        struct, and a new field follows the omit rule.
   6. **The Settings row** (labels, i18n, picker) is a screens edit, and `Choice` gains a variant
      (T-settings).
+- **Which store holds the session is the platform's statement, `plx_os::tv::authority::authority()`**
+  (`Helper`: the LS2/DB8 storage helper, webOS; `Files`: the 0600 record files, the desktop, a host test and
+  any platform with no helper), never the build's CPU or OS. `session/persistence.rs` reads it once per
+  public call (`load`, `commit_data`, `commit_cleared`, `write_session`, `migrate_session`, `bootstrap`,
+  `cleanup_after_confirmed_clear`) and hands it to the `*_via(authority, helper, ..)`
+  form, so a test passes the authority it grades and, for `Helper`, a transport of its own (an in-memory
+  `Backend` or a closure); `cleanup_temporaries` also reads it once but dispatches through
+  `cleanup_temporaries_for(authority)`, which takes no transport, because the `Helper` arm sweeps nothing (DB8
+  has no app-owned rename temporaries); the real `NativeTransport` is named by those seven public forms and by two helpers
+  with no `_via` seam (`reset_cleared_language()`, which `clear_for_erase` calls under `Helper` and which is
+  device-only, and `helper_commit`, which has no caller here), because on a Linux host it waits out a 12 s
+  start deadline with no helper behind it. There is no process-global override.
+  Under `Helper` the dispatchers never answer for a helper that cannot answer (a blocked read stays blocked,
+  and a legacy file is neither imported nor retired on its word); the files a television does keep beside DB8
+  are `session.rs`'s own: the marked fallback `save_legacy_fallback_locked` writes when a commit is not
+  durable, which `read_legacy_filtered_locked` serves as transient state, the legacy migration inputs, and the
+  install-preferences file (`install_preferences::save`, an unmarked `….language.json` beside a session
+  candidate) that `clear_for_erase` writes when a sign-out's helper clear is not durable. `secure::mode()`'s
+  `MemoryOnly` is read before the authority: it holds the session in memory and touches no credential store.
+  `clear_for_erase`, `read_into_cache_locked` and `install_preferences::keeps_language_file` read the same
+  value; the telemetry sweep after a durable clear runs only under `Helper`.
 - **The DB8 document may not pass `MAX_LOGICAL_BYTES` (256 KiB), and per-profile memory is what
   grows it.** Past the cap EVERY write fails (`LogicalTooLarge`, reported as `InvalidSchema`), so
-  `persistence::commit_session_with` measures the projected document (platform's own
+  `persistence::commit_session_with` measures the projected document (the os layer's own
   `state::logical_size`, with the stored envelope, ledger, consent and future keys in hand, for the
   write it is really about to send: update, one-put replace, or the strict staged write; a first
   write onto an ABSENT record, a sign-in or a legacy import, is measured against the fresh state the
@@ -632,7 +660,7 @@ a dead source is **absent** from Home and states itself in its own library secti
   `library_sorts` (`prefs::shed_memory`; the same oldest-from-the-largest-record rule as the
   household budget), only as far as it needs, and logs `prefs: evicted <n> <list> entries to fit
   the 256 KiB document`. The live session keeps what the payload lost until the next load. It never
-  refuses a write: with nothing sheddable left the platform still does, as before. The file backend
+  refuses a write: with nothing sheddable left the os layer still does, as before. The file backend
   has no cap and no guard. A stored document already AT the cap leaves no room for the strict tier's
   second copy (old and new halves side by side), which the guard cannot create. A record created on
   webOS 4.x is ACL-only; a record that already holds a keymanager envelope still stages.
@@ -676,6 +704,22 @@ a dead source is **absent** from Home and states itself in its own library secti
     separate `CACHE` today; when it is wired up, it must install into/drop the cache above
     (`install_locked`/`drop_cache_locked`, under `IO`) instead of maintaining a second copy of the
     session.
+  - **Under `StoreMode::MemoryOnly` (`plx_os::tv::secure`, the `mode` the platform's `Services.secure` states; `Durable` is the
+    default and what webOS and desktop run) the cache is the ONE authority, not a write-through
+    copy** (`session/memory_only.rs`): reads, guarded edits, revocation and clear all resolve
+    against it, and no credential is committed anywhere, canonical store, sealed or plaintext
+    fallback or revocation marker. The gate sits in `read_live_locked`, `save_locked_with_authority`
+    and `clear_for_erase`, above every `TEST_FILE` and storage-authority branch, so nothing behind them
+    is reachable. A write answers `PersistOutcome::Memory`, which classifies as
+    `CompletionOutcome::Ephemeral`: signed in for this run, so the auth owner goes on to Home, but
+    never a saved-login claim and never a warning. `drop_cache_locked` must not run in this mode
+    (a dropped cell would lose the session); tests reset the cell with `redirect_for_test(None)`.
+    What outlives the process is the install's own file (`install_preferences` version 2: the
+    client id, the language and the Interface resolution, none of which can authorize a login);
+    version 1, which webOS and desktop keep writing byte for byte, is still read. Sign-out keeps
+    that file, "Delete all local data" removes it, and a credential file a previous build left in
+    the data directory is never read, written or deleted. Tests set the mode with
+    `secure::set_mode_for_test` (a serial-lock-guarded override that clears on drop).
 - **Track selection is server-side, via `PUT /library/parts/{id}`** (set the chosen audio/subtitle
   stream + subtitle burn), **not** query params on the stream URL. The server re-selects for the next
   decision; the client re-requests the part. See `[[audio-subtitle-track-switching]]`.

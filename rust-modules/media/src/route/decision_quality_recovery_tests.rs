@@ -15,8 +15,8 @@ use super::test_support::apply_plan;
 #[cfg(feature = "devtriggers")]
 fn the_codec_gates_verdict_is_what_the_quality_menu_reads() {
     let mut ps = crate::route::PlaybackSession::IDLE;
-    let caps = plx_platform::devcaps::Caps::assumed();
-    let dv = plx_data::metadata::Dovi::default().presentation(true, plx_platform::devcaps::dv::DvCapability::Unknown, true);
+    let caps = plx_os::devcaps::Caps::assumed();
+    let dv = plx_data::metadata::Dovi::default().presentation(true, plx_os::devcaps::dv::DvCapability::Unknown, true);
     // The two ends of the gate, at a UHD raster this device's table admits.
     assert!(
         video_direct_plays("hevc", 3840, 2160, dv, &caps),
@@ -206,7 +206,7 @@ fn dv_decision_survives_reload_recovery_and_rollback() {
         23.976,
         p8(),
         true,
-        plx_platform::devcaps::dv::DvCapability::Supported,
+        plx_os::devcaps::dv::DvCapability::Supported,
     ));
     let frozen = stream_dv_decision(&ps);
     assert!(frozen.presentation.declared().is_some());
@@ -258,7 +258,7 @@ fn dv_decision_survives_reload_recovery_and_rollback() {
         23.976,
         p8(),
         false,
-        plx_platform::devcaps::dv::DvCapability::Supported,
+        plx_os::devcaps::dv::DvCapability::Supported,
     ));
     // The copy rule itself (`copied_video_dv`) is covered in `plan_dolby_vision_tests.rs`.
 
@@ -2262,10 +2262,10 @@ fn manually_picking_original_restores_native_dolby_vision_instead_of_retranscodi
                 fps: 23.976,
                 dovi: p8(),
                 dv_decision: plx_data::metadata::DvDecision {
-                    capability: plx_platform::devcaps::dv::DvCapability::Supported,
+                    capability: plx_os::devcaps::dv::DvCapability::Supported,
                     presentation: p8().presentation(
                         true,
-                        plx_platform::devcaps::dv::DvCapability::Supported,
+                        plx_os::devcaps::dv::DvCapability::Supported,
                         true,
                     ),
                 },
@@ -2952,4 +2952,27 @@ fn a_failed_original_trial_of_an_original_start_rolls_back_through_the_door() {
             "trial_admitted={trial_admitted}: the rollback reopens the HLS route through the door",
         );
     }
+}
+
+/// A panic inside a cleanup observation must not leave its record claimed: `checking` stays set
+/// otherwise, `take_unchecked` skips the record for the rest of the process and every ABR trial
+/// on that server is deferred behind a check that will never finish.
+#[test]
+fn a_panicking_encoder_cleanup_check_releases_its_claim() {
+    let sid = ServerId::from_raw(60_417);
+    ENCODER_CLEANUP.lock().unwrap_or_else(|e| e.into_inner()).remember(sid, "panic-claim");
+    let mut claimed = ENCODER_CLEANUP.lock().unwrap_or_else(|e| e.into_inner()).take_unchecked(sid);
+    assert_eq!(claimed.len(), 1);
+    let check = claimed.remove(0);
+
+    let outcome = std::panic::catch_unwind(|| {
+        run_encoder_cleanup_check_with(check, |_| panic!("observation blew up"));
+    });
+    assert!(outcome.is_err(), "the observation's panic propagates");
+
+    let retry = ENCODER_CLEANUP.lock().unwrap_or_else(|e| e.into_inner()).take_unchecked(sid);
+    // Remove the record before asserting so a red run leaves no process-global debris.
+    ENCODER_CLEANUP.lock().unwrap_or_else(|e| e.into_inner()).pending.retain(|e| e.sid != sid);
+    assert_eq!(retry.len(), 1, "the record is claimable again after the panic, so a later check runs");
+    assert!(retry[0].stop_needed, "no verdict was published, so the stop is still owed");
 }

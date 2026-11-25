@@ -77,16 +77,16 @@ const FACTS_SEP_PAD: f32 = theme::space::SM;
 /// the pill is sized to the very glyph it carries.
 pub const ALT_ICON: plx_ui::icons::Icon = plx_ui::icons::Icon::ChevronDown;
 
-pub fn alt_label() -> &'static CStr { plx_platform::i18n::msg::browse_detail_also_available_c() }
+pub fn alt_label() -> &'static CStr { plx_os::i18n::msg::browse_detail_also_available_c() }
 
-fn mark_watched_label() -> &'static CStr { plx_platform::i18n::msg::browse_detail_mark_watched_c() }
-fn mark_unwatched_label() -> &'static CStr { plx_platform::i18n::msg::browse_detail_mark_unwatched_c() }
-fn mark_episode_watched_label() -> &'static CStr { plx_platform::i18n::msg::browse_detail_mark_episode_watched_c() }
-fn mark_episode_unwatched_label() -> &'static CStr { plx_platform::i18n::msg::browse_detail_mark_episode_unwatched_c() }
-fn play_from_start_label() -> &'static CStr { plx_platform::i18n::msg::browse_detail_play_start_c() }
-fn trailer_label() -> &'static CStr { plx_platform::i18n::msg::browse_detail_trailer_c() }
-fn play_version_label() -> &'static CStr { plx_platform::i18n::msg::browse_detail_play_version_c() }
-fn go_to_show_label() -> &'static CStr { plx_platform::i18n::msg::browse_menu_go_show_c() }
+fn mark_watched_label() -> &'static CStr { plx_os::i18n::msg::browse_detail_mark_watched_c() }
+fn mark_unwatched_label() -> &'static CStr { plx_os::i18n::msg::browse_detail_mark_unwatched_c() }
+fn mark_episode_watched_label() -> &'static CStr { plx_os::i18n::msg::browse_detail_mark_episode_watched_c() }
+fn mark_episode_unwatched_label() -> &'static CStr { plx_os::i18n::msg::browse_detail_mark_episode_unwatched_c() }
+fn play_from_start_label() -> &'static CStr { plx_os::i18n::msg::browse_detail_play_start_c() }
+fn trailer_label() -> &'static CStr { plx_os::i18n::msg::browse_detail_trailer_c() }
+fn play_version_label() -> &'static CStr { plx_os::i18n::msg::browse_detail_play_version_c() }
+fn go_to_show_label() -> &'static CStr { plx_os::i18n::msg::browse_menu_go_show_c() }
 
 /// The Play Version disc's mark: a portrait card with another behind it — several copies of one
 /// title, which is what a version list is. It used to be [`plx_ui::icons::Icon::Show`], the item
@@ -167,6 +167,59 @@ impl HeroCtl {
     pub fn is_watch(self) -> bool {
         matches!(self, HeroCtl::MarkWatched | HeroCtl::MarkUnwatched)
     }
+    /// Does pressing this control start a playback? Play and Restart play the item, Trailer plays
+    /// its extra. A platform that composed no playback driver ([`Stops::no_playback`]) can start
+    /// none of them, so none owns a focus stop there. The Play Version disc is not one: it only
+    /// opens the list, whose own rows are disabled in that state (`versions_panel`).
+    pub const fn starts_playback(self) -> bool {
+        matches!(self, HeroCtl::Play | HeroCtl::Restart | HeroCtl::Trailer)
+    }
+    /// Does pressing this control WRITE to the household's account? The bookmark disc adds or
+    /// removes the title on the plex.tv Watchlist, and the watched toggle in either face marks it
+    /// watched or unwatched on the server. The rest play, navigate or open a menu or panel. The page
+    /// never seats ITSELF on one of these once its item is there ([`default_stop`]): a reflex OK on a
+    /// page that has just appeared must not change the record. Travel still reaches them, and focus
+    /// the viewer put on one stays. Before the item lands, the one seat on a write control (the
+    /// watched toggle of a page with no driver) presses nothing (`activate_hero`) and is the page's
+    /// own seat, which every frame moves to `DetailScreen::default_elem` until the viewer acts at it
+    /// (`DetailScreen::provisional` lists the acts).
+    pub const fn writes_account(self) -> bool {
+        matches!(self, HeroCtl::Watchlist | HeroCtl::MarkWatched | HeroCtl::MarkUnwatched)
+    }
+    /// **The control's accessibility word** (`detail.hero.<word>`): one static word per variant, never
+    /// derived from the label, which changes with the item (Play wears "Resume" mid-title: both are
+    /// `play`) and the language. The watched toggle's two faces are two words, for what pressing each does.
+    pub const fn a11y_name(self) -> &'static str {
+        match self {
+            HeroCtl::Play => "play",
+            HeroCtl::Restart => "restart",
+            HeroCtl::Trailer => "trailer",
+            HeroCtl::Alt => "alt",
+            HeroCtl::MarkWatched => "mark_watched",
+            HeroCtl::MarkUnwatched => "mark_unwatched",
+            HeroCtl::Watchlist => "watchlist",
+            HeroCtl::GoToShow => "go_to_show",
+            HeroCtl::Version => "version",
+            HeroCtl::More => "more",
+        }
+    }
+    /// The inverse of [`a11y_name`](Self::a11y_name): the control a word names, whether the row
+    /// shows it or not (the caller checks that).
+    pub fn of_a11y_name(word: &str) -> Option<Self> {
+        const ALL: [HeroCtl; 10] = [
+            HeroCtl::Play,
+            HeroCtl::Restart,
+            HeroCtl::Trailer,
+            HeroCtl::Alt,
+            HeroCtl::MarkWatched,
+            HeroCtl::MarkUnwatched,
+            HeroCtl::Watchlist,
+            HeroCtl::GoToShow,
+            HeroCtl::Version,
+            HeroCtl::More,
+        ];
+        ALL.into_iter().find(|ctl| ctl.a11y_name() == word)
+    }
 }
 
 /// Which of the conditional controls the row is showing: the independent bits (bookmark, Go to
@@ -231,11 +284,30 @@ pub fn hero_ctls(set: HeroSet) -> ([HeroCtl; MAX_CTLS], usize) {
     (v, n)
 }
 
-/// Whether `ctl` may hold — or be enumerated as holding — focus right now, given whether
-/// full-trailer mode owns the screen. The ONE predicate [`visible_ctls`] (group extent) and
-/// `DetailScreen::reconcile`/`valid` (focus legitimacy) all gate on, so the row cannot offer a
-/// control the mode has taken away — the exact class of bug this predicate replaced (two
-/// independent "what's visible" checks that had silently drifted apart).
+/// The two facts that decide which of the row's controls own a focus stop, read where the row is
+/// enumerated (never stored: a screen keeps no copy of either).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Stops {
+    /// Full-trailer mode owns the screen (`DetailScreen::full_trailer`).
+    pub full_trailer: bool,
+    /// The platform composed no playback driver at all (`ScreenInputs::can_play` is false).
+    pub no_playback: bool,
+}
+
+impl Stops {
+    /// The row of a platform that can play, with only full-trailer mode deciding: what the row was
+    /// before a platform could compose no driver.
+    pub const fn trailer(full_trailer: bool) -> Self {
+        Self { full_trailer, no_playback: false }
+    }
+}
+
+/// Whether `ctl` may hold — or be enumerated as holding — focus right now, given [`Stops`]. The
+/// ONE predicate [`visible_ctls`] (group extent), the travel, the seat and the fallback
+/// (`DetailScreen::neighbour`/`seat`/`reconcile`), `valid` (focus legitimacy) and the pointer's
+/// stops all gate on, so the row cannot offer a control the state has taken away — the exact class
+/// of bug this predicate replaced (two independent "what's visible" checks that had silently
+/// drifted apart).
 ///
 /// **Play survives as the ANCHOR, not as a reachable control.** Full-trailer mode fades the whole
 /// row out together (`DetailScreen::draw_buttons` draws every control from [`hero_ctls`]
@@ -245,30 +317,40 @@ pub fn hero_ctls(set: HeroSet) -> ([HeroCtl; MAX_CTLS], usize) {
 /// EMPTY hero group would push it into the sections below, scrolling the page out from under a
 /// trailer nobody asked to leave. Keys never reach the row anyway: the mode answers them itself,
 /// before the engine.
-pub fn focusable(ctl: HeroCtl, full_trailer: bool) -> bool {
-    !full_trailer || ctl == HeroCtl::Play
+///
+/// **A disabled control owns no focus stop** (`plx_ui::focus::next_enabled_index`; the player HUD's
+/// disabled discs): with no playback driver composed, the controls that start playback
+/// ([`HeroCtl::starts_playback`]) are drawn disabled and the focus travels only between the
+/// controls that can act. The shared button draws no focused face for a disabled control, so a stop
+/// on one would leave focus visibly nowhere. Where the page rests when nothing says where is a
+/// separate rule ([`default_stop`]): the page never seats itself on a control that writes to the
+/// account once its item is there.
+pub fn focusable(ctl: HeroCtl, stops: Stops) -> bool {
+    if stops.full_trailer {
+        return ctl == HeroCtl::Play;
+    }
+    !(stops.no_playback && ctl.starts_playback())
 }
 
-/// [`hero_ctls`], filtered through [`focusable`] for full-trailer mode's FOCUS/hit-testing extent
-/// only — the transient UI state where the row narrows to its Play anchor alone and everything
-/// else (Restart/Trailer/Alt/the watch toggle) stops being reachable the instant `full_trailer()`
-/// flips. **This is not what gets drawn.** `DetailScreen::draw_buttons` draws every control
-/// [`hero_ctls`] returns, full_trailer or not, so the row fades out together with the rest of the
+/// [`hero_ctls`], filtered through [`focusable`] for the FOCUS/hit-testing extent only: in
+/// full-trailer mode the row narrows to its Play anchor alone, and with no playback driver it
+/// drops the controls that play. **This is not what gets drawn.** `DetailScreen::draw_buttons`
+/// draws every control [`hero_ctls`] returns, so the row fades out together with the rest of the
 /// chrome instead of four pills hard-cutting a frame ahead of the one that fades (2026-09-17
-/// fix — a control losing its focus must not also lose its paint on the same frame). Deliberately
-/// NOT a flag on [`HeroSet`]: that struct describes what the ITEM offers, not a screen's transient
-/// presentation mode. Every call site that enumerates the row for focus/hit-testing extent must go
-/// through this rather than `hero_ctls` directly, or the two can disagree about which controls
-/// exist right now.
-pub fn visible_ctls(set: HeroSet, full_trailer: bool) -> ([HeroCtl; MAX_CTLS], usize) {
+/// fix — a control losing its focus must not also lose its paint on the same frame), and a
+/// disabled Play is still drawn, as disabled. Deliberately NOT a flag on [`HeroSet`]: that struct
+/// describes what the ITEM offers, not a screen's transient presentation mode or the platform.
+/// Every call site that enumerates the row for focus/hit-testing extent must go through this
+/// rather than `hero_ctls` directly, or the two can disagree about which controls exist right now.
+///
+/// The result is a SUBSET in drawn order, not a prefix: its positions are not drawn indices. A
+/// control's drawn index is [`index_of`] over [`hero_ctls`].
+pub fn visible_ctls(set: HeroSet, stops: Stops) -> ([HeroCtl; MAX_CTLS], usize) {
     let (all, n) = hero_ctls(set);
-    if !full_trailer {
-        return (all, n);
-    }
     let mut v = [HeroCtl::Play; MAX_CTLS];
     let mut count = 0;
     for &c in &all[..n] {
-        if focusable(c, full_trailer) {
+        if focusable(c, stops) {
             v[count] = c;
             count += 1;
         }
@@ -276,7 +358,52 @@ pub fn visible_ctls(set: HeroSet, full_trailer: bool) -> ([HeroCtl; MAX_CTLS], u
     (v, count)
 }
 
-/// The control at index `i` in `set`, or `None` for an index the set does not have.
+/// The row's first stop: Play with a playback driver composed (it is always first), the first
+/// control that can act without one. A press UP into the row from a section below seats on
+/// [`default_stop`] and reaches for this one only when every stop writes (a movie with no driver:
+/// the bookmark and the watched toggle), so the write controls stay reachable by travel; it is
+/// also the last resort of [`DetailScreen::default_elem`](super::DetailScreen). The row always
+/// has a stop (the watched toggle is unconditional and plays nothing, and Play anchors
+/// full-trailer mode), so the answer needs no `Option`; were that ever false it is the array's
+/// own fill, Play.
+pub fn first_stop(set: HeroSet, stops: Stops) -> HeroCtl {
+    visible_ctls(set, stops).0[0]
+}
+
+/// The row's stop the page opens on when nothing says which: its first stop that does not write to
+/// the account ([`HeroCtl::writes_account`]). That is Play with a playback driver composed, and
+/// without one Go to Show, More, the versions control or Also available, whichever the row has.
+/// `None` when every stop the row has writes (a movie with no driver: the bookmark and the watched
+/// toggle), which sends the page's default below the row (`DetailScreen::default_elem`).
+pub fn default_stop(set: HeroSet, stops: Stops) -> Option<HeroCtl> {
+    let (v, n) = visible_ctls(set, stops);
+    v[..n].iter().copied().find(|ctl| !ctl.writes_account())
+}
+
+/// The row's stop on drawn index `col` (a restored spot's column), or `None` when that column is
+/// past the row or names a control the row does not stop on right now (a platform that cannot play
+/// has no stop on Play). A restore that names a stop keeps it, whatever it does: it is where the
+/// viewer left their own focus. One that does not resolves by the default rule ([`default_stop`]),
+/// not onto the nearest stop, which would be a write as often as not.
+pub fn stop_at(set: HeroSet, stops: Stops, col: usize) -> Option<HeroCtl> {
+    let (v, n) = hero_ctls(set);
+    (col < n && focusable(v[col], stops)).then(|| v[col])
+}
+
+/// The drawn indices of the row's first and last stop, for the group's extent: the row's
+/// controls are placed by drawn index, so a stop's place is `hero_btn_rect_at` of its
+/// [`index_of`], never of its position among the stops.
+pub fn stop_span(set: HeroSet, stops: Stops) -> Option<(usize, usize)> {
+    let (v, n) = hero_ctls(set);
+    let mut stops_at = (0..n).filter(|&i| focusable(v[i], stops));
+    let first = stops_at.next()?;
+    Some((first, stops_at.last().unwrap_or(first)))
+}
+
+/// The control at index `i` in `set`, or `None` for an index the set does not have. The pages
+/// resolve a column through [`stop_at`] (a column may name a control that is not a stop); this
+/// is the plain inverse of [`index_of`] the tests pin the row's identities with.
+#[cfg(test)]
 pub fn ctl_at(set: HeroSet, i: usize) -> Option<HeroCtl> {
     let (v, n) = hero_ctls(set);
     (i < n).then(|| v[i])
@@ -296,21 +423,7 @@ pub fn watch_index(set: HeroSet) -> Option<usize> {
     v[..n].iter().position(|&c| c.is_watch())
 }
 
-/// Has this show been started AT ALL? PMS puts `S1E1 off=0` on deck for a show nobody has
-/// touched, so "there is something on deck" is not the same question as "this show is underway".
-/// A locally marked on-deck leaf remains the subject until the server replaces it.
-pub fn show_started(d: &Detail) -> bool {
-    d.on_deck.as_ref().is_some_and(|e| e.resume_ms > 0 || e.watched)
-        || d.seasons.iter().any(|s| s.viewed_leaf_count > 0)
-}
-
-/// The episode a show's hero is ABOUT — the server's on-deck episode, once the show has actually
-/// been started. `None` means the hero presents the SERIES instead (finished, or never opened).
-/// Ported verbatim from `ui/detail.rs::hero_episode`.
-pub fn hero_episode(d: &Detail) -> Option<&Episode> {
-    let ep = d.on_deck.as_ref()?;
-    show_started(d).then_some(ep)
-}
+pub(super) fn hero_episode(d: &Detail) -> Option<&Episode> { d.resume_episode() }
 
 /// The resume position (ns) the hero's Play control would ACTUALLY apply. Ported verbatim from
 /// `ui/detail.rs::hero_resume_ns`.
@@ -351,7 +464,7 @@ pub fn hero_watch_state(
 pub fn hero_mark(d: &Detail) -> PosterMark {
     if let Some(ep) = hero_episode(d) {
         hero_watch_state(false, false, ep.watched, plx_data::metadata::resume_ns(ep.resume_ms, ep.dur_ms))
-    } else { hero_watch_state(d.is_show, show_started(d), d.watched, hero_resume_ns(d)) }
+    } else { hero_watch_state(d.is_show, d.show_started(), d.watched, hero_resume_ns(d)) }
 }
 
 /// Name the episode explicitly when the hero presents a leaf, including a show's on-deck item.
@@ -534,10 +647,10 @@ pub fn hero_credit(d: &Detail) -> Option<(&'static str, Vec<&str>)> {
             .filter(|credit| credit.role.contains("Writer"))
             .map(|credit| credit.tag.as_str())
             .collect();
-        return (!names.is_empty()).then_some((plx_platform::i18n::msg::browse_detail_created_by(), names));
+        return (!names.is_empty()).then_some((plx_os::i18n::msg::browse_detail_created_by(), names));
     }
     let names: Vec<&str> = d.directors.iter().map(String::as_str).collect();
-    (!names.is_empty()).then_some((plx_platform::i18n::msg::browse_detail_directed_by(), names))
+    (!names.is_empty()).then_some((plx_os::i18n::msg::browse_detail_directed_by(), names))
 }
 
 pub fn draw_people(p: Painter, d: &Detail, button_y: f32, measure: &dyn Measure) {
@@ -560,7 +673,7 @@ fn people_blocks(d: &Detail, button_y: f32, measure: &dyn Measure, mut f: impl F
     let cast_text = people_text(&cast_names);
     let credit_text = credit.as_ref().map(|(_, names)| people_text(names));
     let cast = (!cast_names.is_empty()).then(|| {
-        people_view(&cast_text, plx_platform::i18n::msg::browse_detail_starring(), measure)
+        people_view(&cast_text, plx_os::i18n::msg::browse_detail_starring(), measure)
     });
     let credit_view = credit.as_ref().zip(credit_text.as_deref()).map(|((label, _), text)| people_view(text, label, measure));
     let heights = [
@@ -627,7 +740,7 @@ fn item_subscription(d: &Detail) -> plx_plex::plex::serverinfo::Subscription {
 }
 
 const FACTS_GLYPH_D: f32 = theme::size::CAPTION as f32;
-fn converts_on_server_c() -> &'static CStr { plx_platform::i18n::msg::browse_detail_converts_c() }
+fn converts_on_server_c() -> &'static CStr { plx_os::i18n::msg::browse_detail_converts_c() }
 
 #[derive(Clone, Copy)]
 enum Bit {
@@ -642,12 +755,29 @@ enum Bit {
 
 const FACTS_BITS: usize = 8;
 
-fn play_mode_bits(d: &Detail, after: bool) -> ([Bit; FACTS_BITS], usize) {
-    match plx_media::route::playback_preview(d) {
-        Some(plx_media::route::Preview::DirectPlay | plx_media::route::Preview::Remux) => ([Bit::Air(0.0); FACTS_BITS], 0),
-        Some(preview) => play_mode_bits_for(preview, d.hdr, item_subscription(d), after),
+fn play_mode_bits(d: &Detail, playable: bool, after: bool) -> ([Bit; FACTS_BITS], usize) {
+    if !playable {
+        return no_playback_bits(after);
+    }
+    match plx_media::route::detail_playback_preview(d) {
+        Some((plx_media::route::Preview::DirectPlay | plx_media::route::Preview::Remux, _)) => ([Bit::Air(0.0); FACTS_BITS], 0),
+        Some((preview, file)) => play_mode_bits_for(preview, file.hdr, item_subscription(d), after),
         None => ([Bit::Air(0.0); FACTS_BITS], 0),
     }
+}
+
+/// The play-mode clause of a device that composes no playback driver: the one reason word, in the
+/// facts line's own ink, in the place the preview clause takes. Nothing about the item's route is read,
+/// since no route can start.
+fn no_playback_bits(after: bool) -> ([Bit; FACTS_BITS], usize) {
+    let mut bits = [Bit::Air(0.0); FACTS_BITS];
+    let mut n = 0;
+    if after {
+        bits[n] = Bit::Sep;
+        n += 1;
+    }
+    bits[n] = Bit::Word(plx_os::i18n::msg::browse_detail_no_playback_c(), plx_ui::detail_layout::FACTS_INK, 0);
+    (bits, n + 1)
 }
 
 /// [`play_mode_bits`] once the item's route has been read: the line's play-mode clause, behind a
@@ -670,10 +800,10 @@ fn play_mode_bits_for(
     match play_note(preview, hdr, subscription) {
         PlayNote::Quiet => push(Bit::Word(
             match preview {
-                plx_media::route::Preview::DirectPlay => plx_platform::i18n::msg::browse_detail_direct_play_c(),
-                plx_media::route::Preview::Remux => plx_platform::i18n::msg::browse_detail_direct_stream_c(),
+                plx_media::route::Preview::DirectPlay => plx_os::i18n::msg::browse_detail_direct_play_c(),
+                plx_media::route::Preview::Remux => plx_os::i18n::msg::browse_detail_direct_stream_c(),
                 plx_media::route::Preview::OriginalAudioConverted => {
-                    plx_platform::i18n::msg::browse_detail_original_audio_converted_c()
+                    plx_os::i18n::msg::browse_detail_original_audio_converted_c()
                 }
                 plx_media::route::Preview::Converts => converts_on_server_c(),
             },
@@ -684,7 +814,7 @@ fn play_mode_bits_for(
             push(Bit::Word(converts_on_server_c(), plx_ui::detail_layout::FACTS_INK, 0));
             push(Bit::Sep);
             push(Bit::Word(
-                plx_platform::i18n::msg::browse_detail_hardware_needs_c(),
+                plx_os::i18n::msg::browse_detail_hardware_needs_c(),
                 theme::TEXT_SECONDARY,
                 0,
             ));
@@ -696,7 +826,7 @@ fn play_mode_bits_for(
             push(Bit::Air(theme::space::SM));
             push(Bit::Word(c"HDR \u{2192} SDR", theme::TEXT_SECONDARY, 1));
             push(Bit::Sep);
-            push(Bit::Word(plx_platform::i18n::msg::browse_detail_tonemap_needs_c(), theme::TEXT_SECONDARY, 0));
+            push(Bit::Word(plx_os::i18n::msg::browse_detail_tonemap_needs_c(), theme::TEXT_SECONDARY, 0));
             push(Bit::Air(theme::space::SM));
             push(Bit::Capsule);
         }
@@ -738,20 +868,21 @@ fn bits_flow(
     flow.end() - x
 }
 
-fn play_mode_w(d: &Detail, after: bool, measure: &dyn plx_machine::machine::Measure) -> f32 {
-    let (bits, n) = play_mode_bits(d, after);
+fn play_mode_w(d: &Detail, playable: bool, after: bool, measure: &dyn plx_machine::machine::Measure) -> f32 {
+    let (bits, n) = play_mode_bits(d, playable, after);
     bits_flow(&bits[..n], 0.0, measure, |_, _| {})
 }
 
 fn draw_play_mode(
     p: Painter,
     d: &Detail,
+    playable: bool,
     x: f32,
     y: f32,
     after: bool,
     measure: &dyn plx_machine::machine::Measure,
 ) -> f32 {
-    let (bits, n) = play_mode_bits(d, after);
+    let (bits, n) = play_mode_bits(d, playable, after);
     paint_bits(p, &bits[..n], x, y, measure)
 }
 
@@ -844,12 +975,12 @@ fn facts_flow(
 }
 
 /// Draw the facts line at `y`; the width it draws from the margin.
-pub fn draw_facts(p: Painter, d: &Detail, y: f32, measure: &dyn plx_machine::machine::Measure) -> f32 {
+pub fn draw_facts(p: Painter, d: &Detail, playable: bool, y: f32, measure: &dyn plx_machine::machine::Measure) -> f32 {
     let (date, extent) = hero_facts(d);
     let extent = extent.as_deref().unwrap_or("");
     let credit = plx_ui::fmt::shared_by(&d.source()).unwrap_or_default();
     let column = Rect::new(plx_ui::consts::MARGIN_X, y, FACTS_R - plx_ui::consts::MARGIN_X, theme::hero::FACTS_H);
-    if play_mode_w(d, false, measure) == 0.0 {
+    if play_mode_w(d, playable, false, measure) == 0.0 {
         let resumes = hero_resume_ns(d) > 0;
         return plx_ui::widgets::hero_facts(p, column, &date, extent, resumes, &credit, measure);
     }
@@ -858,7 +989,7 @@ pub fn draw_facts(p: Painter, d: &Detail, y: f32, measure: &dyn plx_machine::mac
             &[date.as_str(), if fit.extent { extent } else { "" }],
             if fit.credit { &credit } else { "" },
             |text, _, size, _| measure.width_str(text, size, false),
-            |_, after| play_mode_w(d, after, measure),
+            |_, after| play_mode_w(d, playable, after, measure),
         )
     };
     let fit = facts_fit(
@@ -868,7 +999,7 @@ pub fn draw_facts(p: Painter, d: &Detail, y: f32, measure: &dyn plx_machine::mac
     );
     let elided;
     let date = if fit.elide {
-        let budget = (column.w - play_mode_w(d, true, measure)).max(0.0);
+        let budget = (column.w - play_mode_w(d, playable, true, measure)).max(0.0);
         elided = plx_gfx::text::elide_by(&date, budget, false, |t| {
             measure.width_str(t, theme::size::CAPTION, false)
         });
@@ -895,13 +1026,39 @@ pub fn draw_facts(p: Painter, d: &Detail, y: f32, measure: &dyn plx_machine::mac
                 })
                 .unwrap_or(0.0)
         },
-        |dx, after| draw_play_mode(p, d, plx_ui::consts::MARGIN_X + dx, y, after, measure),
+        |dx, after| draw_play_mode(p, d, playable, plx_ui::consts::MARGIN_X + dx, y, after, measure),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hdr_warning_follows_the_version_play_starts() {
+        let version = |id: i64, resolution: &str, width: i64, height: i64, vcodec: &str, hdr: bool| plx_data::pms::MediaVersion {
+            id: plx_plex::plex::MediaId(id),
+            resolution: resolution.into(),
+            width,
+            height,
+            vcodec: vcodec.into(),
+            hdr,
+            ..Default::default()
+        };
+        let mut d = Detail {
+            kind: "movie".into(),
+            part: "/library/parts/1/1/uhd.mkv".into(),
+            vcodec: "vp9".into(),
+            width: 3840,
+            height: 2160,
+            hdr: true,
+            versions: vec![version(1, "4k", 3840, 2160, "vp9", true), version(2, "1080", 1920, 1080, "h264", false)],
+            ..Default::default()
+        };
+        assert!(!plx_media::route::detail_played_video(&d).unwrap().hdr, "the 1080p SDR copy plays, not the 4K HDR one");
+        d.versions.clear();
+        assert!(plx_media::route::detail_played_video(&d).unwrap().hdr, "a single version is described by the item itself");
+    }
 
     // TEST ONLY: this module's few call sites still read/write metadata as free functions, a
     // shape written for the old crate-global statics. A thread-confined store (same pattern as
@@ -974,12 +1131,12 @@ mod tests {
                 for alt in [false, true] {
                     for trailer in [false, true] {
                         let s = set_full(restart, alt, mark, trailer);
-                        let (v, n) = visible_ctls(s, true);
+                        let (v, n) = visible_ctls(s, Stops::trailer(true));
                         assert_eq!(n, 1, "set={s:?}");
                         assert_eq!(v[0], HeroCtl::Play, "set={s:?}");
                         // And the non-full-trailer path must be byte-identical to `hero_ctls` —
                         // `visible_ctls` is a strict narrowing, never a second row model.
-                        assert_eq!(visible_ctls(s, false), hero_ctls(s), "set={s:?}");
+                        assert_eq!(visible_ctls(s, Stops::trailer(false)), hero_ctls(s), "set={s:?}");
                         // Drawing does not narrow with `visible_ctls` — `draw_buttons` iterates
                         // `hero_ctls` directly — so drawing always sees strictly more than
                         // full-trailer mode makes focusable/pointer-reachable: the watch toggle
@@ -1697,7 +1854,7 @@ mod tests {
     /// the People column or the row stays circles. Never across.
     #[test]
     fn five_discs_never_cross_the_people_column_in_any_language() {
-        use plx_platform::i18n::{language_on_this_thread_for_test, SHIPPED};
+        use plx_os::i18n::{language_on_this_thread_for_test, SHIPPED};
         let measure = plx_base::fontcov::advances::ShippedMeasure;
         // Go to Show belongs to an episode page; the on-deck More disc is absent there.
         let wide = HeroSet { more: false,
@@ -1981,16 +2138,20 @@ mod tests {
     #[test]
     fn the_trailer_unfurl_spring_reports_while_opening_and_is_quiet_at_rest() {
         let _g = plx_base::testlock::serial();
-        plx_machine::idle::reset_for_test();
+        plx_machine::motion::report::reset_for_test();
         // What the spring REPORTS is graded on this thread's own motion channel (`scoped_motion`),
         // not through `should_present`: that also reads the process-wide `DIRTY`, which an unlocked
         // test's repaint on another thread sets at any moment, so a quiet-frame assertion on it
         // failed at random under load. The `invalidate` from another thread between the steps below
         // is that repaint, raised on purpose: the verdict must not read it.
         let step = |spring: &mut plx_ui::Spring, target: f32| {
-            plx_machine::idle::scoped_motion(|| spring.step(target, plx_ui::widgets::K_DISC_UNFURL, 1.0 / 60.0)).1
+            plx_machine::motion::report::scoped_motion(|| spring.step(target, plx_ui::widgets::K_DISC_UNFURL, 1.0 / 60.0)).1
         };
-        let foreign_repaint = || std::thread::spawn(plx_machine::idle::invalidate).join().expect("the repaint thread");
+        let foreign_repaint = || std::thread::spawn(|| {
+            let mut other = plx_machine::present::Present::new();
+            other.note(plx_machine::present::PresentEvent::Damage(plx_machine::present::Provenance::Input));
+            assert!(other.page_damaged());
+        }).join().expect("the repaint thread");
         let mut springs = [plx_ui::Spring::at(0.0); 3];
         for spring in springs.iter_mut() {
             foreign_repaint();
@@ -2089,7 +2250,7 @@ mod tests {
     /// all-language sweep above covers the languages where the row itself collapses to circles.
     #[test]
     fn the_go_to_show_disc_opens_in_every_english_episode_row() {
-        use plx_platform::i18n::{language_on_this_thread_for_test, SHIPPED};
+        use plx_os::i18n::{language_on_this_thread_for_test, SHIPPED};
         let measure = plx_base::fontcov::advances::ShippedMeasure;
         let english = SHIPPED
             .iter()
@@ -2126,7 +2287,7 @@ mod tests {
     /// may collapse; this one must not.
     #[test]
     fn go_to_show_unfurls_in_every_language_when_the_row_has_no_alt() {
-        use plx_platform::i18n::{language_on_this_thread_for_test, SHIPPED};
+        use plx_os::i18n::{language_on_this_thread_for_test, SHIPPED};
         let measure = plx_base::fontcov::advances::ShippedMeasure;
         for restart in [false, true] {
             for version in [false, true] {
@@ -2142,5 +2303,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// W6c: with no playback driver composed the play-mode clause is the one reason word (after a
+    /// separator when something precedes it) and never the item's preview; with a driver it is
+    /// today's clause, which an item with no route preview leaves empty.
+    #[test]
+    fn no_playback_replaces_the_play_mode_clause_with_one_reason_word() {
+        let d = Detail::default();
+        let measure = plx_ui::fixture::FixtureMeasure;
+        assert_eq!(play_mode_w(&d, true, false, &measure), 0.0, "today: nothing to say for this item");
+        assert!(play_mode_w(&d, false, false, &measure) > 0.0, "no driver: the reason is drawn");
+        let (bits, n) = play_mode_bits(&d, false, false);
+        assert_eq!(n, 1);
+        assert!(matches!(bits[0], Bit::Word(word, ink, 0)
+            if word == plx_os::i18n::msg::browse_detail_no_playback_c()
+                && ink == plx_ui::detail_layout::FACTS_INK), "one word in the facts line's own ink");
+        let (after, n) = play_mode_bits(&d, false, true);
+        assert!(n == 2 && matches!(after[0], Bit::Sep) && matches!(after[1], Bit::Word(..)));
+    }
+
+    /// W6c: a host that never says (the default inputs) is a platform with a driver.
+    #[test]
+    fn inputs_that_set_no_backends_mean_a_playable_platform() {
+        use crate::registry::ScreenInputs;
+        use plx_media::route::BackendSet;
+        assert!(ScreenInputs::default().can_play());
+        for (set, can) in [(BackendSet::FEED, true), (BackendSet::URI, true), (BackendSet::BOTH, true),
+            (BackendSet::NONE, false)] {
+            assert_eq!(ScreenInputs { backends: set, ..Default::default() }.can_play(), can);
+        }
+        assert!(!ScreenInputs::default().same_facts(&ScreenInputs { backends: BackendSet::NONE, ..Default::default() }),
+            "the set is a screen-visible fact, so a change of it presents");
     }
 }

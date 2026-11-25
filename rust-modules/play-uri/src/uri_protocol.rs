@@ -347,14 +347,14 @@ pub struct Message {
     /// The audio track the service says is selected (`audioInfo.track`). The 4.5 service names it
     /// at load, before any selection, and sends no `trackSelected` for one that changes nothing.
     pub(crate) audio_track: Option<i64>,
-    pub(crate) reply_request: Option<plx_platform::tv::uri::RequestId>,
+    pub(crate) reply_request: Option<plx_os::tv::uri::RequestId>,
     pub(crate) reply_track: Option<&'static str>,
     pub(crate) confirmed_track: Option<&'static str>,
     /// The Seek request this message's `seekDone` reports landed, and whether that request's own
     /// reply had been acknowledged when it did (only the lifecycle, which owns the requests, fills
     /// it). The 4.5 service answers a seek call with a plain reply that carries no `seekDone`: the
     /// `seekDone` is the subscription's own event, so it is attributed, not read off the reply.
-    pub(crate) landed_seek: Option<(plx_platform::tv::uri::RequestId, bool)>,
+    pub(crate) landed_seek: Option<(plx_os::tv::uri::RequestId, bool)>,
 }
 
 /// A typed diagnostic scalar: numbers, booleans, a finite codec/HDR vocabulary, and
@@ -365,7 +365,9 @@ fn scalar(value: &Value) -> Option<String> {
         Value::Bool(b) => Some(b.to_string()),
         Value::String(s) => match s.as_str() {
             "aac" | "ac3" | "eac3" | "dts" | "H264" | "H265" | "h264" | "hevc" | "AV1" | "VP9"
-            | "sdr" | "hdr10" | "dolbyVision" => Some(s.clone()),
+            // `videoInfo.hdrType`: the firmware's whole HDR table (`getHdrTypeString`,
+            // docs/measurements/uri-acb-envelope-2026-11-05.md)
+            | "none" | "HDR10" | "DolbyVision" | "HLG" | "Prime" => Some(s.clone()),
             _ => None,
         },
         Value::Object(o) => {
@@ -542,7 +544,7 @@ pub fn parse_event(payload: &str) -> Message {
         let detail = match ev {
             Ev::VideoInfo => details(
                 value,
-                &["width", "height", "codec", "frameRate", "hdr", "currentBitrate", "contentBitrate"],
+                &["width", "height", "codec", "frameRate", "hdrType", "currentBitrate", "contentBitrate"],
             ),
             Ev::AudioInfo => details(value, &["codec", "channels", "sampleRate", "track"]),
             Ev::BufferRange => details(value, &["beginTime", "endTime", "remainingTime", "percent"]),

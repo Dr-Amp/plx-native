@@ -46,6 +46,11 @@
 //!   of frame time later (per generation), rather than latching it forever.
 //! - [`clear`] (sign-out) drops the cached `Arc` immediately — it holds the very account/server
 //!   tokens sign-out means to get rid of.
+//! - **Except on a platform with no credential store** (`StoreMode::MemoryOnly` in
+//!   `plx_os::tv::secure`, see `session/memory_only.rs`): there the cache is the only authority,
+//!   writers read it and install into it, a write is `Ephemeral` rather than `Durable`, no
+//!   credential store is read or committed, and the install's own file (client id, language,
+//!   Interface resolution) is all that survives the process.
 //! - Other domains of the same record (consent) are not in this cache and their writes never
 //!   touch it. `async_persistence`'s own `CACHE`/`LOCKED_STATE` are a separate, currently-unwired
 //!   engine (see its doc) — when it is wired, its coordinator must install into and drop THIS
@@ -60,6 +65,7 @@ pub use prefs::{IntroSkipPref, CreditsSkipPref, DolbyVisionModePref, InstantDpad
     ProfilePrefsRecord, ProfileSetting, ProfileWrite, QualityPref, Row, Setting, SkipIntervalPref,
     SubtitlePositionPref, SubtitleSizePref, SubtitleTonePref, TrailerAutoplayPref, HudEndTimePref, UiResolutionPref, UnderPostersPref};
 use prefs::ProfileMemory;
+use plx_os::tv::authority::{authority as storage_authority, Authority};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::Mutex;
@@ -70,6 +76,7 @@ pub use plx_base::detail_parts::{DetailPart, DetailParts};
 /// The signed-in profile, in-memory for the UI (the Home profile chip reads this). Set by the boot
 /// gate (from the stored session) and on every profile switch, so it survives an offline boot.
 static CURRENT: Mutex<Option<std::sync::Arc<CurrentProfile>>> = Mutex::new(None);
+static CURRENT_PUBLICATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Immutable worker publication. Identity and its explicit owner-assigned generation are one
 /// record, so a reader that needs both can retain one snapshot across subsequent publications.
@@ -204,8 +211,9 @@ impl ProfilePublisher {
             return;
         }
         {
-            *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(
-                CurrentProfile { user: user.clone(), generation, stamp }));
+            let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+            *current = Some(std::sync::Arc::new(CurrentProfile { user: user.clone(), generation, stamp }));
+            CURRENT_PUBLICATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         warm(user, generation);
     }
@@ -505,7 +513,7 @@ impl Drop for TempSession {
 
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct OpaqueExtensions(pub BTreeMap<String, Value>);
+pub struct OpaqueExtensions(pub BTreeMap<String, ::serde_json::Value>);
 
 impl OpaqueExtensions {
     fn is_empty(&self) -> bool {
@@ -526,8 +534,8 @@ pub struct Session {
     /// Install-wide UI language, applied on the next process launch. Absent means System, and
     /// System is not written, so a session that never chose a language serializes exactly as it
     /// did before localization — committed replay initials and the owner digest included.
-    #[serde(default, skip_serializing_if = "plx_platform::i18n::Preference::is_system")]
-    pub language: plx_platform::i18n::Preference,
+    #[serde(default, skip_serializing_if = "plx_os::i18n::Preference::is_system")]
+    pub language: plx_os::i18n::Preference,
     /// Stable `X-Plex-Client-Identifier` — generated once, reused forever (plex.tv binds the pin
     /// and the authorized-device entry to it).
     #[serde(default)]
@@ -651,7 +659,7 @@ struct CanonicalSessionAuth {
 #[derive(Serialize, Deserialize)]
 struct CanonicalSessionPreferences {
     #[serde(default)]
-    language: plx_platform::i18n::Preference,
+    language: plx_os::i18n::Preference,
     /// Every flattened preference key (playback and display settings, the A5 rows and the two memory-door
     /// lists), flattened ahead of `extensions` so a flattened struct takes its keys first and
     /// `extensions` still sees only unknown ones.
@@ -674,7 +682,7 @@ struct CanonicalSessionPreferences {
 impl Default for CanonicalSessionPreferences {
     fn default() -> Self {
         Self {
-            language: plx_platform::i18n::Preference::System,
+            language: plx_os::i18n::Preference::System,
             prefs: Preferences { trailer_autoplay: true, ..Preferences::default() },
             extensions: BTreeMap::new(),
         }
@@ -689,7 +697,7 @@ impl Default for CanonicalSessionPreferences {
 #[allow(dead_code)] // Connected by the Stage B Session adapter.
 pub fn split_canonical(
     session: &Session,
-) -> Result<(plx_platform::storage::state::PublicPayload, String), ()> {
+) -> Result<(plx_os::storage::state::PublicPayload, String), ()> {
     // `profiles` in a v1 extension is opaque, never an active credential cache. Refuse an
     // ambiguous v2 write; only the typed field is permitted to carry active credentials.
     if session.extensions.0.contains_key("profiles") { return Err(()); }
@@ -708,7 +716,7 @@ pub fn split_canonical(
     Ok((split_public(session)?, auth))
 }
 
-fn split_public(session: &Session) -> Result<plx_platform::storage::state::PublicPayload, ()> {
+fn split_public(session: &Session) -> Result<plx_os::storage::state::PublicPayload, ()> {
     let mut preferences = serde_json::to_value(CanonicalSessionPreferences {
         language: session.language,
         prefs: session.prefs.clone(),
@@ -726,7 +734,7 @@ fn split_public(session: &Session) -> Result<plx_platform::storage::state::Publi
     }
     let pins = serde_json::to_value(&session.home_pins).map_err(|_| ())?;
     let recents = serde_json::to_value(&session.recent_searches).map_err(|_| ())?;
-    Ok(plx_platform::storage::state::PublicPayload {
+    Ok(plx_os::storage::state::PublicPayload {
             preferences,
             client_id: (!session.client_id.is_empty()).then(|| session.client_id.clone()),
             // Profile/server bootstrap metadata is personal and only useful together with its
@@ -748,7 +756,7 @@ fn split_public(session: &Session) -> Result<plx_platform::storage::state::Publi
 /// session would turn corruption into an authenticated state.
 #[allow(dead_code)] // Connected by the Stage B Session adapter.
 pub fn join_canonical(
-    public: &plx_platform::storage::state::PublicPayload,
+    public: &plx_os::storage::state::PublicPayload,
     protected: &str,
 ) -> Result<Session, ()> {
     let auth: CanonicalSessionAuth = serde_json::from_str(protected).map_err(|_| ())?;
@@ -785,7 +793,7 @@ pub fn join_canonical(
 }
 
 /// Public snapshot for a locked protected bundle. It deliberately contains no offline credentials.
-fn public_session(public: &plx_platform::storage::state::PublicPayload) -> Session {
+fn public_session(public: &plx_os::storage::state::PublicPayload) -> Session {
     let preferences = serde_json::from_value::<CanonicalSessionPreferences>(
         public.preferences.clone(),
     )
@@ -833,7 +841,7 @@ fn protected_fields_equal(left: &Session, right: &Session) -> bool {
     matches!((protected_fields(left), protected_fields(right)), (Ok(left), Ok(right)) if left == right)
 }
 fn protected_matches(session: &Session, protected: &str) -> bool {
-    join_canonical(&plx_platform::storage::state::PublicPayload::default(), protected)
+    join_canonical(&plx_os::storage::state::PublicPayload::default(), protected)
         .is_ok_and(|previous| protected_fields_equal(&previous, session))
 }
 
@@ -924,7 +932,7 @@ impl PlaybackQuality {
     /// Display text in the UI language with its regional digits; a log line names the rung by
     /// `{:?}` instead, so the log does not depend on the viewer's language.
     pub fn label(self) -> String {
-        use plx_platform::i18n::{current, msg};
+        use plx_os::i18n::{current, msg};
         let (lines, kbps): (i64, i64) = match self {
             PlaybackQuality::Auto => return msg::settings_playback_auto().to_owned(),
             PlaybackQuality::Original => return msg::widgets_quality_original().to_owned(),
@@ -1533,7 +1541,7 @@ impl HoldHintTaught {
 /// on their own panel. Install-wide (not per profile) because the window is created once, before
 /// anyone is seated. Absence, and any spelling this build does not know, is `Auto`. The setting is
 /// offered, and the stored value honoured at boot, on webOS 1-3 only
-/// (`plx_platform::tv::device::offers_ui_resolution`); elsewhere the stored value is kept but unused.
+/// (`plx_os::tv::device::offers_ui_resolution`); elsewhere the stored value is kept but unused.
 #[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiResolution {
     #[default]
@@ -2114,22 +2122,22 @@ impl NativeAudioRefusal {
     /// lesson; a named refusal keeps that behaviour. The `Facet::Video` arm returns `None`: video
     /// rows never persist (D6(c): a video facet never proves), and this row has no video fields to
     /// hold one.
-    pub fn of_facet(facet: &plx_platform::devcaps::Facet, firmware: &str, build: &str, proofs: Option<u32>) -> Option<Self> {
+    pub fn of_facet(facet: &plx_os::devcaps::Facet, firmware: &str, build: &str, proofs: Option<u32>) -> Option<Self> {
         match facet {
-            plx_platform::devcaps::Facet::Audio { codec, channels } => {
+            plx_os::devcaps::Facet::Audio { codec, channels } => {
                 if *channels == 0 && proofs.is_some() {
                     return None;
                 }
                 Some(NativeAudioRefusal {
                     firmware: firmware.to_owned(),
-                    codec: plx_platform::devcaps::audio_codec_id(codec).into_owned(),
+                    codec: plx_os::devcaps::audio_codec_id(codec).into_owned(),
                     channels: *channels,
                     build: build.to_owned(),
                     proofs,
                     extensions: Default::default(),
                 })
             }
-            plx_platform::devcaps::Facet::Video { .. } => None,
+            plx_os::devcaps::Facet::Video { .. } => None,
         }
     }
 
@@ -2144,8 +2152,8 @@ impl NativeAudioRefusal {
         self.build == other.build && self.codec == other.codec && self.channels == other.channels
     }
 
-    fn to_devcaps(&self) -> plx_platform::devcaps::Refusal {
-        plx_platform::devcaps::Refusal { codec: self.codec.clone(), channels: self.channels, build: self.build.clone() }
+    fn to_devcaps(&self) -> plx_os::devcaps::Refusal {
+        plx_os::devcaps::Refusal { codec: self.codec.clone(), channels: self.channels, build: self.build.clone() }
     }
 }
 
@@ -3218,8 +3226,9 @@ fn read_into_cache_locked(expected: Option<u64>) -> (std::sync::Arc<ReadState>, 
     let state = std::sync::Arc::new(CACHE_READ_FOR_TEST.with(|read| {
         read.get().unwrap_or(read_live_locked)()
     }));
-    #[cfg(all(target_os = "linux", target_arch = "arm", not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
-    plx_base::eventlog::log("session: authority read reason=miss");
+    if storage_authority() == Authority::Helper {
+        plx_base::eventlog::log("session: authority read reason=miss");
+    }
     if !replace_cache(cached_arm(state.clone()), expected, false) { return (state, false); }
     if let ReadState::Ready { session, .. } = &*state { publish_identities(session); }
     (state, true)
@@ -3286,14 +3295,14 @@ pub fn learn_hold_hint_taught(taught: HoldHintTaught) -> bool {
 /// once. See [`record_refusal_proof`] for the counted kind. Returns whether a write was queued (a set
 /// that cannot learn and an unstorable facet return false); what the write changes is decided when it
 /// lands, against the record then current.
-pub fn record_named_refusal(facet: &plx_platform::devcaps::Facet) -> bool {
+pub fn record_named_refusal(facet: &plx_os::devcaps::Facet) -> bool {
     record(facet, None)
 }
 
 /// **A conversion rescued a play and changed only the refused facet** (S2a's facet-clean proof):
 /// count one proof for `(this build, codec, channels)`; the row applies from
 /// [`LEARNED_REFUSAL_PROOFS`]. Returns whether a write was queued, as [`record_named_refusal`] does.
-pub fn record_refusal_proof(facet: &plx_platform::devcaps::Facet) -> bool {
+pub fn record_refusal_proof(facet: &plx_os::devcaps::Facet) -> bool {
     record(facet, Some(1))
 }
 
@@ -3307,8 +3316,8 @@ pub fn record_refusal_proof(facet: &plx_platform::devcaps::Facet) -> bool {
 /// is the store's property for every preference, not this one's: a write that does not land
 /// (unwritable storage) leaves the record as it was, and the next play loads the combination, is
 /// refused once more, and the ladder converts it, one refused Load slower.
-fn record(facet: &plx_platform::devcaps::Facet, proofs: Option<u32>) -> bool {
-    let Some((firmware, build)) = plx_platform::devcaps::learning_firmware() else {
+fn record(facet: &plx_os::devcaps::Facet, proofs: Option<u32>) -> bool {
+    let Some((firmware, build)) = plx_os::devcaps::learning_firmware() else {
         return false;
     };
     let Some(row) = NativeAudioRefusal::of_facet(facet, &firmware, &build, proofs) else {
@@ -3333,7 +3342,7 @@ impl Session {
     /// The stored native-audio rows in force, as `devcaps` takes them (a counted row below the
     /// threshold is stored and not applied). PURE: the play-start edge reads it from `peek()` and
     /// passes it to `devcaps::start_caps`, the one place a stored row narrows a capability value.
-    pub fn applied_refusals(&self) -> Vec<plx_platform::devcaps::Refusal> {
+    pub fn applied_refusals(&self) -> Vec<plx_os::devcaps::Refusal> {
         self.prefs.native_audio_refused.iter().filter(|r| r.applies()).map(NativeAudioRefusal::to_devcaps).collect()
     }
 }
@@ -3516,11 +3525,41 @@ static VISIBLE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 pub fn install_transient_for_test(locked: bool) {
     plx_base::testlock::assert_held("session read fixture");
     let _io = io();
-    install_locked(std::sync::Arc::new(if locked { ReadState::Locked { kept: install_preferences::Retained { language: plx_platform::i18n::saved_preference(), ..Default::default() } } } else { ReadState::Blocked }));
+    install_locked(std::sync::Arc::new(if locked { ReadState::Locked { kept: install_preferences::Retained { language: plx_os::i18n::saved_preference(), ..Default::default() } } } else { ReadState::Blocked }));
 }
 
 pub fn visible_generation() -> u64 {
     VISIBLE_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Host-only publication fence for retained screen inputs, including signed-out defaults.
+/// The cache revision is read under CACHE: replace_cache assigns its content, advances the
+/// counter, and projects keys before releasing that same lock. CURRENT is read separately
+/// to avoid lock-order coupling; a before/after pair fences both publications without allocation.
+pub fn screen_input_revision() -> (u64, u64) {
+    let cache_revision = {
+        let _cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        CACHE_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let profile_revision = {
+        let _current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+        CURRENT_PUBLICATION.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    (cache_revision, profile_revision)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn install_cleared_for_test(ui_resolution: UiResolution) {
+    plx_base::testlock::assert_held("cleared screen input fixture");
+    let kept = Retained { language: plx_os::i18n::Preference::System, ui_resolution };
+    set_cache_locked(Cached::Settled(std::sync::Arc::new(ReadState::Cleared { kept })));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn install_locked_defaults_for_test(ui_resolution: UiResolution) {
+    plx_base::testlock::assert_held("locked screen input fixture");
+    let kept = Retained { language: plx_os::i18n::Preference::System, ui_resolution };
+    set_cache_locked(Cached::Transient { state: std::sync::Arc::new(ReadState::Locked { kept }) });
 }
 
 /// Per-consumer cursor for cached session-derived views. Poll on Tick, including while storage
@@ -3667,7 +3706,7 @@ mod cache_timing_tests {
     // serial fixture: a later test's time zero would otherwise wrap the keepalive arithmetic.
     struct ResetIdle;
     impl Drop for ResetIdle {
-        fn drop(&mut self) { plx_machine::idle::reset_for_test(); }
+        fn drop(&mut self) { plx_machine::motion::report::reset_for_test(); }
     }
 
     /// What a frame thread's landing step reads of the cache: whether the visible generation moved
@@ -3731,7 +3770,7 @@ mod cache_timing_tests {
             READ_RETURNED.store(true, std::sync::atomic::Ordering::SeqCst);
             ReadState::Ready { session: std::sync::Arc::new(test_support::signed_in()), plaintext: false, retry_canonical: false }
         })));
-        plx_machine::idle::reset_for_test();
+        plx_machine::motion::report::reset_for_test();
         let ticket = plx_base::storage_worker::submit_retained(refresh_cache_job(need.generation));
         CACHE_READ_FOR_TEST.with(|slot| slot.set(None));
         entered.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
@@ -3743,8 +3782,12 @@ mod cache_timing_tests {
         release.send(()).unwrap();
         assert_eq!(ticket.wait_blocking().unwrap(), CacheRefreshOutcome::Settled);
         plx_base::storage_worker::drain_for_test();
-        assert!(!plx_machine::idle::should_present(0), "the worker only publishes data");
-        assert_eq!(plx_machine::idle::take_local_damage(), 0, "the peeks raise no frame damage of their own");
+        let mut present = plx_machine::present::Present::new();
+        present.take(0);
+        present.acknowledge(0);
+        plx_machine::motion::report::collect_into(&mut present, 0);
+        assert!(!present.take(0), "the worker only publishes data");
+        assert!(!present.take(1), "the peeks raise no owned frame damage of their own");
         let _frame = plx_base::task::FrameScope::enter();
         assert!(frame_step.lands(), "the frame step observes the published session");
         assert_eq!(peek().client_id, "cid-1");
@@ -3872,19 +3915,27 @@ mod cache_timing_tests {
                 session: std::sync::Arc::new(test_support::signed_in()), plaintext: true, retry_canonical: false,
             }) as fn() -> ReadState, false),
         ] {
-            plx_machine::idle::reset_for_test();
-            plx_machine::idle::note_present(10_000);
+            plx_machine::motion::report::reset_for_test();
+            let mut present = plx_machine::present::Present::new();
+            present.take(10_000);
+            present.acknowledge(10_000);
             CACHE_READ_FOR_TEST.with(|slot| slot.set(Some(read)));
             let job = refresh_cache_job(CACHE_GENERATION.load(std::sync::atomic::Ordering::Relaxed));
             CACHE_READ_FOR_TEST.with(|slot| slot.set(None));
             drop(plx_base::storage_worker::submit_retained(job));
             plx_base::storage_worker::drain_for_test();
-            assert!(!plx_machine::idle::should_present(10_001), "workers cannot wake the UI");
-            assert_eq!(plx_machine::idle::take_local_damage(), 0);
+            plx_machine::motion::report::collect_into(&mut present, 10_001);
+            assert!(!present.take(10_001), "workers cannot wake the UI");
+            assert!(!present.take(10_001), "only the owned landing boundary can damage the gate");
             let _frame = plx_base::task::FrameScope::enter();
             assert_eq!(frame_step.lands(), landed);
             assert!(!frame_step.lands(), "one landing per change");
-            assert_eq!(plx_machine::idle::take_local_damage(), 0, "landing the cache raises no frame damage of its own");
+            assert!(!present.take(10_001), "landing the cache raises no owned damage of its own");
+            if landed {
+                plx_machine::machine::PresentHandle::of(&mut present).note(
+                    plx_machine::present::PresentEvent::Damage(plx_machine::present::Provenance::Lifecycle));
+            }
+            assert_eq!(present.take(10_001), landed, "the caller attributes the typed landing once");
         }
     }
 
@@ -3985,9 +4036,10 @@ const SECURE_FORMAT: &str = "plxnative-secure-session";
 struct SecureEnvelope {
     format: String,
     version: u8,
-    sealed: plx_platform::tv::secure::Sealed,
+    sealed: plx_os::tv::secure::Sealed,
 }
 
+#[derive(Clone)]
 enum ReadState {
     Missing,
     Ready {
@@ -4052,6 +4104,10 @@ fn read_locked(canonical: persistence::CanonicalRead) -> ReadState {
 fn read_live_locked() -> ReadState {
     #[cfg(any(test, feature = "test-support"))]
     READS_FOR_TEST.with(|c| c.set(c.get() + 1));
+    // Above every fixture redirect below: a platform with no credential store reads no store.
+    if memory_only::active() {
+        return memory_only::read_locked();
+    }
     #[cfg(any(test, feature = "test-support"))]
     if TEST_FILE.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
         // A redirected scratch path is an explicit host fixture. It is also deliberately not
@@ -4061,7 +4117,7 @@ fn read_live_locked() -> ReadState {
     }
     match read_canonical_locked() {
         persistence::CanonicalRead::Missing => migrate_missing_fallback_locked(read_legacy_locked()),
-        persistence::CanonicalRead::Blocked(plx_platform::storage::StoreError::HelperUnavailable) => {
+        persistence::CanonicalRead::Blocked(plx_os::storage::StoreError::HelperUnavailable) => {
             match read_legacy_filtered_locked(true) {
                 ReadState::Ready {
                     session, plaintext, ..
@@ -4150,7 +4206,7 @@ fn read_legacy_filtered_locked(fallback_only: bool) -> ReadState {
         }
         if let Ok(envelope) = serde_json::from_slice::<SecureEnvelope>(&bytes) {
             if envelope.format == SECURE_FORMAT && envelope.version == 1 {
-                let Some(plain) = plx_platform::tv::secure::open(&envelope.sealed) else {
+                let Some(plain) = plx_os::tv::secure::open(&envelope.sealed) else {
                     plx_base::eventlog::log("session: secure file is present but its device key is unavailable");
                     return ReadState::Locked { kept: install_preferences::load().unwrap_or_default() };
                 };
@@ -4228,17 +4284,16 @@ fn auto_quality_ready() -> bool {
 }
 
 /// **The telemetry/consent legacy-file sweep that follows a durable canonical clear**
-/// ([`clear_for_erase`]'s ARM arm): `telemetry` owns the files and sits above `plex`, so the app
-/// installs its `cleanup_after_account_clear` as a hook ([`install_account_clear_cleanup`];
-/// `app::boot::install_plex_seams`). It answers whether every candidate was retired. Unset there is
-/// nothing registered to retire, which reads as retired, so the "could not be retired" branch is
-/// never taken without a sweep that failed. Compiled where the sweep is: ARM, not the simulator,
-/// not a test build.
-#[cfg(all(target_os = "linux", target_arch = "arm", not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
+/// ([`clear_for_erase`] where the storage helper is canonical): `telemetry` owns the files and sits
+/// above `plex`, so the app installs its `cleanup_after_account_clear` as a hook
+/// ([`install_account_clear_cleanup`]; `app::boot::install_plex_seams`). It answers whether every
+/// candidate was retired. Unset there is nothing registered to retire, which reads as retired, so
+/// the "could not be retired" branch is never taken without a sweep that failed. The sweep runs
+/// only where the platform states [`Authority::Helper`]; elsewhere the files it retires are not
+/// deferred to a sign-out, so an installed hook is never asked.
 static ACCOUNT_CLEAR_CLEANUP: std::sync::OnceLock<fn() -> bool> = std::sync::OnceLock::new();
 
 /// Install the sweep [`ACCOUNT_CLEAR_CLEANUP`] runs. Once; later calls are ignored.
-#[cfg(all(target_os = "linux", target_arch = "arm", not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
 pub fn install_account_clear_cleanup(sweep: fn() -> bool) {
     let _ = ACCOUNT_CLEAR_CLEANUP.set(sweep);
 }
@@ -4465,15 +4520,28 @@ pub fn update(edit: impl FnOnce(&Session) -> Option<Session>) -> bool {
 
 /// Blocking persistence seam; Language settings dispatches it on the storage worker.
 /// A next-launch promise requires the same confirmed durability as playback preferences.
-pub fn set_language(language: plx_platform::i18n::Preference) -> bool {
+pub fn set_language(language: plx_os::i18n::Preference) -> bool {
     let saved = update_with_outcome(|current| {
         let mut next = current.clone();
         next.language = language;
         Some(next)
-    }).is_some_and(|write| matches!(write.classify(),
-        async_persistence::CompletionOutcome::Durable(_)));
-    if saved { plx_platform::i18n::set_saved_preference(language); }
+    }).is_some_and(|write| kept_for_next_launch(&write));
+    if saved { plx_os::i18n::set_saved_preference(language); }
     saved
+}
+
+/// Whether `write` keeps its choice for the NEXT launch: a store's confirmed commit, or, on a
+/// platform with no credential store, the install's own file ([`memory_only`]), which is where
+/// the language and the Interface resolution live there. A write held in memory alone does not.
+fn kept_for_next_launch(write: &async_persistence::LiveWrite) -> bool {
+    match write.classify() {
+        async_persistence::CompletionOutcome::Durable(_) => true,
+        async_persistence::CompletionOutcome::Ephemeral => write.install_choices_kept(),
+        async_persistence::CompletionOutcome::Uncertain { .. }
+        | async_persistence::CompletionOutcome::Failed(_)
+        | async_persistence::CompletionOutcome::ProtectionUncertain(_)
+        | async_persistence::CompletionOutcome::Superseded => false,
+    }
 }
 
 /// Blocking persistence seam for the Interface resolution picker, dispatched on the storage
@@ -4485,7 +4553,7 @@ pub fn set_ui_resolution(mode: UiResolution) -> bool {
         (!already).then(|| current.with_ui_resolution(mode))
     });
     // Already the stored choice is a pick that landed; an unreadable or refused record is not.
-    already || write.is_some_and(|write| matches!(write.classify(), async_persistence::CompletionOutcome::Durable(_)))
+    already || write.is_some_and(|write| kept_for_next_launch(&write))
 }
 
 
@@ -4673,23 +4741,27 @@ fn save_locked_with_authority(
     // Before the write, not after: a failed persist still means these names are live in THIS run,
     // and the log wants them redacted either way.
     publish_identities(s);
+    // Above the fixture redirect and the platform selection below: no credential store is written.
+    if memory_only::active() {
+        return memory_only::save_locked(s, authority, cache_generation);
+    }
     #[cfg(any(test, feature = "test-support"))]
     if TEST_FILE.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
         let legacy = save_legacy_locked(s);
         install_or_drop_after_write(s, legacy, authority, cache_generation);
         return async_persistence::LiveWrite::legacy(legacy);
     }
-    plx_platform::storage::wire::failure::clear();
+    plx_os::storage::wire::failure::clear();
     CANDIDATE_ERRNOS.with(|slot| slot.set([None; 8]));
     let protected_before = has_protected_authority();
     let commit = persistence::write_session_timed(s, authority);
     // Uncertain helper replies already own their evidence in CanonicalCommit. Only the older
     // StoreError-only failure variants still need this immediate thread-local snapshot.
     let helper_failure = match &commit {
-        persistence::CanonicalCommit::Failed(plx_platform::storage::StoreError::HelperUnavailable
-            | plx_platform::storage::StoreError::HelperAuthentication | plx_platform::storage::StoreError::HelperProtocol) =>
-            Some(plx_platform::storage::wire::failure::last().unwrap_or_else(||
-                plx_platform::storage::wire::failure::HelperFailure::new(plx_platform::storage::wire::failure::Stage::Unknown, None))),
+        persistence::CanonicalCommit::Failed(plx_os::storage::StoreError::HelperUnavailable
+            | plx_os::storage::StoreError::HelperAuthentication | plx_os::storage::StoreError::HelperProtocol) =>
+            Some(plx_os::storage::wire::failure::last().unwrap_or_else(||
+                plx_os::storage::wire::failure::HelperFailure::new(plx_os::storage::wire::failure::Stage::Unknown, None))),
         _ => None,
     };
     let durable = matches!(commit, persistence::CanonicalCommit::Durable { .. });
@@ -4790,7 +4862,7 @@ fn save_legacy_fallback_locked(
         plx_base::eventlog::log("session: preserving the existing protected record; refusing an unprotected downgrade");
         return None;
     }
-    if let Some(sealed) = plx_platform::tv::secure::seal(&serde_json::to_vec_pretty(s).ok()?) {
+    if let Some(sealed) = plx_os::tv::secure::seal(&serde_json::to_vec_pretty(s).ok()?) {
         let envelope = SecureEnvelope {
             format: SECURE_FORMAT.to_string(),
             version: 1,
@@ -4874,7 +4946,7 @@ fn save_legacy_locked(s: &Session) -> Option<bool> {
     let Ok(json) = serde_json::to_vec_pretty(s) else {
         return None;
     };
-    if let Some(sealed) = plx_platform::tv::secure::seal(&json) {
+    if let Some(sealed) = plx_os::tv::secure::seal(&json) {
         let envelope = SecureEnvelope {
             format: SECURE_FORMAT.to_string(),
             version: 1,
@@ -4908,7 +4980,7 @@ fn save_legacy_locked(s: &Session) -> Option<bool> {
 fn has_protected_authority() -> bool {
     match read_canonical_locked() {
         persistence::CanonicalRead::Locked { protection, .. } => protection.is_some_and(|outcome| {
-            !matches!(outcome.class, plx_platform::storage::wire::ProtectionClass::Db8AclOnly)
+            !matches!(outcome.class, plx_os::storage::wire::ProtectionClass::Db8AclOnly)
         }),
         _ => false,
     }
@@ -5261,7 +5333,7 @@ fn clear_cleanup_outcome(outcome: persistence::ClearCleanupOutcome) -> ClearOutc
 /// load. The old-path copy goes too, or the migration fallback would resurrect the stale session.
 /// **And commits an explicit Cleared record to the canonical authority** — the legacy-file sweep
 /// below only ever touches pre-DB8 candidates; on a build where `persistence::load`/`write_session`
-/// actually read/write the canonical store (DB8 or its host/ARM equivalent), that store is a
+/// actually read/write the canonical store (DB8 or its host equivalent), that store is a
 /// SEPARATE copy of the account token and roster, and clearing only the legacy files would leave a
 /// clean-looking sign-out that the canonical authority still hands back on the next boot.
 ///
@@ -5293,8 +5365,11 @@ pub struct Erasure {
 /// replace them with the defaults after the credentials themselves have already been cleared.
 pub fn clear_for_erase(all_local: bool, retry: Option<Retained>) -> Erasure {
     let _io = io();
+    if memory_only::active() {
+        return memory_only::clear_locked(all_local, retry);
+    }
     let kept = retry.unwrap_or_else(|| Retained::of(&session_from_read(&read_live_locked())));
-    let native = cfg!(all(target_os = "linux", target_arch = "arm", not(feature = "hostsim"), not(any(test, feature = "test-support"))));
+    let native = storage_authority() == Authority::Helper;
     // File backends need a credential-free resource before the credential file disappears.
     let mut preference_failures = Vec::new();
     if !all_local && !native && !install_preferences::save(kept) {
@@ -5346,22 +5421,20 @@ pub fn clear_for_erase(all_local: bool, retry: Option<Retained>) -> Erasure {
             // `auth_paths()` above only ever covered `paths::session_candidates()` — the legacy
             // sign-in file and its pre-relocation predecessor. The recognized migration source set
             // is bigger (`paths::session_migration_candidates()`, plus the pre-DB8 canonical JSON
-            // wrapper on ARM), and a candidate this sweep never visits is a live account token left
+            // wrapper where the helper is canonical), and a candidate this sweep never visits is a live account token left
             // on a rooted, world-readable install prefix after a sign-out that otherwise looked
             // clean. `cleanup_after_confirmed_clear` re-reads the authority to confirm it really is
             // Cleared before retiring anything, so this can only ever remove residue, never data a
             // concurrent re-login just wrote.
-            #[allow(unused_mut)] // only mutated on the ARM cfg arm below
             let mut outcome = clear_cleanup_outcome(persistence::cleanup_after_confirmed_clear());
             // Telemetry/consent's own legacy files are a SEPARATE candidate set from the session
             // auth-token sweep above (`persistence::cleanup_after_confirmed_clear` never touches
             // them — see `paths::telemetry_candidates` vs `paths::session_migration_candidates`).
-            // On ARM, `telemetry::persistence::forget_at` defers their removal to exactly this
-            // moment, once this canonical commit is confirmed durable (Copilot review on PR #105,
-            // finding 7; ported from `release/v0.6`'s `telemetry::cleanup_after_account_clear`,
-            // called here in that release).
-            #[cfg(all(target_os = "linux", target_arch = "arm", not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
-            if !ACCOUNT_CLEAR_CLEANUP.get().is_none_or(|sweep| sweep()) {
+            // Where the storage helper is canonical, `telemetry::persistence::forget_at` defers their
+            // removal to exactly this moment, once this canonical commit is confirmed durable
+            // (Copilot review on PR #105, finding 7; ported from `release/v0.6`'s
+            // `telemetry::cleanup_after_account_clear`, called here in that release).
+            if native && !ACCOUNT_CLEAR_CLEANUP.get().is_none_or(|sweep| sweep()) {
                 plx_base::eventlog::log(
                     "session: canonical clear is durable but a telemetry/consent legacy \
                      candidate could not be retired — it remains on disk and will be swept \
@@ -5407,7 +5480,7 @@ pub fn clear_for_erase(all_local: bool, retry: Option<Retained>) -> Erasure {
         if let Some(bytes) = read_owned_regular(&path) {
             if let Ok(envelope) = serde_json::from_slice::<SecureEnvelope>(&bytes) {
                 if envelope.format == SECURE_FORMAT && envelope.version == 1 {
-                    plx_platform::tv::secure::remove(&envelope.sealed.backend, &envelope.sealed.key);
+                    plx_os::tv::secure::remove(&envelope.sealed.backend, &envelope.sealed.key);
                 }
             }
         }
@@ -5428,7 +5501,7 @@ pub fn clear_for_erase(all_local: bool, retry: Option<Retained>) -> Erasure {
         if !reset { preference_failures.push("stored language preference could not be reset".into()); }
         preference_failures.extend(install_preferences::erase());
         if reset && preference_failures.is_empty() {
-            retained.language = plx_platform::i18n::Preference::System;
+            retained.language = plx_os::i18n::Preference::System;
             // The file backend's retained file is gone whole. Native ClearTenure keeps every other
             // public preference, and its Cleared state accepts the removal of `language` alone.
             if !native { retained.ui_resolution = UiResolution::Auto; }
@@ -5533,11 +5606,11 @@ fn retry_pending_revocation_removals_locked() -> bool {
             // Discard obsolete permission without touching the marker for a newer sign-out.
             true
         } else {
-            match plx_platform::storage::unlink(&marker) {
+            match plx_os::storage::unlink(&marker) {
                 Ok(()) => sync_retired_candidate_parent(&marker),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => sync_retired_candidate_parent(&marker),
                 // The same rule as `retire_session_candidate`: absence proven behind a refusal.
-                Err(error) => match plx_platform::storage::prove_absent_after_refused_unlink(&marker, error) {
+                Err(error) => match plx_os::storage::prove_absent_after_refused_unlink(&marker, error) {
                     Ok(()) => true,
                     Err(error) => {
                         plx_base::eventlog::log(&format!("session: revocation retirement failed errno={}",
@@ -5665,14 +5738,14 @@ fn sync_retired_candidate_parent(path: &std::path::Path) -> bool {
 /// lookup, and a neutralize open (no O_CREAT) answering ENOENT is the same proof. Only a name
 /// that exists, or cannot be looked at, stays a failure for the caller to retry.
 fn retire_session_candidate(path: &std::path::Path) -> bool {
-    let unlink = match plx_platform::storage::unlink(path) {
+    let unlink = match plx_os::storage::unlink(path) {
         Ok(()) => return sync_retired_candidate_parent(path),
         // May be the retry of our own unlink whose parent sync failed, so it syncs too.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return sync_retired_candidate_parent(path),
         Err(error) => error,
     };
     // A refusal changed nothing on disk, so absence proven behind it has nothing to flush.
-    let Err(unlink) = plx_platform::storage::prove_absent_after_refused_unlink(path, unlink) else { return true };
+    let Err(unlink) = plx_os::storage::prove_absent_after_refused_unlink(path, unlink) else { return true };
     match neutralize_session_candidate(path) {
         Ok(()) => true,
         // Opened without O_CREAT: the name vanished after the lookup above.
@@ -5860,6 +5933,9 @@ mod prefs_characterisation_tests;
 #[allow(dead_code)] // Stage B connects typed owner admission/completions.
 pub mod async_persistence;
 mod install_preferences;
+mod memory_only;
+#[cfg(test)]
+mod memory_only_tests;
 pub use install_preferences::Retained;
 pub mod prefs;
 #[cfg(test)]
@@ -6054,7 +6130,7 @@ mod ui_resolution_tests {
         let (public, protected) = split_canonical(&Session::default()).unwrap();
         let mut public = serde_json::to_value(&public).unwrap();
         public["preferences"]["ui_resolution"] = serde_json::json!("1080p");
-        let public: plx_platform::storage::state::PublicPayload = serde_json::from_value(public).unwrap();
+        let public: plx_os::storage::state::PublicPayload = serde_json::from_value(public).unwrap();
         assert_eq!(join_canonical(&public, &protected).unwrap().ui_resolution(), UiResolution::Auto);
     }
 
@@ -6062,10 +6138,10 @@ mod ui_resolution_tests {
     /// language, in the cached session `peek` serves and in the owned one a writer starts from.
     #[test]
     fn a_signed_out_read_carries_the_resolution_like_the_language() {
-        let kept = Retained { language: plx_platform::i18n::Preference::Be, ui_resolution: UiResolution::Sd540 };
+        let kept = Retained { language: plx_os::i18n::Preference::Be, ui_resolution: UiResolution::Sd540 };
         for read in [ReadState::Cleared { kept }, ReadState::Locked { kept }] {
             for session in [session_from_read(&read), (*session_of(&read)).clone()] {
-                assert_eq!(session.language, plx_platform::i18n::Preference::Be);
+                assert_eq!(session.language, plx_os::i18n::Preference::Be);
                 assert_eq!(session.ui_resolution(), UiResolution::Sd540);
                 assert!(session.account_token.is_empty());
             }
@@ -6086,16 +6162,16 @@ mod ui_resolution_tests {
         redirect_candidates_for_test(Some(vec![dir.join("auth.json")]));
         let path = dir.join("auth.language.json");
         for (body, language, resolution) in [
-            (r#"{"version":1,"language":"be","ui_resolution":"8k"}"#, plx_platform::i18n::Preference::Be, UiResolution::Auto),
-            (r#"{"version":1,"language":"be","ui_resolution":"1080p"}"#, plx_platform::i18n::Preference::Be, UiResolution::Auto),
-            (r#"{"version":1,"language":"be"}"#, plx_platform::i18n::Preference::Be, UiResolution::Auto),
-            (r#"{"version":1,"language":"be","ui_resolution":"720p"}"#, plx_platform::i18n::Preference::Be, UiResolution::Hd720),
+            (r#"{"version":1,"language":"be","ui_resolution":"8k"}"#, plx_os::i18n::Preference::Be, UiResolution::Auto),
+            (r#"{"version":1,"language":"be","ui_resolution":"1080p"}"#, plx_os::i18n::Preference::Be, UiResolution::Auto),
+            (r#"{"version":1,"language":"be"}"#, plx_os::i18n::Preference::Be, UiResolution::Auto),
+            (r#"{"version":1,"language":"be","ui_resolution":"720p"}"#, plx_os::i18n::Preference::Be, UiResolution::Hd720),
         ] {
             std::fs::write(&path, body).unwrap();
             let loaded = install_preferences::load();
             assert_eq!(loaded, Some(Retained { language, ui_resolution: resolution }), "{body}");
         }
-        assert!(install_preferences::save(Retained { language: plx_platform::i18n::Preference::Be, ui_resolution: UiResolution::Auto }));
+        assert!(install_preferences::save(Retained { language: plx_os::i18n::Preference::Be, ui_resolution: UiResolution::Auto }));
         assert!(!std::fs::read_to_string(&path).unwrap().contains("ui_resolution"), "Automatic is not written");
         redirect_candidates_for_test(None);
         let _ = std::fs::remove_dir_all(&dir);
@@ -6315,7 +6391,7 @@ mod server_key_pin_tests {
         let _serial = plx_base::testlock::serial();
         let key = keypin::key_of("session-signed-in.invalid", 32400);
         let _scoped = keypin::Scoped::watch_machine("m-session-live", &key);
-        let language = plx_platform::i18n::Preference::En;
+        let language = plx_os::i18n::Preference::En;
         let live = || Cached::Settled(std::sync::Arc::new(ReadState::Ready {
             session: std::sync::Arc::new(Session::default()), plaintext: false, retry_canonical: false,
         }));
@@ -6483,17 +6559,17 @@ mod server_key_pin_tests {
 
     // ---- S2a: a refusal is learned from a facet-clean proof, counted, and applied at the threshold ----
 
-    fn dts6() -> plx_platform::devcaps::Facet {
-        plx_platform::devcaps::Facet::Audio { codec: "dca".into(), channels: 6 }
+    fn dts6() -> plx_os::devcaps::Facet {
+        plx_os::devcaps::Facet::Audio { codec: "dca".into(), channels: 6 }
     }
 
-    fn opus6() -> plx_platform::devcaps::Facet {
-        plx_platform::devcaps::Facet::Audio { codec: "opus".into(), channels: 6 }
+    fn opus6() -> plx_os::devcaps::Facet {
+        plx_os::devcaps::Facet::Audio { codec: "opus".into(), channels: 6 }
     }
 
     /// This thread's set: names its firmware and build, so it can record a refusal.
-    fn firmware_build(build: &str) -> plx_platform::devcaps::CapsGuard {
-        plx_platform::devcaps::firmware_on_this_thread_for_test("fw", build, plx_platform::devcaps::Caps::assumed())
+    fn firmware_build(build: &str) -> plx_os::devcaps::CapsGuard {
+        plx_os::devcaps::firmware_on_this_thread_for_test("fw", build, plx_os::devcaps::Caps::assumed())
     }
 
     fn row(codec: &str, channels: u32, build: &str, proofs: Option<u32>) -> NativeAudioRefusal {
@@ -6568,8 +6644,8 @@ mod server_key_pin_tests {
     }
 
     /// A set that announces Opus 5.1, so a recorded Opus refusal WOULD move `caps()` if anything wrote it.
-    fn opus_announcing_caps() -> plx_platform::devcaps::Caps {
-        plx_platform::devcaps::Caps { audio: "aac,ac3,eac3,opus".into(), ..plx_platform::devcaps::Caps::assumed() }
+    fn opus_announcing_caps() -> plx_os::devcaps::Caps {
+        plx_os::devcaps::Caps { audio: "aac,ac3,eac3,opus".into(), ..plx_os::devcaps::Caps::assumed() }
     }
 
     /// `devcaps` is write-once (#1047): a recorded refusal lands in the install's record and moves
@@ -6579,15 +6655,15 @@ mod server_key_pin_tests {
     fn caps_is_one_arc_across_a_recorded_refusal() {
         let _serial = plx_base::testlock::serial();
         let _session = test_support::TempSession::new("refusal-one-arc");
-        let _fw = plx_platform::devcaps::firmware_on_this_thread_for_test("fw", "B", opus_announcing_caps());
+        let _fw = plx_os::devcaps::firmware_on_this_thread_for_test("fw", "B", opus_announcing_caps());
         save(&test_support::signed_in());
-        let before = plx_platform::devcaps::caps();
+        let before = plx_os::devcaps::caps();
         assert!(before.audio_supports("opus", 6), "sanity: the set announces Opus 5.1");
         assert!(record_named_refusal(&opus6()));
         plx_base::storage_worker::drain_for_test();
         save(&peek());
         assert_eq!(peek().native_audio_refused().len(), 1, "the row is stored");
-        let after = plx_platform::devcaps::caps();
+        let after = plx_os::devcaps::caps();
         assert!(std::sync::Arc::ptr_eq(&before, &after), "the stored row moved caps(): opus ceiling {:?} -> {:?}", before.audio_channels.get("opus"), after.audio_channels.get("opus"));
     }
 
@@ -6642,7 +6718,7 @@ mod server_key_pin_tests {
             row("dts", 6, "B", Some(LEARNED_REFUSAL_PROOFS)),
             row("flac", 6, "B", Some(1)),
         ];
-        let refusal = |codec: &str| plx_platform::devcaps::Refusal { codec: codec.into(), channels: 6, build: "B".into() };
+        let refusal = |codec: &str| plx_os::devcaps::Refusal { codec: codec.into(), channels: 6, build: "B".into() };
         assert_eq!(session.applied_refusals(), [refusal("opus"), refusal("dts")]);
         assert!(Session::default().applied_refusals().is_empty());
     }
@@ -6651,7 +6727,7 @@ mod server_key_pin_tests {
     /// remove the whole codec. A named refusal keeps the unguarded behaviour.
     #[test]
     fn a_proof_of_unknown_width_is_not_stored() {
-        let unknown = plx_platform::devcaps::Facet::Audio { codec: "dts".into(), channels: 0 };
+        let unknown = plx_os::devcaps::Facet::Audio { codec: "dts".into(), channels: 0 };
         assert_eq!(NativeAudioRefusal::of_facet(&unknown, "fw", "B", Some(1)), None);
         assert!(NativeAudioRefusal::of_facet(&unknown, "fw", "B", None).is_some());
     }
@@ -6660,7 +6736,7 @@ mod server_key_pin_tests {
     /// attempt's alone, so the next play retries the raster once.
     #[test]
     fn a_video_facet_is_never_stored() {
-        let video = plx_platform::devcaps::Facet::Video { codec: "h264".into(), width: 3840, height: 2160 };
+        let video = plx_os::devcaps::Facet::Video { codec: "h264".into(), width: 3840, height: 2160 };
         assert_eq!(NativeAudioRefusal::of_facet(&video, "fw", "b", Some(1)), None);
         assert_eq!(NativeAudioRefusal::of_facet(&video, "fw", "b", None), None);
     }
@@ -6789,5 +6865,40 @@ mod server_key_pin_tests {
         plx_base::storage_worker::drain_for_test();
         let _ = peek();
         assert_eq!(plx_net::net::keypin::pin_for_test(&key), None, "the late probe did not repopulate it");
+    }
+}
+
+#[cfg(test)]
+mod screen_input_revision_tests {
+    use super::*;
+    #[test]
+    fn screen_input_revision_observes_cleared_defaults_without_a_visible_generation_change() {
+        let _serial = plx_base::testlock::serial();
+        let _session = test_support::TempSession::new("screen-revision-defaults");
+        install_cleared_for_test(UiResolution::Auto);
+        let before = screen_input_revision();
+        let visible = visible_generation();
+        install_cleared_for_test(UiResolution::Hd720);
+        assert_ne!(screen_input_revision().0, before.0);
+        assert_eq!(visible_generation(), visible);
+        assert_eq!(peek_settled().unwrap().ui_resolution(), UiResolution::Hd720);
+    }
+    #[test]
+    fn screen_input_revision_waits_for_the_cache_publication_lock() {
+        let _serial = plx_base::testlock::serial();
+        let _session = test_support::TempSession::new("screen-revision-lock");
+        let expected = screen_input_revision();
+        let cache = CACHE.lock().unwrap();
+        let (started, start) = std::sync::mpsc::channel();
+        let (answer, result) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            answer.send(screen_input_revision()).unwrap();
+        });
+        start.recv().unwrap();
+        assert!(matches!(result.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        drop(cache);
+        assert_eq!(result.recv_timeout(std::time::Duration::from_secs(2)).unwrap(), expected);
+        reader.join().unwrap();
     }
 }

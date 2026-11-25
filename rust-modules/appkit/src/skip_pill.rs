@@ -52,16 +52,16 @@ impl Prompt {
     /// end): Skip intro / Skip credits, for the manual pill and the Automatic prompt alike.
     pub fn label(&self) -> &'static str {
         match self.kind {
-            MarkerKind::Intro => plx_platform::i18n::msg::widgets_skip_intro(),
-            MarkerKind::Credits => plx_platform::i18n::msg::widgets_skip_credits(),
+            MarkerKind::Intro => plx_os::i18n::msg::widgets_skip_intro(),
+            MarkerKind::Credits => plx_os::i18n::msg::widgets_skip_credits(),
         }
     }
     /// The Automatic prompt's unfilled button, which cancels the countdown: Watch intro / Watch credits.
     /// Item 0 of the row, to the left of the filled action ([`crate::up_next::BTN_CREDITS`]).
     pub fn watch_label(&self) -> &'static str {
         match self.kind {
-            MarkerKind::Intro => plx_platform::i18n::msg::widgets_watch_intro(),
-            MarkerKind::Credits => plx_platform::i18n::msg::widgets_next_credits(),
+            MarkerKind::Intro => plx_os::i18n::msg::widgets_watch_intro(),
+            MarkerKind::Credits => plx_os::i18n::msg::widgets_next_credits(),
         }
     }
 }
@@ -94,13 +94,13 @@ pub fn prompt_for(m: metadata::Marker) -> Prompt {
 /// unfilled Watch button (item 0) cancels, the FILLED Skip (item 1) carries the countdown sweep and is what
 /// the clock performs, so pressing it acts now; `btn` says which one holds the ring.
 #[allow(clippy::too_many_arguments)]
-pub fn draw_at(row: &crate::player_hud::motion::HudMotion, p: Painter, pr: Prompt, slot: Rect, watch: Option<Rect>, focused: bool, btn: c_int, progress: Option<f32>) {
+pub fn draw_at(row: &crate::player_hud::motion::HudMotion, p: Painter, pr: Prompt, slot: Rect, watch: Option<Rect>, focused: bool, btn: c_int, progress: Option<f32>, press: plx_machine::machine::PressRead<u32>) {
     let Ok(label) = CString::new(pr.label()) else {
         return;
     };
     // No leading icon: the label alone carries it, and a chevron on a control that does not
     // navigate anywhere was reading as "more" rather than "skip".
-    let (pop, ring) = if pr.automatic { (row.scale(crate::up_next::BTN_NEXT), focused && btn == crate::up_next::BTN_NEXT) } else { (row.scale(0), focused) };
+    let (pop, ring) = if pr.automatic { (row.scale(crate::up_next::BTN_NEXT, press), focused && btn == crate::up_next::BTN_NEXT) } else { (row.scale(0, press), focused) };
     // It stands in the transport discs' own slot, over the video plane and on the HUD's ramp,
     // so it wears their ground as well as their pop — see `ControlGround`.
     let button = Button::new(label.as_ptr(), theme::size::BODY, slot).scale(pop).focused(ring).ground(ControlGround::Unkeyed);
@@ -108,7 +108,7 @@ pub fn draw_at(row: &crate::player_hud::motion::HudMotion, p: Painter, pr: Promp
     button.draw(&Env::inert(), p);
     if let (true, Some(watch), Ok(cancel)) = (pr.automatic, watch, CString::new(pr.watch_label())) {
         Button::new(cancel.as_ptr(), theme::size::BODY, watch)
-            .scale(row.scale(crate::up_next::BTN_CREDITS))
+            .scale(row.scale(crate::up_next::BTN_CREDITS, press))
             .focused(focused && btn == crate::up_next::BTN_CREDITS)
             .ground(ControlGround::Unkeyed)
             .draw(&Env::inert(), p);
@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn the_automatic_prompt_draws_watch_beside_the_filled_skip_and_the_manual_one_the_pill_alone() {
         let _serial = plx_base::testlock::serial();
-        let _en = plx_platform::i18n::language_on_this_thread_for_test(plx_platform::i18n::Preference::En);
+        let _en = plx_os::i18n::language_on_this_thread_for_test(plx_os::i18n::Preference::En);
         let row = crate::player_hud::motion::HudMotion::new();
         let (watch, skip) = (Rect::new(900.0, 800.0, 200.0, 64.0), Rect::new(1116.0, 800.0, 232.0, 64.0));
         for (kind, filled, cancel) in [(MarkerKind::Intro, "Skip Intro", "Watch Intro"), (MarkerKind::Credits, "Skip Credits", "Watch Credits")] {
@@ -137,7 +137,7 @@ mod tests {
                 let mut runs = Vec::new();
                 plx_ui::record_walk(|| plx_ui::draw_census::capture(|| {
                     runs = plx_ui::draw_census::capture_runs(|| {
-                        draw_at(&row, Painter::root(), prompt, skip, automatic.then_some(watch), true, crate::up_next::BTN_NEXT, automatic.then_some(0.4));
+                        draw_at(&row, Painter::root(), prompt, skip, automatic.then_some(watch), true, crate::up_next::BTN_NEXT, automatic.then_some(0.4), Default::default());
                     });
                 }));
                 runs

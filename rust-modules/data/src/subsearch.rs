@@ -346,7 +346,7 @@ impl SubSearchState {
         if let Some(mail) = mail {
             // every landing repaints, the failure branch included — a spinner already answered
             // must not wait for the next keypress
-            plx_machine::idle::invalidate();
+
             if mail.gen == self.generation { changed |= self.apply(mail.what); }
         }
         // A launch the runner refused freed its claim in the call that refused it, and said so:
@@ -610,6 +610,8 @@ fn run_job(client: &'static Client, rk: &str, work: Work) -> Landing {
 }
 
 /// The item's subtitle streams across every Media/Part, or `None` when the read failed.
+/// Not `Client::metadata_background`: this read follows the viewer's own subtitle write, and whether a
+/// skipped refresh could hide the stream that write just installed has not been measured.
 fn subtitle_rows(client: &Client, rk: &str) -> Option<Vec<StreamRow>> {
     let item = client.metadata(rk)?;
     Some(item.media.iter().flat_map(|m| &m.part).flat_map(|p| &p.stream)

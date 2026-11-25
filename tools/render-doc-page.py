@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render one of docs/{install-and-verify,troubleshooting,nightly-builds}.md into a standalone HTML page
+"""Render one of docs/{install-and-verify,troubleshooting,nightly-builds,samsung-nightly}.md into a standalone HTML page
 for plxnative.com, wrapped in the site's own header/footer and styled with site/styles.css.
 
 Used by `.github/workflows/pages.yml` ("Stage _site") and locally:
@@ -22,7 +22,7 @@ Mode expires" is linked from README.md as "#important-developer-mode-expires", a
 "### Option A — install PlxNative directly" is linked internally as
 "#option-a--install-plxnative-directly", double hyphen and all, where the em dash used to be).
 
-Link rewriting: install-and-verify.md, troubleshooting.md and nightly-builds.md are the only docs
+Link rewriting: The guides in PAGES are the only docs
 rendered as site pages (see PAGES below), so a relative link from one to another becomes a site path,
 fragment kept. Every other repo-relative link — a link to README.md, to a sibling doc that isn't
 rendered (native-video-sandbox.md), to an image — becomes an absolute GitHub blob URL, since
@@ -48,7 +48,7 @@ except ImportError:  # pragma: no cover - operator-facing message, not exercised
         "    pip install -r tools/requirements-docs.txt"
     )
 
-REPO = "GLinnik21/plx-native"
+REPO = "plxnative/plx-native"
 GITHUB_BLOB = f"https://github.com/{REPO}/blob/main"
 SITE_ORIGIN = "https://plxnative.com"
 
@@ -62,6 +62,12 @@ REPO_ROOT = SCRIPT_DIR.parent
 
 # The only docs rendered as site pages. Adding another page means adding it here.
 PAGES = {
+    "samsung-nightly.md": {
+        "route": "/nightly/samsung/",
+        "title": "PlxNative for Samsung TVs: SUPER ALPHA Nightly",
+        "name": "Samsung nightly",
+        "description": "Install the PlxNative Tizen nightly with Apps2Samsung and capture a log.",
+    },
     "install-and-verify.md": {
         "route": "/install/",
         "title": "Install Plex on LG webOS TV: Unofficial PlxNative App, No Root",
@@ -249,7 +255,7 @@ PAGE_TEMPLATE = """<!doctype html>
               <a href="{root}#faq">FAQ</a>
             </nav>
             <div class="header-actions">
-              <a class="header-github" href="https://github.com/GLinnik21/plx-native" aria-label="PlxNative on GitHub">
+              <a class="header-github" href="https://github.com/plxnative/plx-native" aria-label="PlxNative on GitHub">
                 <svg class="gh-icon" viewBox="0 0 24 24" width="21" height="21" fill="currentColor" aria-hidden="true"><path d="M12 1.5a10.5 10.5 0 0 0-3.32 20.46c.53.1.72-.23.72-.5v-1.76c-2.92.64-3.54-1.4-3.54-1.4-.48-1.22-1.17-1.55-1.17-1.55-.95-.65.07-.64.07-.64 1.06.08 1.61 1.09 1.61 1.09.94 1.6 2.46 1.14 3.06.87.1-.68.37-1.14.67-1.4-2.33-.27-4.78-1.17-4.78-5.2 0-1.15.41-2.09 1.08-2.83-.11-.27-.47-1.34.1-2.79 0 0 .88-.28 2.88 1.08a9.98 9.98 0 0 1 5.24 0c2-1.36 2.88-1.08 2.88-1.08.57 1.45.21 2.52.1 2.79.67.74 1.08 1.68 1.08 2.83 0 4.04-2.46 4.93-4.8 5.19.38.33.72.97.72 1.96v2.9c0 .28.19.62.73.51A10.5 10.5 0 0 0 12 1.5Z"></path></svg>
               </a>
               <a class="header-kofi" href="https://ko-fi.com/0xbeb" aria-label="Support the project on Ko-fi" title="Support the project on Ko-fi">

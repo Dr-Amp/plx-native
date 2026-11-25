@@ -63,9 +63,9 @@ impl Page {
     }
 
     fn header_row(&self, measure: &dyn plx_machine::machine::Measure) -> std::rc::Rc<HeaderRow> {
-        let key = std::ptr::from_ref(plx_platform::i18n::current()) as usize as u64;
+        let key = std::ptr::from_ref(plx_os::i18n::current()) as usize as u64;
         self.header_rows.get(key, || {
-            let left = vec![HeaderItem { label: plx_platform::i18n::msg::browse_home_live_tv().to_owned(), title: true, ..Default::default() }];
+            let left = vec![HeaderItem { label: plx_os::i18n::msg::browse_home_live_tv().to_owned(), title: true, ..Default::default() }];
             let page = PageHeader::new(PageHeaderSpec { left, ..Default::default() }, &[], measure);
             let layout = page.layout(SCR_W, measure);
             HeaderRow::new(page, layout, Vec::new())
@@ -75,10 +75,10 @@ impl Page {
     fn status_overlay(&self, tick: u32) -> StatusOverlay<'static> {
         match self.status {
             // placeholder-exempt: built here, counted by StatusOverlay's Working draw.
-            LiveTvStatus::Loading => StatusOverlay::new(STATUS_FRAME, plx_platform::i18n::msg::browse_livetv_loading_c(), StatusKind::Working).phase(tick),
-            LiveTvStatus::Empty => StatusOverlay::new(STATUS_FRAME, plx_platform::i18n::msg::browse_livetv_empty_c(), StatusKind::Empty),
-            LiveTvStatus::Failed => StatusOverlay::new(Rect::FULL, plx_platform::i18n::msg::browse_home_failed_c(), StatusKind::Failed)
-                .page(plx_ui::icons::Icon::ServerBadgeMinus).action(plx_platform::i18n::msg::browse_action_retry_c()),
+            LiveTvStatus::Loading => StatusOverlay::new(STATUS_FRAME, plx_os::i18n::msg::browse_livetv_loading_c(), StatusKind::Working).phase(tick),
+            LiveTvStatus::Empty => StatusOverlay::new(STATUS_FRAME, plx_os::i18n::msg::browse_livetv_empty_c(), StatusKind::Empty),
+            LiveTvStatus::Failed => StatusOverlay::new(Rect::FULL, plx_os::i18n::msg::browse_home_failed_c(), StatusKind::Failed)
+                .page(plx_ui::icons::Icon::ServerBadgeMinus).action(plx_os::i18n::msg::browse_action_retry_c()),
             LiveTvStatus::Ready => StatusOverlay::new(STATUS_FRAME, c"", StatusKind::Empty),
         }
     }
@@ -123,7 +123,7 @@ impl<H: LiveTvLike> CardSource<H> for Cards<'_> {
         let mut facts = tile_facts::caption_facts(item);
         facts.title = Some(channel.now.clone());
         captions::label(&captions::live_tv_policy(), &facts,
-            Some(plx_platform::i18n::msg::browse_livetv_channel(&channel.name, &channel.vcn)))
+            Some(plx_os::i18n::msg::browse_livetv_channel(&channel.name, &channel.vcn)))
     }
 }
 
@@ -152,7 +152,7 @@ impl<H: LiveTvLike> StackPage<H> for Page {
             edge: [EdgeRule::Geometric, EdgeRule::Geometric, EdgeRule::Stop, EdgeRule::Stop], extent, len: 1, elem: ElemKind::Bare }
     }
     fn draw_heading(&self, k: Sec, f: &mut DrawFrame<'_, '_, H>, r: Rect, lift: f32) {
-        let title = match k { Sec::Channels => plx_platform::i18n::msg::browse_livetv_channels_c(), Sec::Now => plx_platform::i18n::msg::browse_livetv_on_now_c(), _ => return };
+        let title = match k { Sec::Channels => plx_os::i18n::msg::browse_livetv_channels_c(), Sec::Now => plx_os::i18n::msg::browse_livetv_on_now_c(), _ => return };
         plx_ui::cards::draw_heading_c(f.painter.alpha(f.page_alpha).translate(0.0, r.y), title, c"", c"", MARGIN_X, -lift, 1.0, f.measure);
     }
     fn custom_draw(&self, k: Sec, f: &mut DrawFrame<'_, '_, H>, r: Rect, _scroll: f32) {

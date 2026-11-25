@@ -262,9 +262,9 @@ dependencies = [
 
 [[package]]
 name = "ed25519-compact"
-version = "2.6.0"
+version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1454db4f2edb7f0e8fe0c5b375b0c978fc63244cc9f010d160e417eb10139aa8"
+checksum = "9547879431a90e352a35863a54416d92898a787b9af09e6ae2e09a96bd78be80"
 
 [[package]]
 name = "either"
@@ -766,7 +766,7 @@ dependencies = [
  "plx_gfx",
  "plx_machine",
  "plx_media",
- "plx_platform",
+ "plx_os",
  "plx_plex",
  "plx_telemetry",
  "plx_ui",
@@ -790,7 +790,7 @@ dependencies = [
  "plx_data",
  "plx_machine",
  "plx_net",
- "plx_platform",
+ "plx_os",
  "plx_playback_contract",
  "plx_plex",
  "plx_telemetry",
@@ -829,7 +829,7 @@ dependencies = [
  "plx_media",
  "plx_media_codecs",
  "plx_net",
- "plx_platform",
+ "plx_os",
  "plx_play_feed",
  "plx_playback_contract",
  "plx_plex",
@@ -861,7 +861,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "plx_platform"
+name = "plx_os"
 version = "0.0.0"
 dependencies = [
  "icu_calendar",
@@ -878,6 +878,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "plx_owp"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "plx_platform_desktop"
+version = "0.0.0"
+dependencies = [
+ "plx_base",
+ "plx_media",
+ "plx_os",
+ "plxnative-modules",
+]
+
+[[package]]
+name = "plx_platform_tizen"
+version = "0.0.0"
+dependencies = [
+ "plx_base",
+ "plx_data",
+ "plx_media",
+ "plx_os",
+ "plx_playback_contract",
+ "plx_plex",
+ "plxnative-modules",
+ "serde_json",
+]
+
+[[package]]
+name = "plx_platform_webos"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "plx_base",
+ "plx_gfx",
+ "plx_os",
+ "plx_shell_sdl",
+ "plx_telemetry",
+ "plxnative-modules",
+ "serde_json",
+]
+
+[[package]]
 name = "plx_play_feed"
 version = "0.0.0"
 dependencies = [
@@ -886,7 +932,7 @@ dependencies = [
  "plx_base",
  "plx_media_codecs",
  "plx_net",
- "plx_platform",
+ "plx_os",
  "plx_playback_contract",
  "serde",
  "serde_json",
@@ -897,7 +943,7 @@ name = "plx_play_uri"
 version = "0.0.0"
 dependencies = [
  "plx_base",
- "plx_platform",
+ "plx_os",
  "plx_play_uri",
  "plx_playback_contract",
  "serde",
@@ -920,7 +966,7 @@ dependencies = [
  "plx_base",
  "plx_machine",
  "plx_net",
- "plx_platform",
+ "plx_os",
  "serde",
  "serde_json",
 ]
@@ -937,7 +983,7 @@ dependencies = [
  "plx_machine",
  "plx_media",
  "plx_net",
- "plx_platform",
+ "plx_os",
  "plx_play_feed",
  "plx_plex",
  "plx_screens",
@@ -955,12 +1001,19 @@ dependencies = [
  "plx_base",
  "plx_machine",
  "plx_net",
- "plx_platform",
+ "plx_os",
  "plx_plex",
  "plx_session",
  "plx_telemetry",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "plx_shell_sdl"
+version = "0.0.0"
+dependencies = [
+ "plx_base",
 ]
 
 [[package]]
@@ -970,7 +1023,7 @@ dependencies = [
  "libc",
  "plx_base",
  "plx_net",
- "plx_platform",
+ "plx_os",
  "plx_plex",
  "serde",
  "serde_json",
@@ -984,7 +1037,7 @@ dependencies = [
  "plx_base",
  "plx_gfx",
  "plx_machine",
- "plx_platform",
+ "plx_os",
  "qrcodegen",
  "serde",
  "serde_json",
@@ -992,7 +1045,7 @@ dependencies = [
 
 [[package]]
 name = "plxnative-modules"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "image",
  "libc",
@@ -1004,13 +1057,14 @@ dependencies = [
  "plx_media",
  "plx_media_codecs",
  "plx_net",
- "plx_platform",
+ "plx_os",
  "plx_play_feed",
  "plx_play_uri",
  "plx_playback_contract",
  "plx_plex",
  "plx_screens",
  "plx_session",
+ "plx_shell_sdl",
  "plx_telemetry",
  "plx_ui",
  "serde",

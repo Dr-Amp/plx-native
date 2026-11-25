@@ -8,6 +8,7 @@ mod state;
 mod time;
 pub use time::MediaTimeMs;
 pub mod adaptive;
+pub mod clock_debt;
 pub mod subtitle;
 pub mod readout;
 pub mod tracks;
@@ -16,6 +17,8 @@ pub mod playurl;
 pub use uri::UriDriver;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+pub mod uri_conformance;
 #[cfg(any(test, feature = "test-support"))]
 pub mod feed_fake;
 pub mod video;
@@ -68,7 +71,12 @@ impl AttemptId {
 /// One dispatched operation. This is distinct from a backend's bus or firmware request ID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CommandId(u64);
-impl CommandId { pub const fn get(self) -> u64 { self.0 } }
+impl CommandId {
+    pub const fn get(self) -> u64 { self.0 }
+    /// A command identity minted by a test: in production only the runner issues them.
+    #[cfg(any(test, feature = "test-support"))]
+    pub const fn for_test(value: u64) -> Self { Self(value) }
+}
 
 /// Milliseconds in the content timeline, after a backend has normalized any native clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

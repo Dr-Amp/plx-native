@@ -112,7 +112,7 @@ pub(super) fn focus_first_poster(w: &mut World, surface: &str) {
 fn the_library_grid_opens_the_band_its_setting_asks_for() {
     let mut w = World::movies_library("band-grid", false);
     let _cell = Cell::default();
-    w.bridge.stores.browse.borrow_mut().seed_items_for_test(120);
+    w.bridge.bridge().stores.browse.borrow_mut().seed_items_for_test(120);
     w.frames(30);
     assert_eq!(w.grid_cell(), Some((0, 0)), "premise: the library opens on its first poster");
     grade_grid_bands(&mut w, "Library");
@@ -204,7 +204,7 @@ fn home_opens_the_band_its_setting_asks_for() {
 #[test]
 fn recommended_opens_the_band_its_setting_asks_for() {
     let mut w = World::recommended_pending("band-recommended");
-    w.bridge.stores.browse.borrow_mut().seed_named_shelves_for_test(
+    w.bridge.bridge().stores.browse.borrow_mut().seed_named_shelves_for_test(
         0, &[("hub.movie.recent", "", "Recently Added"), ("hub.movie.top", "", "Top Rated")], 3);
     w.frames(60);
     grade_shelf_bands(&mut w, "Recommended", "Recently Added", "Top Rated");
@@ -270,7 +270,7 @@ fn search_opens_the_band_its_setting_asks_for() {
 /// The person page's filmography: the Movies shelf is the focused one, the Shows shelf below it.
 #[test]
 fn the_filmography_opens_the_band_its_setting_asks_for() {
-    use plx_platform::i18n::msg;
+    use plx_os::i18n::msg;
     let sid = plx_plex::plex::ServerId::UNSET;
     let show = plx_data::pms::PmsMovie { kind: 1, ..member(sid, "s1") };
     let mut w = World::person_page("band-person", vec![member(sid, "m1"), member(sid, "m2")], vec![show], &["", ""]);
@@ -311,7 +311,7 @@ fn detail_names_an_untitled_season_zero_and_an_unnumbered_episode_by_their_ident
         seen.extend(w.drawn().words.into_iter().map(|(text, _)| text));
         w.press(super::Key::Down);
     }
-    let kind = plx_platform::i18n::msg::browse_kind_episode().to_uppercase();
+    let kind = plx_os::i18n::msg::browse_kind_episode().to_uppercase();
     let has = |text: &str| seen.iter().any(|seen| seen == text);
     assert!(has("Specials"), "the untitled season 0's tab reads its identity: {seen:?}");
     assert!(!has("Season 0"), "never Season 0: {seen:?}");

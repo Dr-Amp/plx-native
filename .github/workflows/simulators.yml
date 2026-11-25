@@ -188,10 +188,28 @@ jobs:
         uses: ./.github/actions/deps-cache
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          workspaces: rust-modules -> target-sim-ci
+          workspaces: |
+            rust-modules -> target-sim-ci
+            rust-modules -> target-sim-ci-macapp
           key: simulator-macos
       - name: Build native macOS simulator
         run: make sim-macos SIM_TDIR=rust-modules/target-sim-ci
+      - name: Link the macOS app's feature set
+        # What `make macapp` ships: `--no-default-features --features sim,play-feed` (the
+        # release build in `ci/mkmacapp.py`, linked here in DEBUG: the harder case for the reliance
+        # below, and cheaper than a release build). The simulator is the binary of the desktop platform
+        # crate (`plx_platform_desktop`), which depends on no television code: the Wayland and
+        # SDL-private externs, `webos` and `keymanager` are `plx_platform_webos`'s, which no desktop crate
+        # names (`ci/check-module-layers.py` holds that edge). This link is what proves it from the other
+        # side: a change that made the desktop reach one fails here on libwayland, glib or luna-service2,
+        # which the default-features build above may not show. It has its own target dir because cargo does
+        # not hash its output: in `target-sim-ci` it would overwrite the binary the steps below run.
+        # The host FFmpeg and libass it links were staged by the step above.
+        run: |
+          CARGO_INCREMENTAL=0 cargo "+$(make -s print-rust-toolchain)" build \
+            --manifest-path rust-modules/Cargo.toml \
+            --target-dir rust-modules/target-sim-ci-macapp \
+            --no-default-features --features sim,play-feed -p plx_platform_desktop --bin plxnative-sim
       - name: Replay all committed product recordings
         # 960x540, not the driver's 1920x1080 default. The runner has no GPU (the log says `GL:
         # Apple Software Renderer`), so a replay is CPU-bound in the rasteriser and costs what the
@@ -213,6 +231,7 @@ jobs:
           path: |
             ${{ runner.temp }}/plxnative-replay/**/plxnative-events.log
             ${{ runner.temp }}/plxnative-replay/**/sim.out
+            ${{ runner.temp }}/plxnative-replay/**/process.json
           if-no-files-found: ignore
           retention-days: 7
       - name: Launch and capture 1080p frame

@@ -45,7 +45,9 @@ const RELEASE_PREFIX: &str = "plxnative@";
 static RELEASE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
 /// Record the release string every outbound report carries (Sentry `release`, the SDK and client
-/// version, the usage context's `app_version`).
+/// version, the usage context's `app_version`). The one exception to `release` is a crash-log
+/// record left by another build than this one, which `crashreport::stamp_release` files under no
+/// release rather than this one.
 ///
 /// **The application hands it in**: `PLX_VERSION` is published by the application's build script, a
 /// `cargo:rustc-env` reaches that one crate only, and the rule that derives it is written once
@@ -232,15 +234,31 @@ pub fn forget() {
 }
 
 /// Called after the shared account tombstone (`plex::session::clear`'s canonical commit) is
-/// confirmed durable. On ARM, `persistence::forget_at` deliberately leaves telemetry/consent's own
-/// legacy files in place when a decision is cleared, relying on this sweep to run once the ONE
-/// atomic DB8 revocation for both domains — session and telemetry/consent — is confirmed rather
-/// than merely queued. Ported from `release/v0.6`'s `telemetry::cleanup_after_account_clear` /
-/// `persistence::cleanup_after_combined_clear`, which the 0.7 forward-port dropped along with
-/// their only caller (Copilot review on PR #105, finding 7).
-#[cfg(all(target_os = "linux", target_arch = "arm", not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
+/// confirmed durable. Where the platform's storage authority is the helper
+/// ([`plx_os::tv::authority::Authority::Helper`], a webOS television), `persistence::forget_at`
+/// deliberately leaves telemetry/consent's own legacy files in place when a decision is cleared,
+/// relying on this sweep to run once the ONE atomic DB8 revocation for both domains — session and
+/// telemetry/consent — is confirmed rather than merely queued. With files
+/// ([`plx_os::tv::authority::Authority::Files`]) `forget_at` already removed them inline, so there is
+/// nothing left to retire and this answers `true`. Ported from `release/v0.6`'s
+/// `telemetry::cleanup_after_account_clear` / `persistence::cleanup_after_combined_clear`, which the
+/// 0.7 forward-port dropped along with their only caller (Copilot review on PR #105, finding 7).
 pub fn cleanup_after_account_clear() -> bool {
-    persistence::cleanup_after_combined_clear(&candidates()) != persistence::CleanupResult::Failed
+    account_clear_sweep(plx_os::tv::authority::authority(), candidates)
+}
+
+/// [`cleanup_after_account_clear`] with the platform's authority handed in. `legacy` is called only
+/// by the helper arm, so the files arm reads no path.
+fn account_clear_sweep(
+    authority: plx_os::tv::authority::Authority,
+    legacy: impl FnOnce() -> Vec<std::path::PathBuf>,
+) -> bool {
+    match authority {
+        plx_os::tv::authority::Authority::Helper => {
+            persistence::cleanup_after_combined_clear(&legacy()) != persistence::CleanupResult::Failed
+        }
+        plx_os::tv::authority::Authority::Files => true,
+    }
 }
 
 // ---- the spool, and the one worker that drains it ---------------------------------------------
@@ -294,7 +312,7 @@ pub fn flush_soon() {
     let ok = plx_base::task::spawn_small("telemetry", move || {
         let retry = flush_now(&c, decision_revision);
         FLUSHING.store(false, Ordering::Release);
-        if AGAIN.load(Ordering::Acquire) {
+        if worker_tail_reruns(&AGAIN, decision_revision, consent::revision) {
             flush_soon();
         }
         if let Some(seconds) = retry {
@@ -316,6 +334,24 @@ pub fn flush_soon() {
     if !ok {
         FLUSHING.store(false, Ordering::Release);
     }
+}
+
+/// Whether a finishing worker must look again: a flush was asked for while it ran (`again`), or
+/// the decision it ran with is no longer the installed one. Pure, so the interleaving is testable
+/// as data.
+fn rerun_after_flush(again: bool, ran_revision: u32, installed_revision: u32) -> bool {
+    again || ran_revision != installed_revision
+}
+
+/// The worker tail's whole decision: read the request flag, THEN the installed revision, so a
+/// decision installed after the snapshot is seen. The worker calls this and nothing else, which is
+/// what lets a test pin the call site rather than only [`rerun_after_flush`].
+fn worker_tail_reruns(
+    again: &std::sync::atomic::AtomicBool,
+    ran_revision: u32,
+    installed: impl Fn() -> u32,
+) -> bool {
+    rerun_after_flush(again.load(std::sync::atomic::Ordering::Acquire), ran_revision, installed())
 }
 
 /// The flush itself, on the worker.
@@ -444,6 +480,26 @@ pub fn is_minted_id(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Thread A snapshots revision 1, then thread B installs revision 2 and raises AGAIN while A
+    /// still holds FLUSHING; A then clears AGAIN and spawns with the stale revision 1. At the
+    /// worker's tail AGAIN reads false, yet the installed decision is newer than the one it ran
+    /// with, and `process_records` sent nothing for it: the tail must run another flush.
+    #[test]
+    fn a_decision_installed_after_the_snapshot_is_not_lost_at_the_worker_tail() {
+        assert!(
+            super::rerun_after_flush(false, 1, 2),
+            "AGAIN was cleared by the winner after the new decision raised it; the stale worker must still rerun"
+        );
+        assert!(super::rerun_after_flush(true, 2, 2), "an explicit request still reruns");
+        assert!(!super::rerun_after_flush(false, 2, 2), "nothing new: stop");
+        // The tail function the worker really calls, with a flag that is never raised.
+        let again = std::sync::atomic::AtomicBool::new(false);
+        assert!(super::worker_tail_reruns(&again, 1, || 2), "tail: a newer decision reruns");
+        assert!(!super::worker_tail_reruns(&again, 2, || 2), "tail: nothing new stops");
+        again.store(true, std::sync::atomic::Ordering::Release);
+        assert!(super::worker_tail_reruns(&again, 2, || 2), "tail: a request reruns");
+    }
 
     #[test]
     fn a_held_destination_does_not_block_the_other_destination() {
@@ -753,5 +809,29 @@ mod tests {
             serde_json::from_slice(br#"{"asked_version":1,"usage":true,"a_field_from_later":7}"#)
                 .expect("a file with more fields still parses");
         assert!(newer.usage);
+    }
+
+    /// The sweep after a durable account clear belongs to the helper authority alone: it retires
+    /// every legacy candidate there, and with files it answers `true` without reading a path, because
+    /// `forget_at` already removed them inline. The webOS answer and the one Tizen gets, side by side.
+    #[test]
+    fn the_account_clear_sweep_retires_legacy_files_only_where_the_helper_defers_it() {
+        use plx_os::tv::authority::Authority;
+        let dir = std::env::temp_dir().join(format!("plxnative-account-clear-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let candidate = dir.join("telemetry.json");
+        std::fs::write(&candidate, b"{}").unwrap();
+
+        assert!(
+            account_clear_sweep(Authority::Files, || panic!("the files authority reads no candidate")),
+            "files: nothing deferred, nothing to retire"
+        );
+        assert!(candidate.exists(), "files: the sweep touched nothing");
+
+        assert!(account_clear_sweep(Authority::Helper, || vec![candidate.clone()]));
+        assert!(!candidate.exists(), "helper: the deferred legacy candidate is retired");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

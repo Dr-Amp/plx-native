@@ -1,6 +1,6 @@
 //! The application's clock (restructure spec §4.1): ONE door to frame time, so a replay can drive
 //! the loop on recorded ticks. `today()` is the same door for the calendar date: the ONE place the
-//! application asks the platform what day it is (`plx_platform::i18n::local_calendar_today`), once a
+//! application asks the platform what day it is (`plx_os::i18n::local_calendar_today`), once a
 //! minute. Its one caller is the LOOP, which publishes the answer once per iteration
 //! (`run::publish_frame` -> `Bridge::publish_today`); a screen that words a date ("Today",
 //! "Yesterday") RECEIVES it as `AppViews::today` (`LibraryLike::today`) and reads no clock, the way
@@ -49,6 +49,7 @@ pub(crate) const REPLAY_DATE: [i32; 3] = [2026, 1, 1];
 
 /// Milliseconds since SDL init — or, under a replay, the recorded tick of the frame in flight.
 pub(crate) fn now() -> u32 {
+    plx_base::step::assert_io_allowed("app::clock::now");
     if let Some(ms) = REPLAY.with(|c| c.get()) {
         return ms;
     }
@@ -68,6 +69,7 @@ pub(crate) fn set_replay(ms: u32) {
 /// inventing today's date for a historical frame would make the HUD nondeterministic. The platform
 /// clock is sampled at most every five seconds and advanced with monotonic frame ticks between samples.
 pub(crate) fn unix_ms() -> Option<i64> {
+    plx_base::step::assert_io_allowed("app::clock::unix_ms");
     if REPLAY.with(|c| c.get().is_some()) {
         UNIX.with(|c| c.set(None));
         return None;
@@ -79,7 +81,7 @@ pub(crate) fn unix_ms() -> Option<i64> {
         }
     }
     LOCAL_END.with(|c| c.set(None));
-    let sampled = plx_platform::i18n::unix_timestamp_ms();
+    let sampled = plx_os::i18n::unix_timestamp_ms();
     UNIX.with(|c| c.set(Some((tick, sampled))));
     sampled
 }
@@ -90,7 +92,7 @@ pub(crate) fn local_end_time(seconds: i64) -> Option<[i32; 2]> {
         if let Some((_, local)) = cache.get().filter(|(cached, _)| *cached == seconds) {
             return local;
         }
-        let local = plx_platform::i18n::local_clock_time(seconds);
+        let local = plx_os::i18n::local_clock_time(seconds);
         cache.set(Some((seconds, local)));
         local
     })
@@ -119,6 +121,7 @@ fn advance_unix_ms(sampled_at: u32, sampled: Option<i64>, tick: u32) -> Option<O
 /// into the Bridge's views. A screen or a host impl never calls it: `AppHost::today` returns the
 /// frame's publication.
 pub(crate) fn today() -> Option<[i32; 3]> {
+    plx_base::step::assert_io_allowed("app::clock::today");
     // A recorded Library grid sorted by a date must word the same on every run and on every day.
     if REPLAY.with(|c| c.get()).is_some() {
         return Some(REPLAY_DATE);
@@ -127,13 +130,27 @@ pub(crate) fn today() -> Option<[i32; 3]> {
     if let Some((at, date)) = TODAY.with(|c| c.get()) {
         if at == minute { return date; }
     }
-    let date = plx_platform::i18n::local_calendar_today();
+    let date = plx_os::i18n::local_calendar_today();
     TODAY.with(|c| c.set(Some((minute, date))));
     date
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_machine_cannot_sample_even_the_replay_clock_or_cached_calendar() {
+        super::set_replay(4242);
+        let _allowed = plx_base::task::allow_blocking(const { &plx_base::task::BlockingLabel::new("fixture") });
+        let step = plx_base::step::StepScope::enter();
+        for read in [|| { super::now(); }, || { super::unix_ms(); }, || { super::today(); }] {
+            assert!(std::panic::catch_unwind(read).is_err());
+        }
+        drop(step);
+        assert_eq!(super::now(), 4242);
+        assert_eq!(super::today(), Some(super::REPLAY_DATE));
+        super::REPLAY.with(|c| c.set(None));
+    }
+
     #[test]
     fn a_replay_tick_overrides_the_clock_for_the_thread() {
         super::set_replay(4242);
@@ -161,8 +178,9 @@ mod tests {
         use plx_machine::machine::{EntryId, InputOwner, Tick};
         use plx_screens::registry::LibraryLike;
         use plx_ui::dispatch::CxParts;
-        let mut bridge = Bridge::for_test(|| 0);
-        let parts = CxParts { tick: Tick::default(), press: Default::default(), focus: Default::default(),
+        let mut owner = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut bridge = owner.bridge();
+        let parts = CxParts { modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(), tick: Tick::default(), press: Default::default(), focus: Default::default(),
             owner: InputOwner::Entry(EntryId(0)) };
         // What a screen sees: a `Cx` over the Bridge's views, asked through the Library's host trait.
         let seen = |bridge: &Bridge| {

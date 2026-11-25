@@ -192,8 +192,11 @@ main-thread adapter's existing `textinput::start/stop` operations. Cover and sus
 binding. Both the binding and queued keyboard requests are included in the state hash.
 The owned path normalizes SDL and FIFO commits at ingress, before later edit keys, and uses
 `adopt` (never `start`) for a panel observation. Text recording preserves commit boundaries,
-original timing/source, and the observed panel capability, and replay reuses that observation
-rather than probing its current platform.
+original timing/source, and whether the commit carried the `SystemKeyboard(true)` adoption edge
+(`bridge::text_panel_edge`: the set has a panel and Search owns the text), and replay reuses that
+answer rather than probing its current platform. A commit on any other page records `panel:false`
+even on a set with a panel, so a non-Search recording's `panel:false` does not mean the set has
+none.
 
 **Live cutover is finished.** `AppArg::Search` mounts `screens::search::SearchScreen`
 unconditionally — there is no `AppMounter::search_owned` flag any more, no legacy ingress/lifecycle
@@ -274,7 +277,7 @@ backend is not in the webOS extension API at all — it is inside **LG's Wayland
 `Wayland_CreateDevice` writes four real hooks into `SDL_VideoDevice`
 (`WebOSHasScreenKeyboardSupport`, `Show`, `Hide`, `IsShown`), `SDL_StartTextInput` dispatches to the
 second, and `WebOSShowScreenKeyboard` is a complete `text_model` IME client. Typed text comes back
-as an ordinary **`SDL_TEXTINPUT`** event, so `app.rs`'s existing `SDL_PollEvent` loop already sees
+as an ordinary **`SDL_TEXTINPUT`** event, so the existing `SDL_PollEvent` loop (`plx_shell_sdl::event`) already sees
 it. moonlight-tv 1.5.8 shipped exactly this against the TV's own SDL.
 
 **Linking is the plain `extern "C"` case, not `dynlib!`.** Verified with
@@ -305,17 +308,17 @@ Both halves are checkable on the dev Mac without a television:
   declares `{ type, timestamp, windowID, inputSource /* webOS specific field */, text[] }` — text at
   **+16**.
 
-This is the same class of bug as the `SDL_KeyboardEvent` shift `app.rs` already reads around with
+This is the same class of bug as the `SDL_KeyboardEvent` shift `plx_shell_sdl::event` already reads around with
 raw offsets, and it has the same fix: read the bytes, do not trust the struct. Note the offset is a
-`cfg`, not a constant — under `hostsim` desktop SDL2 is stock and the offset really is +12, so a
-single hard-coded number ships garbage on one of the two platforms.
+platform value, not a constant — desktop SDL2 is stock and the offset really is +12, so a
+single hard-coded number ships garbage on one of the two platforms (`Shell::sdl()` states the `SdlFlavor`; `text_off` maps it).
 
 **2. `SDL_WINDOW_INPUT_FOCUS` is a silent precondition.**
 
 `SDL_StartTextInput` looks for a window carrying `0x200` (`SDL_video.h` in the SDK sysroot's `usr/include/SDL2/`) before
 dispatching to the driver hook. Our window is created with
-`SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN` and nothing else — `app.rs`'s `SDL_WINDOW_FLAGS` is
-`0x2 | 0x1` on the device — so it carries neither `SHOWN` nor a focus flag at creation. **If the flag
+`SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN` and nothing else — `plx_shell_sdl`'s `window_flags_of` (`shell-sdl/src/window.rs`) turns the platform's
+`Placement::Panel` into `0x2 | 0x1` on the device — so it carries neither `SHOWN` nor a focus flag at creation. **If the flag
 is clear the panel never rises, silently and with no error return.** That is why the boot probe logs
 the flag rather than trusting it: a keyboard that does not appear and a keyboard that appeared and
 was dismissed look identical from inside the app.
@@ -336,8 +339,8 @@ Two host-side findings, recorded because both cost time today and neither is a s
 television.
 
 **The boot probe's answer on macOS is `keyboard: support=0 active=1 focus=0 winflags=0x26`.** That
-is **trap 2 observed**: `0x26` is `OPENGL | SHOWN | RESIZABLE` (`app.rs`'s `hostsim` arm asks for
-`0x2 | 0x20`; SDL adds `SHOWN`), and `0x200` — `SDL_WINDOW_INPUT_FOCUS` — is not in it. The trap is
+is **trap 2 observed**: `0x26` is `OPENGL | SHOWN | RESIZABLE` (the `hostsim` arm asked for
+`0x2 | 0x20` when this was measured, and is `window_flags_of`'s `Placement::Desktop` arm now; SDL adds `SHOWN`), and `0x200` — `SDL_WINDOW_INPUT_FOCUS` — is not in it. The trap is
 therefore reproducible without a television, which is the useful part; what it does **not** tell you
 is anything about the TV's own answer, since `support=0` here just means desktop SDL has no screen
 keyboard at all.
@@ -348,7 +351,9 @@ carries a `char *text` **pointer** where SDL2 carries an inline `char[32]`; the 
 dereferences what it is handed. There is no Rust panic and no log line — the process is simply gone.
 The existing remote-FIFO injection is safe by luck of shape: key events and `ck:` pointer clicks are
 all scalar fields, and nothing in them is read as a pointer. Anything that wants to test the field
-headlessly must go in **above** SDL — through `textinput`'s own buffer — not by forging the event.
+headlessly must go in **above** SDL: through the `txt:` remote token or `ingest_text`'s event pair
+(`app::events::text_inputs`), never through `textinput`'s own buffer (which holds only text no field
+owns), and never by forging the event.
 
 ### Two dead ends, so nobody spends a day on them again
 

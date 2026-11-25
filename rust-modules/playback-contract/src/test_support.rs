@@ -1,7 +1,7 @@
 //! Test doubles for the contract's driver traits, compiled only for this crate's own tests and for
 //! dependents that name the `test-support` feature from their `[dev-dependencies]`.
 
-use crate::uri::{UriDriver, UriSource};
+use crate::uri::{DisplayEvidence, UriDriver, UriSource};
 use crate::{AttemptId, BackendEvent, BackendKind, Capabilities, CommandId, DispatchResult,
     DriverEvent, DriverSet, ExitDisposition, Failure, Observation, Operation, ReleaseStatus,
     SourceKey, TrackSelection};
@@ -9,8 +9,13 @@ use plx_base::task::MainThread;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+/// The display path a [`FakeUriDriver`] reports until a test scripts another: ready, no preview
+/// rectangle, tagged `fake`.
+const FAKE_DISPLAY: DisplayEvidence = DisplayEvidence::ready("fake");
+
 #[derive(Default)]
 struct Script {
+    display: Option<DisplayEvidence>,
     staged: Vec<(AttemptId, SourceKey)>,
     cancelled: Vec<AttemptId>,
     discarded: Vec<(AttemptId, SourceKey)>,
@@ -22,6 +27,8 @@ struct Script {
     refuse_start: Option<Failure>,
     refuse_track: Option<Failure>,
     exit_preserved: bool,
+    not_ready: Option<crate::uri::UriNotReady>,
+    ready_asked: u32,
 }
 
 /// A scriptable [`UriDriver`]. It answers [`DriverSet::capabilities`] with the set it was built
@@ -82,6 +89,16 @@ impl FakeUriHandle {
     pub fn set_exit_preserved(&self, preserved: bool) {
         self.0.lock().unwrap().exit_preserved = preserved;
     }
+    /// Make [`UriDriver::display`] report this (until then: ready, tagged `fake`).
+    pub fn set_display(&self, display: DisplayEvidence) {
+        self.0.lock().unwrap().display = Some(display);
+    }
+    /// Make [`UriDriver::ready_to_start`] answer this (`None`: ready).
+    pub fn set_not_ready(&self, why: Option<crate::uri::UriNotReady>) {
+        self.0.lock().unwrap().not_ready = why;
+    }
+    /// How many times the adapter has asked whether the driver is ready.
+    pub fn ready_asked(&self) -> u32 { self.0.lock().unwrap().ready_asked }
 }
 
 impl DriverSet for FakeUriDriver {
@@ -133,6 +150,10 @@ impl DriverSet for FakeUriDriver {
 }
 
 impl UriDriver for FakeUriDriver {
+    fn display(&self) -> DisplayEvidence {
+        self.script.lock().unwrap().display.unwrap_or(FAKE_DISPLAY)
+    }
+
     fn stage_source(&mut self, attempt: AttemptId, key: SourceKey, source: UriSource)
         -> Result<(), Failure> {
         // The checks the product driver makes before it escrows a source.
@@ -150,6 +171,12 @@ impl UriDriver for FakeUriDriver {
 
     fn maps_track(&self, selection: TrackSelection) -> bool {
         self.script.lock().unwrap().mapped.contains(&selection)
+    }
+
+    fn ready_to_start(&mut self, _: &MainThread) -> Result<(), crate::uri::UriNotReady> {
+        let mut script = self.script.lock().unwrap();
+        script.ready_asked += 1;
+        script.not_ready.map_or(Ok(()), Err)
     }
 }
 
@@ -215,6 +242,22 @@ mod tests {
     }
 
     #[test]
+    fn the_display_a_driver_reports_is_what_the_test_scripted_and_a_reason_reads_as_its_text() {
+        use crate::uri::{DisplayReadiness, UriNotReady};
+        let (driver, handle) = boxed();
+        assert_eq!(driver.display(), DisplayEvidence::ready("fake"), "ready until a test says otherwise");
+        assert!(driver.display().is_ready() && !driver.display().preview_rectangle);
+        handle.set_display(DisplayEvidence::unavailable("none"));
+        let display = driver.display();
+        assert_eq!(display.readiness, DisplayReadiness::NotReady(UriNotReady::DisplayUnavailable));
+        assert!(!display.is_ready());
+        assert_eq!(display.tag, "none");
+        // A driver's own reason reads as the driver wrote it; the shared one names no driver.
+        assert_eq!(UriNotReady::Driver("the handle could not be made").log_name(), "the handle could not be made");
+        assert_eq!(UriNotReady::DisplayUnavailable.log_name(), "the driver has no display path");
+    }
+
+    #[test]
     fn a_track_pick_is_refused_once_when_scripted_and_queued_after() {
         let (mut driver, handle) = boxed();
         handle.refuse_next_track(Failure::Busy);
@@ -244,5 +287,45 @@ mod tests {
                 attempt: attempt(3), status: ReleaseStatus::Released } },
         ]);
         assert!(driver.poll(&mt()).is_empty(), "events are delivered once");
+    }
+
+    /// The shared conformance suite over the fake: its native answers are scripted, so this run pins the sequence
+    /// a real driver's events must follow (`uri_conformance`).
+    struct FakeHarness { driver: FakeUriDriver, handle: FakeUriHandle }
+
+    impl FakeHarness {
+        fn started_attempt(&self) -> AttemptId {
+            self.handle.dispatched().iter().rev().find_map(|(attempt, _, op)|
+                matches!(op, Operation::Start { .. }).then_some(*attempt)).expect("a Start was dispatched")
+        }
+    }
+
+    impl crate::uri_conformance::UriHarness for FakeHarness {
+        type Driver = FakeUriDriver;
+        fn driver(&mut self) -> &mut FakeUriDriver { &mut self.driver }
+        fn after_start(&mut self) {
+            self.handle.set_plane_owned(true);
+            self.handle.set_exit_preserved(true);
+        }
+        fn native_prepared(&mut self) {
+            let attempt = self.started_attempt();
+            self.handle.queue([DriverEvent::Observation { attempt, observation: Observation::Playback(
+                crate::Observed { value: crate::Playback::ReadyAwaitPlay,
+                    from: crate::EvidenceSource::BackendReport }) }]);
+        }
+        fn native_closed(&mut self) {
+            let attempt = self.started_attempt();
+            self.handle.set_plane_owned(false);
+            self.handle.set_exit_preserved(false);
+            self.handle.queue([DriverEvent::Release { attempt, status: ReleaseStatus::Released }]);
+        }
+    }
+
+    #[test]
+    fn the_fake_conforms_to_the_shared_uri_suite() {
+        crate::uri_conformance::conforms(|| {
+            let (driver, handle) = FakeUriDriver::new(CAPS);
+            FakeHarness { driver, handle }
+        });
     }
 }

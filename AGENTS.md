@@ -49,6 +49,12 @@ the macOS simulator are valuable, but they cannot prove every device behavior.
   whole. The reason is the history itself: `main` is read by `git log`, by the release audit and by
   `git bisect`, and a trunk of "fix typo" / "wip" / merge commits pollutes all three. Push `main`
   only when the user asked for it.
+- **Releases are cut from release lines, and fixes reach a line from `main`.** `main` never holds
+  a PR back for a release: `cut-line.yml` branches `release/vX.Y` off `main` and moves `main` on,
+  and the release and its candidates ship from that line (the `cut-release` skill). A fix the line
+  needs lands on `main` first with the `backport release/vX.Y` label, and `backport.yml`
+  cherry-picks it into a PR against the line; a line takes squash merges only, like `main`. Never
+  fix only on the line: that is how `release/v0.6` once carried 37 fixes `main` never had.
 - **A diff stat is not a measure of change.** `dec32f2e` ran rustfmt over all of `ui/`, so
   `detail.rs` read +2416 lines for +113 characters of content. `git diff -w` does not rescue it —
   that ignores whitespace *within* a line, not one line split into three. Size a change by content
@@ -58,7 +64,7 @@ the macOS simulator are valuable, but they cannot prove every device behavior.
   `ci/module-layers.ini` declares the crates `rust-modules/src` is being split into, and
   `ci/check-module-layers.py` (in `make check`) fails on a reference that names a layer its own
   layer may not use, on a module placed in no layer, and on a reference from outside
-  `[port webos]` to `webos`, `keymanager`, `system` or `port`. Fix the reference
+  `[platform webos]` to `webos`, `keymanager`, `system` or `port`. Fix the reference
   (`docs/module-layers.md` says where code belongs and how to cut an upward name) instead of
   adding a (file, member) pair to `ci/allow/layers.txt`, which is empty and only shrinks.
 - **Logic never performs IO.** A machine (a screen, a `data/` store, the session owner, the player's
@@ -126,12 +132,15 @@ the macOS simulator are valuable, but they cannot prove every device behavior.
   `ci/list-caps.ini`.
 - While iterating on one crate, `make test-crate C=plx_ui [T=filter] [DEPS=1]` builds and runs only
   that crate's lib tests in `make test-fast`'s incremental tree. It is a loop, not a gate.
-- `make test-crate` does NOT enable `hostsim`: tests under `#[cfg(all(test, feature = "hostsim"))]`
-  (the application crate's `app/run.rs` `lifecycle_regression_tests`, the player-return rig;
-  `plx_media`'s `player/engine.rs`, `pump.rs`, `route/decision.rs`) run as `make test-hostsim
-  [C=<crate>] [T=filter]`. `C` defaults to the application crate; `C=plx_media` (or `C=media`)
-  runs that crate's `hostsim` tests, the same ones `make check`'s hostsim pass runs for it. It runs
-  `cargo test --lib -p <crate> --features hostsim` on the pinned
+- `make test-crate` does NOT enable `sim`: tests under `#[cfg(all(test, feature = "sim"))]`
+  (the application crate's `app/run.rs` `lifecycle_regression_tests`, the player-return rig)
+  run as `make test-hostsim
+  [C=<crate>] [T=filter]`. `plx_media`'s player and route tests (the engine, pump and
+  `route/decision.rs` ones that drive the host sink) are plain `cfg(test)` since W8c-1 and run in `make test-crate`.
+  `C` defaults to the application crate; `C=plx_media` (or `C=media`)
+  runs that crate's tests with `sim` on (the Cargo feature is `sim`; the target, its tree and CI job keep the name
+  `hostsim`), the same ones `make check`'s hostsim pass runs for it. It runs
+  `cargo test --lib -p <crate> --features sim` on the pinned
   toolchain with a throwaway `PLXNATIVE_RUNTIME_DIR` (removed afterwards), incrementally in its own
   gitignored `rust-modules/target-hostsim`: inside the checkout, so `make disk` and
   `tools/build-gc.sh` see it and it goes with the worktree, like `target-fast`. A `T=` that matches
@@ -204,7 +213,12 @@ the macOS simulator are valuable, but they cannot prove every device behavior.
   cargo-running target joins `DISK_ENTRIES` in the Makefile (`ci/test_disk_preflight.py` fails
   until it does), and a `$(MAKE)` line inside an entry passes `PLX_DISK_BUDGET_DONE=1`. `make disk`
   stays the report to read before intervening yourself, or when the volume needs relief faster than
-  the automatic trigger provides it.
+  the automatic trigger provides it. In a Claude session `.claude/hooks/disk-low-notify.py` adds a note
+  after a Bash call when free space is under the comfort line or the reserve (or a command failed with
+  "No space left on device" while it is), and says `tools/build-gc.sh --auto` was already started in the
+  background: when it appears, relief is `build-gc.sh` and `make disk`, and a volume still under the
+  reserve goes to the owner, never an `rm -rf` of build trees or a `git clean`; the same error while this
+  volume has room gets a note only (another volume may be full, and the reclaim is not started).
 - Use the `which-tier` skill to choose between host checks, `ui-sim`, and real-device verification.
   Pixel output, LG text rasterization, video-plane composition, performance, and native playback
   generally need the TV before being called verified.
@@ -226,7 +240,10 @@ the macOS simulator are valuable, but they cannot prove every device behavior.
   contradictions, not missing documentation.
 - Before opening or merging a PR, review its combined `base...head` diff once with the
   `pr-reviewer` custom agent (`pr_reviewer` in Codex): it returns findings only and never edits,
-  comments or merges.
+  comments or merges. It reads its rules from the base, and the review is recorded on the commit it
+  read (`tools/pr-land.py reviewed`, the `land-pr` skill); a push after it needs a new review.
+  `tools/review-eval.py` grades the reviewer against past pull requests whose bugs are known; run it
+  before and after changing the reviewer's prompt.
 
 ## Television and release safety
 

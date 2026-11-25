@@ -67,9 +67,11 @@ fn item(label: impl Into<String>) -> HeaderItem {
     HeaderItem { label: label.into(), focusable: true, ..Default::default() }
 }
 
-/// A control that opens a page (Collections, Recommended): the row draws a chevron after it.
-fn place(label: impl Into<String>) -> HeaderItem {
-    HeaderItem { place: true, ..item(label) }
+/// A control that opens a page (Collections, Recommended): the row draws a chevron after it. `name`
+/// is its accessibility name (`header.collections`), a word and never its label, which is the
+/// language's.
+fn place(name: &'static str, label: impl Into<String>) -> HeaderItem {
+    HeaderItem { place: true, a11y: Some(name), ..item(label) }
 }
 
 /// The hairline between the places and the sort control. Not a stop.
@@ -98,7 +100,7 @@ impl LibraryScreen {
             Some(GridAction::Sort { key, .. }) => listing.sorts().iter().find(|sort| &sort.key == key),
             _ => listing.sorts().get(listing.sort_index()),
         };
-        sort.map_or(plx_platform::i18n::msg::browse_library_title(), |sort| sort.label())
+        sort.map_or(plx_os::i18n::msg::browse_library_title(), |sort| sort.label())
     }
 
     /// Is a genre or Unwatched filter in force (a queued edit included)? Only then does the row
@@ -171,17 +173,17 @@ impl LibraryScreen {
             if self.filter_key(cx).as_ref() != Some(held) { return None; }
             *matching
         };
-        let locale = plx_platform::i18n::current();
+        let locale = plx_os::i18n::current();
         let of_total = listing.library_type().count_label(self.kind, *total);
-        Some(plx_platform::i18n::msg::library_header_filtered_of(&locale.number(matching), &of_total))
+        Some(plx_os::i18n::msg::library_header_filtered_of(&locale.number(matching), &of_total))
     }
 
     /// The right cluster as it is now, and in its widest case (every value at its longest), which
     /// fixes the cluster's BUDGET so the room the library names may use does not change when a
     /// value does.
     pub(super) fn header_right<H: LibraryLike>(&self, cx: &Cx<'_, H>) -> (Vec<HeaderItem>, Vec<HeaderItem>) {
-        use plx_platform::i18n::msg;
-        let locale = plx_platform::i18n::current();
+        use plx_os::i18n::msg;
+        let locale = plx_os::i18n::current();
         let mut right = Vec::new();
         let mut widest = Vec::new();
         if let Some(readout) = self.filtered_readout(cx) {
@@ -199,7 +201,7 @@ impl LibraryScreen {
         // must not repack between the two (the room they pack into is measured once and never
         // moves).
         let slot_of = |count: u32| Some(locale.number(i64::from(count.max(999))));
-        let control = |value, slot| HeaderItem { value, value_slot: slot, ..place(msg::library_header_collections()) };
+        let control = |value, slot| HeaderItem { value, value_slot: slot, ..place("collections", msg::library_header_collections()) };
         match self.collections {
             CollectionsControl::Count(count) => {
                 let slot = slot_of(count);
@@ -213,8 +215,8 @@ impl LibraryScreen {
             }
         }
         right.push(HeaderItem { selected_plate: self.listing == Listing::Recommended,
-            ..place(msg::library_header_recommended()) });
-        widest.push(place(msg::library_header_recommended()));
+            ..place("recommended", msg::library_header_recommended()) });
+        widest.push(place("recommended", msg::library_header_recommended()));
         // The divider and the sort control draw what the criterion says, with no slot for it: the
         // control ends at the row's edge and the places slide as the criterion's width changes. The
         // widest criterion only sizes the room the library names may use.
@@ -236,7 +238,7 @@ impl LibraryScreen {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let listing = H::listing(cx);
         let directory = H::directory(cx);
-        (std::ptr::from_ref(plx_platform::i18n::current()) as usize).hash(&mut h);
+        (std::ptr::from_ref(plx_os::i18n::current()) as usize).hash(&mut h);
         self.view_section(cx).hash(&mut h);
         self.collections.hash(&mut h);
         self.listing.hash(&mut h);
@@ -322,8 +324,8 @@ impl LibraryScreen {
                     LIBRARY_GROUP, all.len());
                 all.push((elem, index));
             }
-            let more = HeaderItem { glyph: Some(plx_ui::icons::Icon::More), value_only: true,
-                ..item(plx_platform::i18n::msg::browse_library_libraries()) };
+            let more = HeaderItem { glyph: Some(plx_ui::icons::Icon::More), value_only: true, a11y: Some("libraries"),
+                ..item(plx_os::i18n::msg::browse_library_libraries()) };
             let more_w = page_header::cluster_width(&[more.clone()], measure);
             // Reserve a current-library slot whenever the roster can require one. The same
             // reservation applies while a favorite is selected, so a visit never shifts or
@@ -444,7 +446,7 @@ impl LibraryScreen {
         // the control's whole menu-open stretch, during which the engine's focus is on the menu's
         // rows and the row's motion HOLDS.
         let lifted = f.lifted.filter(|key| key.entry == self.entry).map(|key| key.elem);
-        row.draw_with(p, self.scroll.pos, &self.header_capsules, self.header_pop.scale_with(0, f.press.scale), lifted, &self.header_swap);
+        row.draw_with(p, self.scroll.pos, &self.header_capsules, self.header_pop.scale_with(0, f.press), lifted, &self.header_swap);
     }
 
     /// **The opener lift for a header control** (`Screen::redraw_focused`): `elem`, the control a
@@ -458,6 +460,6 @@ impl LibraryScreen {
     pub(super) fn draw_header_opener<H: LibraryLike>(&self, f: &DrawFrame<'_, '_, H>, elem: u32) {
         let Some(row) = self.header.row() else { return };
         let p = f.painter.alpha(f.page_alpha * self.page_fade.alpha() * self.handoff.clearance(layout::HEADER_Y - self.scroll.pos));
-        row.draw_opener_with(p, self.scroll.pos, self.header_pop.scale_with(0, f.press.scale), elem, &self.header_swap);
+        row.draw_opener_with(p, self.scroll.pos, self.header_pop.scale_with(0, f.press), elem, &self.header_swap);
     }
 }

@@ -80,7 +80,7 @@ state. Close other WSL work, run `wsl.exe --shutdown`, and retry; accept the run
 `use_gfxredir = 1`.
 
 **Ask for `SIM_W=1920 SIM_H=1080` on any shot you intend to JUDGE.** The window is otherwise sized
-to fit the display (`app::boot::plan_desktop_window`), and on a 1x screen that divisor lands on 2, so
+to fit the display (`plx_shell_sdl::window::plan_desktop_window`), and on a 1x screen that divisor lands on 2, so
 every screenshot comes back 960x540 — half the canvas the UI is authored at. A 1px edge-sheen, a
 hairline, a snapped glyph and a specular rim are exactly the things that do not survive that
 halving, which makes a shot at the default size evidence about layout and nothing else. The size is
@@ -221,6 +221,33 @@ Tokens: `up`/`down`/`left`/`right`, `ok`, `back`, `play`/`pause`/`stop`, `ck:X,Y
 authored 1920×1080 coords), `okdown`/`okup` (split halves — the only way to drive a press-and-hold
 past `press::LONG_MS`), and `shot` (simulator only).
 
+**Reach a target by id, not by walking to it.** A debug (`devtriggers`) build also takes
+`focus:<id>`, `press:<id>` (focus, then an ordinary OK) and `press:<id>@<subject>` (refuses and
+presses nothing when the element the id NAMES carries another subject than the one given), plus
+`state:<nonce>`, which writes `plxnative-a11y.json` in the runtime dir (route, owner, the focused full
+id, every element's id, role, rect, `visible`, `loaded`, label and subject) with the nonce echoed back.
+An id is a place-based dot path (`nav.watchlist`, `watchlist.grid.card.7`, `detail.hero.play`) in the
+namespace of whoever OWNS input, so inside a menu it is the menu's (`itemmenu.watchlist_remove`); a
+refusal presses nothing and logs `a11y: refused <act> <id> <reason> owner=<ns>` (`unloaded` is not
+an error: the element is not pressable yet, a card whose item has not landed or Home's focused element while its picture
+lags a key across the hero/grid door, so press again once the screen has settled). `tools/a11y.py` writes
+the tokens (`focus`, `press`) and reads the answer (`expect_focus`). Prefer these over key walks; a walk
+stays where the test's subject IS the travel (fps walks, focus fingerprints, a held key).
+
+The simulator boots against the owner's real server unless you aim it at the mock, and OK on a title
+can play it, so the command line refuses to press one UNNAMED: `python3 tools/a11y.py press <runtime>
+<id>` WITHOUT `--subject <ratingKey>` (and `send press:<id>` without an `@<subject>`) exits 2 and sends
+nothing when the id is of an element that ACTS ON a title it names (it plays, restarts, finishes or retries it,
+marks it watched or unwatched, bookmarks it, acts on the title a menu was opened for, or opens that title's own page
+or menu where the title can change under the press: a card, a credit, the Home carousel's Info, a hero button, an
+item-menu row, a Play Version row, a player control that starts a title; only a control whose target the page fixes
+stays bare). `SUBJECT_BEARING` in `tools/a11y.py` is the one list of those ids, and the key to name is the ratingKey
+of the title the press acts on, which `state` prints as the element's subject. Read the ratingKey from `state`
+first. The library functions `a11y.press` / `press_token` stay unguarded, for a script that drives the mock (a
+script that imports them against a real server has no check). `a11y.py
+send` writes ONE token: a word with whitespace in it (`send "back press:<card>"`) exits 2 and sends
+nothing, because the app cuts a FIFO line at any whitespace and the second token would skip that guard.
+
 A desktop keyboard also works directly in `make sim-macos-run`: arrows, RETURN, ESC (`is_ok`/`is_back`
 have always accepted keyboard keys), plus space=pause, `p`=play, `s`=stop, backspace=BACK.
 
@@ -289,7 +316,7 @@ make screenshots SHOT_HERO_VARIANTS=1 # also home-hero-<film>.jpg for each hero 
   `libtype=recommended` first; the view scrolls to it),
   `libtype=<movies|shows|seasons|episodes|collections|recommended>` (the first four set the Show-menu
   type of the page's grid; `collections` and `recommended` press the header control that opens that
-  page; applied before `libgrid`/`libshelf`/`libmenu` act), `libmenu=<sortfilter|sort|filter|type>,<ms>`, and under `hostsim` `clockstop=<ms>`: the clock sink's clock stops at that
+  page; applied before `libgrid`/`libshelf`/`libmenu` act), `libmenu=<sortfilter|sort|filter|type>,<ms>`, and under `sim` `clockstop=<ms>`: the clock sink's clock stops at that
   position while the player stays PLAYING (Up Next only shows while playing; `autopause` would
   take it down). The settled capture waits for every armed seat, menu, clock stop and
   `autopause` pause to land, so a scene that seeks does not rest before it (a busy host can leave a
@@ -309,7 +336,7 @@ make screenshots SHOT_HERO_VARIANTS=1 # also home-hero-<film>.jpg for each hero 
   scene's `free_regions`, which must carry a `tolerance_reason`. Search, detail, sign-in and the
   failure read-out come back byte-identical; scenes with backdrop blur or glass differ by exactly
   1 in anything from a few pixels to ~120k of them. The player is byte-identical too:
-  `autopause=at=<ms>` waits for the playhead to reach that position, and under `hostsim` it also
+  `autopause=at=<ms>` waits for the playhead to reach that position, and under `sim` it also
   stops the clock sink exactly there, so the frame, the clocks and the knob are the same every
   run. Aim `at` between two frames (Sintel is 24 fps), so no PTS rounding picks the neighbour.
 - **The library is openly licensed.** `tests/demo_library/assets.json` pins every source file (URL,
@@ -428,7 +455,7 @@ device-verified" is a useful, honest status. "Verified" without a TV is not.
 ## The frame dump (the demo video's renderer)
 
 `make site-video-sim` builds the simulator for the demo-video pipeline (`--no-default-features
---features hostsim,play-feed,devtriggers,placeholder-sentinel`, release, its own target dir, libass only), and
+--features sim,play-feed,devtriggers,placeholder-sentinel`, release, its own target dir, libass only), and
 `python3 tools/site_video.py render --out DIR --storyboard` plays `tests/video/feel.json` (positions and durations, compiled to the driver's key schedule: Home hero, hero paged to the second page and back, down to the Continue Watching shelf, the third card's Detail opened with OK and scrolled with five downs past its Cast & Crew row to the About section, back, the Movies library walked down with arrows only to its All poster grid and across it, walked back up and left with one back, about 30 s; nothing opened from Detail, no modal; shot with the hold hint taught, so card rests and the card OK are not capped: `render --storyboard` sets the `plxnative-hintoff` trigger (`devtriggers` builds only; it calls `hold_hint::teach_all_for_dev`, once, at boot) because the capsule is a one-time teaching overlay and a film has no viewer to teach) and records its sha256, `--extra-holds`, `--trigger`, how far each beat still moved at its end (`storyboard.rest`) and which titles it opened and `hold_hint: suppressed` in `render.json`. Before the film boots the launcher signs the simulator in to the mock's Demo account through the app's own QR sign-in (a prep boot with the `plxnative-login` trigger), so the profile chip, one `left` from the Home pill that `up` from the hero lands on, reads "Demo" and never "Sign in" should a beat press `left` there. A pushed page is filmed LIVE under the dip, never as a held image (`plx_gfx::dump`'s one page rule: every dip frame re-captures the page, `PageImage::step_filmed`), so a page that mounts hidden and fades in (an `Xfade` mount, the Library's) fades in as it does in the product, with its entrance springs playing, and nothing cuts when the dip ends. Either way `render` runs the simulator headless against the mock catalog (without `--storyboard` it holds Home for `--frames`, 180 by default) and leaves
 `master.mkv`, `frames.tsv`, `dump.json` and `render.json`. The simulator side is
 `rust-modules/src/dev/framedump.rs`, armed by `PLXNATIVE_DUMP=<dir>` (its module doc lists the

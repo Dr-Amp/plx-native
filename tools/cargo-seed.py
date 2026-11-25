@@ -26,7 +26,7 @@ What makes this safe, in order of importance:
 * **It clones or it does nothing.** `clonefile(2)` is called directly (not `cp -c`, which quietly
   falls back to a full copy, spending the very disk this exists to save). Another volume, a
   filesystem without cloning, or any platform other than macOS: a no-op, never a copy.
-* **Linked worktrees only.** The main checkout keeps its own incremental cache and full DWARF,
+* **Linked worktrees only.** The main checkout keeps its own incremental cache and full DWARF in `dev` builds,
   which no lane could share, so the Makefile does not call this there and the script refuses
   too. `PLX_CARGO_SEED=off` disables it everywhere.
 * **A key guards the seed**: the sha256 of the toolchain (`rustc +<pinned toolchain> -vV` and `rustc -vV`),
@@ -187,7 +187,7 @@ def seed_key(root, kind):
     part("manifest-storage", manifest_bytes(os.path.join(root, "rust-modules", "storage", "Cargo.toml")))
     part("manifest-base", manifest_bytes(os.path.join(root, "rust-modules", "base", "Cargo.toml")))
     part("manifest-machine", manifest_bytes(os.path.join(root, "rust-modules", "machine", "Cargo.toml")))
-    part("manifest-platform", manifest_bytes(os.path.join(root, "rust-modules", "platform", "Cargo.toml")))
+    part("manifest-os", manifest_bytes(os.path.join(root, "rust-modules", "os", "Cargo.toml")))
     part("manifest-gfx", manifest_bytes(os.path.join(root, "rust-modules", "gfx", "Cargo.toml")))
     part("manifest-net", manifest_bytes(os.path.join(root, "rust-modules", "net", "Cargo.toml")))
     part("manifest-ui", manifest_bytes(os.path.join(root, "rust-modules", "ui", "Cargo.toml")))

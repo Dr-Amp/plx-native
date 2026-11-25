@@ -363,11 +363,11 @@ impl CrewRole {
         }
     }
 
-    fn display(self, locale: &plx_platform::i18n::LocaleContext) -> &'static str {
+    fn display(self, locale: &plx_os::i18n::LocaleContext) -> &'static str {
         match self {
-            Self::Director => plx_platform::i18n::msg::browse_crew_director_in(locale),
-            Self::Writer => plx_platform::i18n::msg::browse_crew_writer_in(locale),
-            Self::DirectorWriter => plx_platform::i18n::msg::browse_crew_director_writer_in(locale),
+            Self::Director => plx_os::i18n::msg::browse_crew_director_in(locale),
+            Self::Writer => plx_os::i18n::msg::browse_crew_writer_in(locale),
+            Self::DirectorWriter => plx_os::i18n::msg::browse_crew_director_writer_in(locale),
         }
     }
 }
@@ -453,6 +453,19 @@ impl Dovi {
         bl_present: false,
         rpu_present: false,
     };
+
+    pub fn of_stream(s: &plx_plex::plex::Stream) -> Option<Dovi> {
+        (s.dovi_present != 0).then(|| Dovi {
+            present: true,
+            profile: s.dovi_profile,
+            bl_compat: s.dovi_bl_compat_id,
+            el_present: s.dovi_el_present != 0,
+            level: s.dovi_level,
+            version: Dovi::parse_version(&s.dovi_version),
+            bl_present: s.dovi_bl_present != 0,
+            rpu_present: s.dovi_rpu_present != 0,
+        })
+    }
 
     /// [`Self::version`] back as the dotted string the server sent (`"1.0"`), or `None` when it
     /// sent none. `None` and `Some("0.0")` are different answers and the panel draws only the
@@ -562,7 +575,7 @@ impl Dovi {
     ///
     /// `signal` retains `nodv`'s diagnostic asymmetry: it withholds a Profile-5-style declaration,
     /// but does not suppress a compatible Profile 8 on a supported set. `capability` must be a
-    /// definite [`Supported`](plx_platform::devcaps::dv::DvCapability::Supported), and
+    /// definite [`Supported`](plx_os::devcaps::dv::DvCapability::Supported), and
     /// `video_carries_dv` ([`dv_video_codec`]) closes the old Profile 9 disagreement where the gate
     /// declared AVC and the payload's codec guard silently discarded the node.
     ///
@@ -603,7 +616,7 @@ impl Dovi {
     pub fn presentation(
         &self,
         signal: bool,
-        capability: plx_platform::devcaps::dv::DvCapability,
+        capability: plx_os::devcaps::dv::DvCapability,
         video_carries_dv: bool,
     ) -> DvPresentation {
         if !self.present {
@@ -618,7 +631,7 @@ impl Dovi {
         // Presence of our node enables libpf's DV path even on a television which cannot display
         // it. libplayerAPIs' own platform metadata does not protect that seam, so only this app's
         // affirmative configd result may make the declaration eligible.
-        let declare = capability == plx_platform::devcaps::dv::DvCapability::Supported
+        let declare = capability == plx_os::devcaps::dv::DvCapability::Supported
             && video_carries_dv
             && (signal || !self.base_layer_unusable());
         if !declare || self.profile <= 0 {
@@ -690,13 +703,13 @@ pub enum DvPresentation {
 /// installed decision exactly.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DvDecision {
-    pub capability: plx_platform::devcaps::dv::DvCapability,
+    pub capability: plx_os::devcaps::dv::DvCapability,
     pub presentation: DvPresentation,
 }
 
 impl DvDecision {
     pub const NONE: Self = Self {
-        capability: plx_platform::devcaps::dv::DvCapability::Unknown,
+        capability: plx_os::devcaps::dv::DvCapability::Unknown,
         presentation: DvPresentation::NotDv,
     };
 }
@@ -871,7 +884,7 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-fn is_zero(n: &i64) -> bool {
+pub(crate) fn is_zero(n: &i64) -> bool {
     *n == 0
 }
 
@@ -997,7 +1010,7 @@ impl Extra {
     /// Human subtype for the extras shelf caption, in the UI language. Unknown subtypes read as
     /// the generic extra. The match is on PMS's own subtype names, which are never drawn.
     pub fn caption(&self) -> &'static str {
-        use plx_platform::i18n::msg;
+        use plx_os::i18n::msg;
         match self.subtype.as_str() {
             "trailer" => msg::browse_detail_trailer(),
             "behindTheScenes" => msg::browse_extra_behind_the_scenes(),
@@ -1052,8 +1065,8 @@ impl ExtraContext {
     /// The HUD's word for this kind, in the UI language.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Trailer => plx_platform::i18n::msg::browse_detail_trailer(),
-            Self::Extra => plx_platform::i18n::msg::browse_extra_extra(),
+            Self::Trailer => plx_os::i18n::msg::browse_detail_trailer(),
+            Self::Extra => plx_os::i18n::msg::browse_extra_extra(),
         }
     }
 }
@@ -1561,6 +1574,21 @@ fn convert_ratings(it: &plx_plex::plex::Metadata) -> Vec<Rating> {
     out
 }
 
+/// Ownership of the episode stream facts stored on a show detail page.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EpisodeStreams {
+    #[default]
+    Unavailable,
+    Loaded(String),
+    /// Old recordings fetched the on-deck episode when one existed and omitted the owner.
+    LegacyOnDeck,
+}
+
+impl EpisodeStreams {
+    fn legacy() -> Self { Self::LegacyOnDeck }
+    fn is_legacy(&self) -> bool { matches!(self, Self::LegacyOnDeck) }
+}
+
 #[derive(Default, Clone)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Detail {
@@ -1575,6 +1603,8 @@ pub struct Detail {
     /// Host-captured dev input; never recorded and neutral on decode. Some(empty) forces no credit.
     #[serde(skip, default)]
     pub source_override: Option<String>,
+    #[serde(skip, default)]
+    pub source_credit: String,
     /// Which SERVER this item was fetched from, as the OWNER'S HANDLE ("friend") — empty whenever
     /// it came from the signed-in user's own server, which is every item today.
     ///
@@ -1632,9 +1662,12 @@ pub struct Detail {
     pub acodec: String, // Media[0].audioCodec
     #[serde(with = "record::float_bits")]
     pub video_fps: f64, // video Stream frameRate (0 = unknown); feeds the Load esInfo
+    /// Episode whose streams were loaded into a show page. Its displayed season may since have changed.
+    #[serde(default = "EpisodeStreams::legacy", skip_serializing_if = "EpisodeStreams::is_legacy")]
+    pub episode_streams: EpisodeStreams,
     // ---- the PRIMARY version's technical fields (plex::Metadata::media_version(None) = Media[0], NOT a
     // best-of pick — a multi-version item has more, and the user chooses among them in the Play Version
-    // picker, by `MediaId`). For a SHOW these are borrowed from its first episode, like the
+    // picker, by `MediaId`). For a SHOW these are borrowed from its hero episode, like the
     // About footer's audio/subtitle lists. `bitrate`/`width`/`height` are unused by the UI today
     // and carried for the video-quality ladder ("26.1 Mbps 4K (Original)").
     pub video_resolution: String, // "4k" | "1080" | "720" | "sd" — the hero's media badge
@@ -1735,9 +1768,34 @@ pub struct Detail {
     /// hero's Play Version disc; empty for a single-version item and for a show or season.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub versions: Vec<crate::pms::MediaVersion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub version_parts: Vec<VersionPart>,
 }
 
 impl Detail {
+    pub fn show_started(&self) -> bool {
+        self.on_deck.as_ref().is_some_and(|ep| ep.resume_ms > 0 || ep.watched)
+            || self.seasons.iter().any(|s| s.viewed_leaf_count > 0)
+    }
+
+    pub fn resume_episode(&self) -> Option<&Episode> {
+        self.on_deck.as_ref().filter(|_| self.show_started())
+    }
+
+    /// The show hero resumes its underway episode, otherwise it starts the displayed season.
+    pub fn play_episode(&self) -> Option<&Episode> {
+        self.resume_episode().or_else(|| self.episodes.first())
+    }
+
+    /// Older recordings predate the explicit owner and loaded the on-deck episode if present.
+    pub fn stream_episode_key(&self) -> Option<&str> {
+        match &self.episode_streams {
+            EpisodeStreams::Unavailable => None,
+            EpisodeStreams::Loaded(rk) => Some(rk),
+            EpisodeStreams::LegacyOnDeck => self.on_deck.as_ref().map(|e| e.rk.as_str()),
+        }
+    }
+
     /// **The show an episode played from this page belongs to**, which the play queue is built
     /// from so the episodes BEFORE it are in the queue: a show page's own key, a season page's
     /// parent, an episode page's grandparent, empty for anything else (a movie). The `show_rk` field
@@ -1758,8 +1816,8 @@ impl Detail {
     /// (`screens::tracks_panel`) and the Languages column's press gate on the detail page.
     ///
     /// It is `part` rather than `is_show` on purpose. A SHOW container carries no `Media` of its
-    /// own — `parse_streams` backfills its audio/subtitle lists from episode 1 for the About footer
-    /// — so on a show page a track sheet would print episode 1's path, size and bitrate under the
+    /// own — `parse_streams` backfills its audio/subtitle lists from the hero episode for the About footer
+    /// — so on a show page a track sheet would print that episode's path, size and bitrate under the
     /// show's name. That is not a truncation of the truth, it is a different file, and `part` is
     /// exactly the field that is empty when the item has no file of its own ("Media[0].Part[0].key
     /// for a leaf (movie/episode); empty for a show").
@@ -1820,11 +1878,7 @@ impl Detail {
     /// value at live launch/held execution in the host, not at draw time. Controlled host entry
     /// creates a fresh owner and controlled installation neutralizes the retained override.
     pub fn source(&self) -> String {
-        self.source_override.clone().unwrap_or_else(|| {
-            plx_plex::plex::server_facts(self.sid)
-                .map(|f| f.handle.clone())
-                .unwrap_or_default()
-        })
+        self.source_override.as_ref().unwrap_or(&self.source_credit).clone()
     }
 
     /// How many tiles the Cast & Crew shelf holds: every actor, then every crew credit.
@@ -1844,10 +1898,10 @@ impl Detail {
     /// Only the crew array owns job identities. An actor whose server-provided character is
     /// named "Director" must retain that exact character name in every locale.
     pub fn credit_role(&self, i: usize) -> Option<&str> {
-        self.credit_role_in(i, plx_platform::i18n::current())
+        self.credit_role_in(i, plx_os::i18n::current())
     }
 
-    fn credit_role_in(&self, i: usize, locale: &plx_platform::i18n::LocaleContext) -> Option<&str> {
+    fn credit_role_in(&self, i: usize, locale: &plx_os::i18n::LocaleContext) -> Option<&str> {
         let credit = self.credit(i)?;
         if i < self.cast.len() {
             return Some(&credit.role);
@@ -2285,6 +2339,7 @@ fn fetch_detail(client: &'static plx_plex::plex::Client, sid: plx_plex::plex::Se
     let mut d = Detail {
         sid,
         source_override: None,
+        source_credit: String::new(),
         rk: rk.to_string(),
         // the portable identity — what "Also available" resolves across the other sources
         guid: it.guid.clone(),
@@ -2316,7 +2371,8 @@ fn fetch_detail(client: &'static plx_plex::plex::Client, sid: plx_plex::plex::Se
         acodec: media0.map(|m| m.audio_codec.clone()).unwrap_or_default(),
         video_fps: 0.0, // set from the video Stream by parse_streams below
         // likewise set by parse_streams (one assignment point), which for a SHOW runs a second
-        // time over its first episode — the show container carries no Media of its own
+        // time over its hero episode — the show container carries no Media of its own
+        episode_streams: EpisodeStreams::Unavailable,
         video_resolution: String::new(),
         width: 0,
         height: 0,
@@ -2370,9 +2426,10 @@ fn fetch_detail(client: &'static plx_plex::plex::Client, sid: plx_plex::plex::Se
         extras: Vec::new(),
         trailer_rk: String::new(),
         versions: if it.kind == "movie" || it.kind == "episode" { crate::pms::versions_of(&it) } else { Vec::new() },
+        version_parts: Vec::new(),
     };
     // audio/subtitle streams (movies carry Media/Part/Stream; a show does not — its
-    // episodes do, so load_detail backfills a show's streams from its first episode).
+    // episodes do, so load_detail backfills a show's streams from its hero episode).
     parse_streams(&it, &mut d);
     Some((d, it.primary_extra_key.clone()))
 }
@@ -2451,6 +2508,25 @@ pub struct Streams {
     pub dovi: Dovi,
 }
 
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct VersionPart {
+    pub id: plx_plex::plex::MediaId,
+    pub part: String,
+    pub audio: Vec<Stream>,
+    pub subs: Vec<Stream>,
+}
+
+fn version_parts_of(it: &plx_plex::plex::Metadata) -> Vec<VersionPart> {
+    it.media
+        .iter()
+        .filter_map(|m| {
+            let p = m.part.first()?;
+            let s = convert_streams(&p.stream);
+            Some(VersionPart { id: m.id, part: p.key.clone(), audio: s.audio, subs: s.subs })
+        })
+        .collect()
+}
+
 fn convert_streams(streams: &[plx_plex::plex::Stream]) -> Streams {
     let (mut audio, mut subs, mut fps) = (Vec::new(), Vec::new(), 0.0);
     let mut hdr = false;
@@ -2506,17 +2582,8 @@ fn convert_streams(streams: &[plx_plex::plex::Stream]) -> Streams {
                 // so this costs nothing and is not a change to any measured behaviour — it is the
                 // one assignment here whose failure is silent and wrong rather than silent and
                 // cosmetic.
-                if s.dovi_present != 0 {
-                    dovi = Dovi {
-                        present: true,
-                        profile: s.dovi_profile,
-                        bl_compat: s.dovi_bl_compat_id,
-                        el_present: s.dovi_el_present != 0,
-                        level: s.dovi_level,
-                        version: Dovi::parse_version(&s.dovi_version),
-                        bl_present: s.dovi_bl_present != 0,
-                        rpu_present: s.dovi_rpu_present != 0,
-                    };
+                if let Some(record) = Dovi::of_stream(s) {
+                    dovi = record;
                 }
                 // The video track ITSELF, kept rather than reduced to `fps`/`hdr`/`dovi`. It is the
                 // only place the stream's own bitrate, profile, bit depth and chroma survive, and
@@ -2574,13 +2641,62 @@ mod convert_streams_tests {
         assert!(!s.audio[1].can_normalize_loudness);
         assert!(!s.video.expect("video track").can_normalize_loudness);
     }
+
+    #[test]
+    fn each_version_keeps_its_own_part_and_tracks() {
+        fn media(id: i64, key: &str, acodec: &str, sub_lang: &str) -> plx_plex::plex::Media {
+            plx_plex::plex::Media {
+                id: plx_plex::plex::MediaId(id),
+                part: vec![plx_plex::plex::MediaPart {
+                    key: key.into(),
+                    stream: vec![
+                        plx_plex::plex::Stream { stream_type: 1, codec: "hevc".into(), ..Default::default() },
+                        plx_plex::plex::Stream { stream_type: 2, codec: acodec.into(), ..Default::default() },
+                        plx_plex::plex::Stream { stream_type: 3, language_code: sub_lang.into(), ..Default::default() },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        }
+        let it = plx_plex::plex::Metadata {
+            media: vec![
+                media(11, "/library/parts/21/1/uhd.mkv", "truehd", "ita"),
+                media(12, "/library/parts/22/1/fhd.mkv", "ac3", "eng"),
+                plx_plex::plex::Media { id: plx_plex::plex::MediaId(13), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let parts = version_parts_of(&it);
+        let seen: Vec<_> = parts
+            .iter()
+            .map(|p| (p.id.0, p.part.as_str(), p.audio.iter().map(|a| a.codec.as_str()).collect::<Vec<_>>(), p.subs.iter().map(|s| s.lang_code.as_str()).collect::<Vec<_>>()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (11, "/library/parts/21/1/uhd.mkv", vec!["truehd"], vec!["ita"]),
+                (12, "/library/parts/22/1/fhd.mkv", vec!["ac3"], vec!["eng"]),
+            ]
+        );
+        let mut d = Detail::default();
+        parse_streams(&it, &mut d);
+        assert_eq!(d.version_parts.len(), 2, "the backfill a show page takes from its episode keeps them too");
+        let single = plx_plex::plex::Metadata {
+            media: vec![media(11, "/library/parts/21/1/uhd.mkv", "truehd", "ita")],
+            ..Default::default()
+        };
+        parse_streams(&single, &mut d);
+        assert!(d.version_parts.is_empty(), "a single version keeps none");
+    }
 }
 
 /// parse an item's Media[0].Part[0].Stream[] into d.audio / d.subs (the About footer), plus that
 /// same version's technical fields (resolution/size/bitrate — the hero's media badge). Both ride
 /// the ONE version (see `plex::Metadata::media_version`), and both are borrowed from a show's
-/// first episode by the same call in `fetch_item_streams`, so they can't describe different files.
+/// hero episode by the same call in `backfill_episode`, so they can't describe different files.
 fn parse_streams(it: &plx_plex::plex::Metadata, d: &mut Detail) {
+    d.version_parts = if crate::pms::versions_of(it).is_empty() { Vec::new() } else { version_parts_of(it) };
     if let Some(m) = it.media_version(None).map(|(_, m)| m) {
         d.video_resolution = m.video_resolution.clone();
         d.width = m.width;
@@ -2653,6 +2769,7 @@ pub struct PlayingItem {
     /// stream's rate—when deciding whether a remote connection has enough headroom to carry the
     /// original file, because the transport also has to carry audio and container overhead.
     pub bitrate: i64,
+    pub video_kbps: i64,
     /// The played leaf's Dolby Vision layering — the direct-play gate's other refusal, beside the
     /// frame size above and for the same reason: the local fallback never asks PMS, so a file
     /// whose base layer we cannot display correctly (Profile 5, or a dual layer the feed path does
@@ -2684,6 +2801,7 @@ impl PlayingItem {
             width: 0,
             height: 0,
             bitrate: 0,
+            video_kbps: 0,
             dovi: Default::default(),
             markers: Vec::new(),
             chapters: Vec::new(),
@@ -2733,6 +2851,7 @@ fn cached_playing(state: &MetadataState, sid: plx_plex::plex::ServerId, rk: &str
             width: d.width,
             height: d.height,
             bitrate: d.bitrate,
+            video_kbps: d.video.as_ref().map_or(0, |v| v.bitrate),
             dovi: d.dovi,
             markers: d.markers.clone(),
             chapters: d.chapters.clone(),
@@ -2849,6 +2968,7 @@ fn playing_item_of(
     let st = media
         .and_then(|m| m.part.first().map(|p| convert_streams(&p.stream)))
         .unwrap_or_default();
+    let video_kbps = st.video.as_ref().map_or(0, |v| v.bitrate);
     let (audio, subs, video_fps, dovi, hdr) = (st.audio, st.subs, st.fps, st.dovi, st.hdr);
     let show_rk = it
         .as_ref()
@@ -2872,6 +2992,7 @@ fn playing_item_of(
         width,
         height,
         bitrate,
+        video_kbps,
         dovi,
         markers,
         chapters,
@@ -3322,12 +3443,15 @@ mod lang_matches_tests {
     }
 }
 
-/// fetch one item's full metadata and parse its streams into `d` — used to borrow a
-/// show's first-episode audio/subtitle tracks (the show container carries none).
-fn fetch_item_streams(client: &'static plx_plex::plex::Client, rk: &str, d: &mut Detail) {
-    if let Some(it) = client.metadata(rk) {
-        parse_streams(&it, d);
+/// Install the hero episode's primary stream facts and the complete list of alternate versions.
+fn backfill_episode(d: &mut Detail, rk: String, it: &plx_plex::plex::Metadata) {
+    if it.default_part().is_none() { return; }
+    parse_streams(it, d);
+    let versions = crate::pms::versions_of(it);
+    if d.episodes.position(&rk).and_then(|i| d.episodes.get(i)).is_some_and(|ep| ep.versions != versions) {
+        d.episodes.edit(&rk, |ep| ep.versions = versions);
     }
+    d.episode_streams = EpisodeStreams::Loaded(rk);
 }
 
 fn fetch_seasons(client: &'static plx_plex::plex::Client, rk: &str) -> Vec<Season> {
@@ -3746,7 +3870,7 @@ pub fn fetch_full(client: &'static plx_plex::plex::Client, sid: plx_plex::plex::
     // `ms=` is the whole chain's wall clock. It is the exact cost `request_detail` moves off the
     // SDL loop, so it is the number to read when judging whether a call site can afford to block
     // — note the framedrop breakdown CANNOT show it (fd_pc0 starts after event handling).
-    let t0 = std::time::Instant::now();
+    let t0 = crate::instruments::start();
     // The ONE line that says a detail page was asked for and got nothing — the summary at the end
     // of this function prints on success only, and nothing downstream can speak for the failure.
     // Its worst shape is the page opened through `detail::open_rk`, which clears before requesting:
@@ -3790,16 +3914,18 @@ pub fn fetch_full(client: &'static plx_plex::plex::Client, sid: plx_plex::plex::
             .map(|ep| plx_base::task::beside(s, "detail-hero", move || client.metadata(&ep)));
         if d.is_show {
             load_show_seasons(client, rk, &mut d, prefer);
-            match on_deck {
-                Some(on_deck) => {
-                    if let Some(it) = on_deck.finish() {
-                        parse_streams(&it, &mut d);
-                    }
-                }
-                None => {
-                    if let Some(ep_rk) = d.episodes.first().map(|e| e.rk.clone()) {
-                        fetch_item_streams(client, &ep_rk, &mut d);
-                    }
+            let deck_item = on_deck.and_then(|job| job.finish());
+            if let (Some(ep), Some(it)) = (&mut d.on_deck, &deck_item) {
+                ep.versions = crate::pms::versions_of(it);
+            }
+            if let Some(target) = d.play_episode().map(|e| e.rk.clone()) {
+                let streams = if d.on_deck.as_ref().is_some_and(|ep| ep.rk == target) {
+                    deck_item
+                } else {
+                    client.metadata(&target)
+                };
+                if let Some(it) = streams {
+                    backfill_episode(&mut d, target, &it);
                 }
             }
             // NB `part`/`vcodec`/`acodec` are deliberately NOT backfilled. They are the item's OWN
@@ -3854,7 +3980,7 @@ pub fn fetch_full(client: &'static plx_plex::plex::Client, sid: plx_plex::plex::
     plx_base::eventlog::log(&format!(
         "detail: sid={} rk={} show={} genres={} cast={} crew={} seasons={} eps={} related={} collection={} audio={} subs={} trailer={} extras={} ms={}",
         d.sid.raw(), d.rk, d.is_show, d.genres.len(), d.cast.len(), d.crew.len(), d.seasons.len(), d.episodes.len(),
-        d.related.len(), d.collection.as_ref().map_or(0, |c| c.members.len()), d.audio.len(), d.subs.len(), u8::from(d.trailer().is_some()), extras_src, t0.elapsed().as_millis()
+        d.related.len(), d.collection.as_ref().map_or(0, |c| c.members.len()), d.audio.len(), d.subs.len(), u8::from(d.trailer().is_some()), extras_src, crate::instruments::elapsed(t0).as_millis()
     ));
     Some(d)
 }
@@ -4146,8 +4272,13 @@ pub fn finish_detail_fetch(
 /// `#[cfg(test)]` arms (`AltInstall`, `AltRestampOwners`) exist only so tests can seed the
 /// alt-sources store the way a landed resolve or a facts-epoch move would — production reaches
 /// both through `pump_alt_sources`, a same-file call, never as a dispatched `Cmd`.
+#[cfg(any(test, feature = "test-support"))]
 pub fn run(state: &mut MetadataState, adapter: &std::sync::Arc<MetadataAdapter>, cmd: crate::stores::metadata::MetadataCmd) -> bool {
+    run_with_keys(state, adapter, cmd, Some(&crate::pms::registry_keys_for_test()))
+}
+pub fn run_with_keys(state: &mut MetadataState, adapter: &std::sync::Arc<MetadataAdapter>, cmd: crate::stores::metadata::MetadataCmd, keys: Option<&plx_plex::plex::ClientKeys>) -> bool {
     use crate::stores::metadata::MetadataCmd;
+    let _ = keys;
     match cmd {
         MetadataCmd::RequestDetail { sid, rk } => {
             let prefer = selected_season_number(state, sid, &rk);
@@ -4217,9 +4348,15 @@ pub fn run(state: &mut MetadataState, adapter: &std::sync::Arc<MetadataAdapter>,
             true
         }
         #[cfg(any(test, feature = "test-support"))]
-        MetadataCmd::AltInstall { sid, rk, copies } => alt_install(state, sid, &rk, copies),
+        MetadataCmd::AltInstall { sid, rk, copies } => {
+            let Some(keys) = keys else { debug_assert!(false, "Metadata AltInstall requires captured keys"); return false; };
+            alt_install(state, sid, &rk, copies, keys)
+        },
         #[cfg(any(test, feature = "test-support"))]
-        MetadataCmd::AltRestampOwners => alt_restamp_owners(state),
+        MetadataCmd::AltRestampOwners => {
+            let Some(keys) = keys else { debug_assert!(false, "Metadata AltRestampOwners requires captured keys"); return false; };
+            alt_restamp_owners(state, keys)
+        },
     }
 }
 
@@ -4237,7 +4374,7 @@ pub fn pump_detail_with_gate(state: &mut MetadataState, adapter: &std::sync::Arc
     // Under a replay this drains on the frame the recording drained it on (§3.3 step 3,
     // `plx_machine::landgate`); off one it is the same call. The gate wraps the QUEUE drain and not the
     // supersede/install below, so a held frame leaves the record in the landing untouched.
-    let out = if crate::stores::tape::active() {
+    let out = if controlled {
         crate::stores::take_landings(gate, crate::stores::StoreId::Metadata, || {
             crate::stores::tape::poll_apply("metadata", 0,
                 || record::drain_live(adapter, &want), |replies| record::supply(adapter, replies, &want))
@@ -4260,7 +4397,7 @@ pub fn pump_detail_with_gate(state: &mut MetadataState, adapter: &std::sync::Arc
             out
         })
     };
-    let mut fresh = false;
+    let mut fresh = restamp_detail_source(state, keys);
     for rec in out {
         let gen = rec.addr.req.0;
         if gen != adapter.detail_gen.load(Ordering::SeqCst) {
@@ -4290,10 +4427,21 @@ pub fn pump_detail(state: &mut MetadataState,
 /// reached `fetch_full`'s line. `task`'s panic logger names the thread and the source location,
 /// so the failure is in the log — it just is not in these words, and a `None` here with no
 /// `detail:` line above it is that case.
+fn restamp_detail_source(state: &mut MetadataState, keys: &plx_plex::plex::ClientKeys) -> bool {
+    let Some(detail) = state.current.as_mut() else { return false };
+    let credit = keys.facts(detail.sid).and_then(|facts| facts.described)
+        .map_or("", |facts| facts.handle.as_str());
+    if detail.source_credit == credit { return false; }
+    detail.source_credit.clear();
+    detail.source_credit.push_str(credit);
+    true
+}
 fn install_landed_detail(state: &mut MetadataState, adapter: &std::sync::Arc<MetadataAdapter>, d: Option<Detail>,
     keys: &plx_plex::plex::ClientKeys, controlled: bool) -> bool {
     let Some(mut d) = d else { return false };
     if controlled { d.source_override = None; }
+    d.source_credit = keys.facts(d.sid).and_then(|facts| facts.described)
+        .map(|facts| facts.handle.clone()).unwrap_or_default();
     // The LANDING is what defines which show's episodes are current, so the season supersede has
     // to happen here as well as at request time: a tab hop issued while this load was in flight
     // spawned a fetch against the OLD item, and its landing would patch these fresh episodes.
@@ -4484,6 +4632,7 @@ struct AltStore {
     /// Which item the stand-in has already had its one chance at, so it is built ONCE per item
     /// rather than on every frame.
     stand_in_rk: String,
+    clients: plx_plex::plex::ClientKeys,
 }
 
 /// The copies held for `(sid, rk)` — EMPTY for any other item, and for an item nothing has landed
@@ -4525,13 +4674,14 @@ fn alt_install(
     item_sid: plx_plex::plex::ServerId,
     item_rk: &str,
     list: Vec<AltCopy>,
+    keys: &plx_plex::plex::ClientKeys,
 ) -> bool {
     let mut list = list;
     // **The worker's stamp is not trusted.** `resolve_alt_sources` reads the credit on a background
     // thread, and a resolve dispatched before a roster refresh re-grades that credit lands after
     // it — past `pump_alt_sources`' facts epoch, which it has already consumed. Regrading here is
     // the only point that sees both the list and the current answer.
-    alt_regrade(&mut list, false);
+    alt_regrade(&mut list, false, keys);
     let held = &mut state.alt;
     let same = plx_plex::plex::same_item((held.sid, held.rk.as_str()), (item_sid, item_rk))
         && held.copies == list
@@ -4559,10 +4709,10 @@ fn alt_install(
 /// **MAIN THREAD**, like every other reader and writer of this store — [`pump_alt_sources`] is its
 /// only caller and runs on the SDL loop. The workers in this chain touch the mutex-protected
 /// result slot and never the store.
-fn alt_restamp_owners(state: &mut MetadataState) -> bool {
+fn alt_restamp_owners(state: &mut MetadataState, keys: &plx_plex::plex::ClientKeys) -> bool {
     let held = &mut state.alt;
     let stand_in = held.stand_in;
-    alt_regrade(&mut held.copies, stand_in)
+    alt_regrade(&mut held.copies, stand_in, keys)
 }
 
 /// **Re-read a copy list's CREDITS from the registry**, `true` when any of them moved.
@@ -4582,13 +4732,13 @@ fn alt_restamp_owners(state: &mut MetadataState) -> bool {
 /// what it was for one round, and is a different statement. A real resolve can land over a stand-in
 /// list, and an armed-but-EMPTY trigger builds no stand-in at all; on both, "armed" would have gone
 /// on suppressing the regrade for a list the stand-in does not own.
-fn alt_regrade(list: &mut [AltCopy], stand_in_owns: bool) -> bool {
+fn alt_regrade(list: &mut [AltCopy], stand_in_owns: bool, keys: &plx_plex::plex::ClientKeys) -> bool {
     if stand_in_owns {
         return false;
     }
     let mut moved = false;
     for c in list.iter_mut() {
-        let credit = plx_plex::plex::server_facts(c.sid)
+        let credit = keys.facts(c.sid).and_then(|facts| facts.described)
             .map(|f| f.handle.clone())
             .unwrap_or_default();
         // `None` is the absence of an owner and must not become `Some("")` — the same guard
@@ -4697,14 +4847,15 @@ fn request_alt_sources(
     use std::sync::atomic::Ordering;
     let mut slot = adapter.alt_slot.lock().unwrap_or_else(|e| e.into_inner());
     let gen = adapter.alt_gen.fetch_add(1, Ordering::SeqCst) + 1;
-    let roster_gen = plx_plex::plex::server_roster_gen();
+    let roster_gen = keys.roster_gen();
+    if state.alt.clients != *keys { state.alt.clients.clone_from(keys); }
     adapter.alt_roster_gen.store(roster_gen, Ordering::SeqCst);
     *slot = None;
     if guid.is_empty() {
         adapter.alt_done.fetch_max(gen, Ordering::SeqCst);
         return;
     }
-    let others: Vec<plx_plex::plex::ServerId> = plx_plex::plex::server_ids().collect();
+    let others: Vec<plx_plex::plex::ServerId> = keys.slots().collect();
     if others.len() < 2 {
         adapter.alt_done.fetch_max(gen, Ordering::SeqCst);
         return;
@@ -4761,7 +4912,7 @@ fn resolve_alt_sources_with(
         let Some(mc) = read(id, c, guid) else {
             continue;
         };
-        let handle = plx_plex::plex::server_facts(id)
+        let handle = clients.facts(id).and_then(|facts| facts.described)
             .map(|f| f.handle.clone())
             .unwrap_or_default();
         out.extend(alt_copies_from(id, &handle, &mc));
@@ -4890,7 +5041,7 @@ impl AltSourcesPass<'_> {
     pub fn take_request(&mut self) -> Option<AltStandInReq> { self.request.take() }
     pub fn finish(self, answer: Option<AltStandInAnswer>, gate: &plx_machine::landgate::Gate) -> bool {
         use std::sync::atomic::Ordering;
-        let Self { state, adapter, roster_gen, gen, mut changed, identity, .. } = self;
+        let Self { state, adapter, _keys: keys, roster_gen, gen, mut changed, identity, .. } = self;
         if gen != adapter.alt_gen.load(Ordering::SeqCst) { return false; }
         if let Some(answer) = answer {
             if !identity.as_ref().is_some_and(|id| std::sync::Arc::ptr_eq(id, &answer.identity)) { return false; }
@@ -4914,7 +5065,7 @@ impl AltSourcesPass<'_> {
         let Some(r) = taken else { return changed };
         adapter.alt_done.fetch_max(r.gen, Ordering::SeqCst);
         if r.gen != adapter.alt_gen.load(Ordering::SeqCst) || r.roster_gen != roster_gen { return changed; }
-        changed | alt_install(state, r.sid, &r.rk, r.list)
+        changed | alt_install(state, r.sid, &r.rk, r.list, keys)
     }
 }
 
@@ -4926,8 +5077,9 @@ fn pump_alt_sources_with_library<'a>(
 ) -> AltSourcesPass<'a> {
     use std::sync::atomic::Ordering;
     let mut changed = false;
-    let roster_gen = plx_plex::plex::server_roster_gen();
-    if adapter.alt_roster_gen.swap(roster_gen, Ordering::SeqCst) != roster_gen {
+    let roster_gen = keys.roster_gen();
+    if adapter.alt_roster_gen.swap(roster_gen, Ordering::SeqCst) != roster_gen
+        || !state.alt.clients.slots().eq(keys.slots()) || !state.alt.clients.iter().eq(keys.iter()) {
         // Same lock protocol as request generation/clear and port publication.
         let mut slot = adapter.alt_slot.lock().unwrap_or_else(|e| e.into_inner());
         let gen = adapter.alt_gen.fetch_add(1, Ordering::SeqCst) + 1;
@@ -4935,10 +5087,12 @@ fn pump_alt_sources_with_library<'a>(
         *slot = None;
         changed |= alt_prune_inactive(state, keys);
     }
-    let facts_gen = plx_plex::plex::server_facts_gen();
-    if adapter.alt_facts_gen.swap(facts_gen, Ordering::SeqCst) != facts_gen {
-        changed |= alt_restamp_owners(state);
+    let facts_gen = keys.facts_gen();
+    if adapter.alt_facts_gen.swap(facts_gen, Ordering::SeqCst) != facts_gen || state.alt.clients != *keys {
+        changed |= alt_restamp_owners(state, keys);
     }
+    if state.alt.clients != *keys { state.alt.clients.clone_from(keys); }
+    changed |= restamp_detail_source(state, keys);
     // Allocate pass identity only for a due request; ordinary/not-due frames allocate nothing.
     // Controlled suppression precedes chance consumption and ALL host IO/cache access.
     let request = if controlled { None } else {
@@ -6804,3 +6958,7 @@ mod alt_runtime_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "metadata/captured_inputs_tests.rs"]
+mod captured_inputs_tests;

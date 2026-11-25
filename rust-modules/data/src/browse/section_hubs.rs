@@ -687,7 +687,7 @@ impl super::BrowseState {
                 Flight::Row => st.hubs.inflight = None,
             }
         }
-        plx_machine::idle::invalidate();
+
     }
 
     /// Reads one row's window: a page the reader walked to, or the cards of a row that came back
@@ -756,7 +756,7 @@ impl super::BrowseState {
                     plx_base::eventlog::log(&format!("libhubs: section {} row {} read failed", result.sec, ask.id));
                 }
                 let moved = state.hubs.land_row(&ask, shelf);
-                plx_machine::idle::invalidate();
+
                 return moved || failed;
             }
             Outcome::List(Some(parsed)) => {
@@ -782,7 +782,7 @@ impl super::BrowseState {
                 state.hubs.owed = true;
             }
         }
-        plx_machine::idle::invalidate();
+
         true
     }
 
@@ -1873,7 +1873,7 @@ mod tests {
     /// against a plain `hub.title.clone()` before the override was wired in.
     #[test]
     fn a_be_ui_localizes_the_section_recently_added_hub_and_leaves_an_unknown_one_alone() {
-        let _thread_locale = plx_platform::i18n::language_on_this_thread_for_test(plx_platform::i18n::Preference::Be);
+        let _thread_locale = plx_os::i18n::language_on_this_thread_for_test(plx_os::i18n::Preference::Be);
         let json = r#"{"MediaContainer":{"Hub":[
           {"hubIdentifier":"tv.recentlyadded.1","title":"Recently Added","type":"mixed",
            "Metadata":[{"ratingKey":"2001","type":"show","title":"Beta","thumb":"/t/2001"}]},

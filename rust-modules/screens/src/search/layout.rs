@@ -37,6 +37,18 @@ pub(super) fn ordinal(kind: Kind) -> u32 {
 pub(super) fn group(kind: Kind) -> GroupId {
     GroupId(0x5345_4200 + ordinal(kind))
 }
+/// The result row's name in the accessibility ids (`search.movies.card.3`). The page holds at most
+/// one row of a kind, so the kind names it, whichever rows stand before it (a row's position moves
+/// with the results). Each is `[a-z][a-z0-9_]*` and unique among the page's sections.
+pub(super) fn name(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Movie => "movies",
+        Kind::Show => "shows",
+        Kind::Episode => "episodes",
+        Kind::Person => "people",
+        Kind::Collection => "collections",
+    }
+}
 static EPISODE: RowStyle = RowStyle { w: 420.0, h: 236.0, ..RowStyle::HOME };
 static PERSON: RowStyle = RowStyle { w: 250.0, h: 250.0, circular: true, ..RowStyle::HOME };
 static POSTER: RowStyle = RowStyle { w: CARD_W, h: CARD_H, ..RowStyle::HOME };
@@ -80,7 +92,7 @@ pub(super) fn clear(terms: usize, scroll: f32, measure: &dyn plx_machine::machin
 /// The Clear control under a recents block whose last row ends at `list_end`.
 pub(super) fn clear_below(list_end: f32, measure: &dyn plx_machine::machine::Measure) -> Rect {
     let width = plx_ui::widgets::Button::pill_w_measured(
-        plx_platform::i18n::msg::browse_search_clear_c(),
+        plx_os::i18n::msg::browse_search_clear_c(),
         plx_ui::theme::size::BODY,
         false,
         None,

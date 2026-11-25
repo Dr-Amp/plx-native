@@ -1,6 +1,6 @@
 # rust-modules — the Rust app core
 
-This crate's ARM build is a `staticlib` linked into the C binary (`pkg/plxnative`). It began as a
+The ARM build is a `staticlib` linked into the C binary (`pkg/plxnative`), made from the webOS platform crate (`plx_platform_webos`), which depends on this one. It began as a
 gradual, module-by-module C→Rust migration; today it IS the app — UI, event loop, player
 engine, demux pipeline, and the Plex data layer all live here (see `docs/agent-reference.md`
 for the architecture). The C side boots the process, records an async-signal-safe fallback crash
@@ -37,6 +37,10 @@ side. Its Rust entry points are `plex_run`, `plx_crash_write_image_marker`,
   also writes the `*** EXIT` record of a library's `exit()` (`plx_exit_record`) and the freeze record.
 - **`src/exit.c`** — libc `exit` defined in the executable, so a library's `exit()` ends the process
   through `plx_exit_record` without running the exit handlers.
+- **`src/access.c`** — libc `access` defined in the executable, so the GPU driver's probes of its four
+  `/tmp` debug-switch paths (`API_PRINT` on every GL call, the other three per draw, swap or
+  `glUseProgram`) are answered "absent" without a kernel path lookup; every other path gets the
+  kernel's own answer.
 - **`src/sentry_context.c`** — a narrow string-only wrapper around Sentry's opaque, by-value
   `sentry_value_t`; Rust calls it without having to reproduce that ARM32 ABI.
 - **`src/svg.c`** — the nanosvg rasterizer (header-only C, fetched at the pinned commit by `ci/deps.py`).
@@ -49,7 +53,7 @@ tool for the C++ interop.
 ## Build (see the Makefile for the full toolchain)
 
 Cross-compiled on the pinned STABLE toolchain (`rust-toolchain.toml`; the `.a` via `cargo
-+$(RUST_TOOLCHAIN) rustc --lib --crate-type staticlib`) for `armv7-unknown-linux-gnueabi`, whose
++$(RUST_TOOLCHAIN) rustc -p plx_platform_webos --lib --crate-type staticlib`) for `armv7-unknown-linux-gnueabi`, whose
 prebuilt ARMv7 std needs no `-Z build-std`; the C side and the final link use the webOS NDK
 (`make setup-env`). Critical TV flags: the ARMv7 target itself (the old ARMv6 target's std emits a
 CP15 memory barrier that SIGILLs on this SoC; ARMv7 emits the dedicated `dmb`),

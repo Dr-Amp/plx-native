@@ -9,9 +9,10 @@ use crate::uri_lifecycle::{Event as LifeEvent, Fx as LifeFx, Lifecycle, Phase};
 use crate::acb_envelope::Ls2VideoInfo;
 use crate::uri_protocol::{AbrBps, AcbSource, Ev, Message, Method, UriCall};
 use plx_base::task::MainThread;
-use plx_platform::tv::plane::{Refusal, Shown};
-use plx_platform::tv::sink::{DisplaySink, VP_ACB, VP_EXPORTED};
-use plx_platform::tv::uri::{Shape, UriMedia};
+use plx_os::tv::plane::{Refusal, Shown};
+use plx_os::tv::sink::{DisplaySink, VP_ACB, VP_EXPORTED};
+use plx_os::tv::uri::{Shape, UriMedia};
+use plx_playback_contract::uri::DisplayEvidence;
 use plx_playback_contract::{AttemptId, BackendEvent, BackendKind, Capabilities, CommandId,
     ContentTime, DispatchResult, DriverEvent, DriverSet, EvidenceSource, ExitDisposition,
     Failure, Observation, Observed, Operation, Playback, ReleaseStatus, SourceKey, SourceKind,
@@ -22,38 +23,65 @@ use std::os::raw::c_int;
 /// A monotonic clock supplied by the runner. The ownership reducer only receives its value.
 pub trait MonotonicClock { fn now_ms(&self) -> u64; }
 
-/// The display path the URI executor is composed with (`Binding` is the contract's value). `Acb`
-/// is the webOS 4.x plane: the paced bind sequence of `acb_bind` through the one plane owner,
-/// released by `UNLOADED` and its completion fence. The executor refuses to start on it unless the
-/// display is in ACB mode and the gate (`acb_bind::gate`) passes, and it forwards only a descriptor
-/// the service itself reported. Routed in production only for a viewer who turned on Settings > Playback
-/// engine > Experimental: nothing else is offered to it. A `devtriggers` build can compose a dev qualifier and
-/// certified capabilities for it (the app's `dev::uri_product`); its attempt then also writes the
+/// The display path the URI executor is composed with. This is the LG driver's own detail: the
+/// shared contract carries only what the driver says of it ([`display_evidence`]), and the
+/// application that composes the driver names this type to configure it. `Acb` is the webOS 4.x
+/// plane: the paced bind sequence of `acb_bind` through the one plane owner, released by `UNLOADED`
+/// and its completion fence. The executor refuses to start on it unless the display is in ACB mode
+/// and the gate (`acb_bind::gate`) passes, and it forwards only a descriptor the service itself
+/// reported. `Exported` is the exported window at a canvas size; `Unbound` is no certified path.
+/// Routed in production only for a viewer who turned on Settings > Playback engine > Experimental:
+/// nothing else is offered to it. A `devtriggers` build can compose a dev qualifier and certified
+/// capabilities for it (the app's `dev::uri_product`); its attempt then also writes the
 /// `uri-trace:` stream (`uri_trace`).
-pub use plx_playback_contract::uri::Binding;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Binding { Exported { canvas: (c_int, c_int) }, Acb, Unbound }
+
+/// The display tags the driver names ([`DisplayEvidence::tag`]): one per [`Binding`].
+pub const TAG_ACB: &str = "acb";
+pub const TAG_EXPORTED: &str = "exported-window";
+pub const TAG_UNBOUND: &str = "unbound";
+
+/// What the driver reports of its display path ([`UriDriver::display`]), a pure function of how it is
+/// composed and of the display's window mode. The path is ready when it can show a source at all:
+/// the ACB plane (whose handle is made later, on demand, and checked by [`UriDriver::ready_to_start`]),
+/// or the exported window with a real canvas on a display in the mode that exports it (`VP_EXPORTED`).
+/// An unbound executor shows nothing. This is only the path: what may be offered through it is still
+/// decided by the capabilities the product certifies. The preview rectangle is never placeable.
+pub fn display_evidence(binding: Binding, display_mode: i32) -> DisplayEvidence {
+    match binding {
+        Binding::Acb => DisplayEvidence::ready(TAG_ACB),
+        Binding::Exported { canvas: (w, h) } if display_mode == VP_EXPORTED && w > 0 && h > 0 =>
+            DisplayEvidence::ready(TAG_EXPORTED),
+        Binding::Exported { .. } => DisplayEvidence::unavailable(TAG_EXPORTED),
+        Binding::Unbound => DisplayEvidence::unavailable(TAG_UNBOUND),
+    }
+}
+
+/// Why [`UriDriver::ready_to_start`] declines on an ACB display, as the offer's decline line says it
+/// (`uri: original declined (<reason>)`): the URI engine's own ACB handle (player type 0) could not
+/// be created or initialized.
+pub const ACB_HANDLE_UNAVAILABLE: &str = "the ACB handle for the URI engine could not be created";
 
 /// The display path composition chooses for the executor, a pure function of what the set and the
 /// boot report:
 ///
-///   - the ACB plane when the display is in ACB mode and the same gate the executor re-checks at
-///     every Start holds (a handle the library confirmed initialized, player type 0 (the URI
-///     engine's own boot handle); `connectDass` is a developer arm and is not asked for);
+///   - the ACB plane when the display is in ACB mode: the URI engine's own handle (player type 0)
+///     is created when the first source is offered (the Start's gate makes it if nothing did), and the gate the executor re-checks at every
+///     Start (a handle the library confirmed initialized, player type 0; `connectDass` is a
+///     developer arm and is not asked for) then decides that play, so composition cannot say
+///     "unbound" for a handle that has not been asked for yet;
 ///   - the exported window ([`Binding::Exported`] on [`EXPORTED_CANVAS`]) when the display is in
 ///     `VP_EXPORTED` mode and `firmware_major` is one the table `strata` lists. Production passes
 ///     [`EXPORTED_STRATA`], whose doc comment is the evidence rule for an entry; the table is a
 ///     parameter (never a `cfg(test)` constant) so a test passes its own. A major of 0, the
 ///     unknown answer, is never admitted, whatever the table lists, and nothing is inferred from a
 ///     neighbouring major;
-///   - otherwise nothing: a webOS 5+ release without an entry plays Standard.
+///   - otherwise nothing: a webOS 5+ major without an entry plays Standard.
 ///
-/// `plane` and `initialized` are the URI engine's own handle's (player type 0, the plane owner's
-/// `facts_of(PlaneHandle::Uri)` and `initialized(PlaneHandle::Uri)`), never Feed's: a normal boot
-/// initializes Feed's handle as player type 10 and the URI engine's as 0. A 5+ set has no ACB
-/// handle, so the exported window's answer does not read them.
-pub fn product_binding(display_mode: i32, plane: plx_platform::tv::plane::PlaneFacts, initialized: bool,
-    firmware_major: u32, strata: &[u32]) -> Binding {
-    let gate = crate::acb_bind::gate(false, display_mode, plane.handle, plane.player_type, false, initialized);
-    if gate.ready {
+/// A 5+ set has no ACB handle, and the exported window's answer reads none.
+pub fn product_binding(display_mode: i32, firmware_major: u32, strata: &[u32]) -> Binding {
+    if display_mode == VP_ACB {
         Binding::Acb
     } else if display_mode == VP_EXPORTED && firmware_major != 0 && strata.contains(&firmware_major) {
         Binding::Exported { canvas: EXPORTED_CANVAS }
@@ -65,12 +93,14 @@ pub fn product_binding(display_mode: i32, plane: plx_platform::tv::plane::PlaneF
 /// The firmware majors on which the product backend selects the exported window
 /// ([`product_binding`]): the only way production ever composes [`Binding::Exported`]. An entry is
 /// a webOS firmware major as `device::info().major` reports it (5 for 5.x, 11 for 11.x). The table
-/// is empty, so every webOS 5+ release plays Standard until a major earns an entry (a webOS 4.x set
-/// takes the ACB plane, which this table does not touch).
+/// admits majors 5 and 10 on tester evidence, and majors 6, 7, 8 and 9 as bracketed by them with no
+/// tester run, and no other, so every other webOS 5+ major (11 included) plays Standard until it
+/// earns an entry (a webOS 4.x set takes the ACB plane, which this table does not touch).
 ///
 /// A major is admitted only with all three parts of the evidence in `docs/uri-mode.md`'s Results
-/// table, each recorded there with the tester log's decisive lines. A release is never admitted on
-/// the developer probe's evidence alone: a run of the product backend is required.
+/// table, each recorded there with the tester log's decisive lines (one exception follows the
+/// list). A release is never admitted on the developer probe's evidence alone: a run of the product
+/// backend is required.
 ///
 ///   - (a) decompile: that major's own firmware image reads `option.windowId` at load
 ///     (`parseLoadMessage`);
@@ -78,18 +108,73 @@ pub fn product_binding(display_mode: i32, plane: plx_platform::tv::plane::PlaneF
 ///     `evidence=override`) shows a moving picture with sound, placed and proportioned right,
 ///     supported by the probe's summary tokens `load=ok`, `playing=yes`,
 ///     `currentTime_advanced=yes` and `window=exported`;
-///   - (c) controls: the probe's `drive` tokens (`pause=froze`, `resume=sent` with `resume_from=`
-///     at or after the paused position minus 1000 ms, `seek=hit`, and `audio=ok` or an
-///     `audio_at_load=`) AND the product run's pause, seek and audio doing what the viewer asked.
+///   - (c) controls: the probe's `drive` tokens (`pause=froze` on either `pause_basis`, `resume=sent`
+///     with `resume_from=` at or after the paused position minus 1000 ms, `seek=hit`, and `audio=ok`
+///     or an `audio_at_load=`) AND the product run's pause, seek and audio doing what the viewer
+///     asked. Two amendments, each named in the row that uses it. (1) A run made before the current
+///     grader may stand on the current grader's verdict on that run's recorded numbers, replayed in
+///     a unit test: the row names the test and says the run itself printed `pause=unconfirmed`.
+///     (2) A control the product run showed failing is acceptable only when the route now sends that
+///     case to Standard; the row names it, and the admission covers only the route as it now stands.
 ///
-/// One exception: a major with (a) but no tester run is admitted when BOTH neighbouring majors
-/// (`major - 1` and `major + 1`) are already admitted on tester evidence, and its own image shows
-/// the same `windowId` path. Its Results row then says "bracketed, no tester run". One admitted
-/// neighbour is not a bracket, and a major with no image to read has no (a).
+/// One exception, the owner's rule of 2026-11-13, "nearest admitted major on each side": a major
+/// with (a), its own image showing the same `windowId` load path, but no tester run is admitted
+/// when the nearest admitted major below it and the nearest admitted major above it were both
+/// admitted on tester evidence. Its Results row then says "bracketed, no tester run". A major
+/// admitted only as bracketed was not admitted on tester evidence, so it is skipped when looking
+/// for a side and never extends a bracket: 6, 7, 8 and 9 each stand between 5 and 10, never
+/// between one another. One side is not a bracket, a major with no image to read has no (a), and
+/// nothing else is inferred from a neighbouring major.
 ///
 /// Each entry carries a comment naming its Results row. `0` is never an entry: it is the unknown
 /// answer.
-pub const EXPORTED_STRATA: &[u32] = &[];
+pub const EXPORTED_STRATA: &[u32] = &[
+    // webOS 5.6.2, LG OLED CX (build 5.6.2-21): `docs/uri-mode.md` Results row "webOS 5.6.2 (build
+    // 5.6.2-21)", #1064. (a) the 5.5.0 and 5.6.2 images read `option.windowId`; (b) a product run on a
+    // debug build of main at e8442d5e (carries #1314; single audio track, SDR and Dolby Vision) played
+    // a placed, correctly letterboxed picture with sound; (c) the drive probe on that build printed
+    // pause=froze (pause_basis=paused_event_and_resume), seek=hit and audio_at_load=0, and the
+    // product run's pause, seek and sound answered, so amendment (1) is not used. The earlier
+    // four-audio-track run's audio-track switch failed; such a file now starts in Standard (#1314,
+    // amendment (2); the application's `exported_uri_leaves_multi_audio_originals_on_standard` pins
+    // the route).
+    5,
+    // Firmware major 6 (the 6.5.3 image): `docs/uri-mode.md` Results row "webOS 6.5.3 (firmware major
+    // 6)", #1064. Bracketed, no tester run. (a) the 6.5.3 image (HE_DTV_W21O_AFABATAA, libplayerAPIs
+    // sha256 0b0f6654) reads `option.windowId` at load in `parseLoadMessage` (0x41556); bracketed by
+    // majors 5 and 10, both admitted on tester evidence; no tester run.
+    6,
+    // Firmware major 7 (the 7.6.0 image): `docs/uri-mode.md` Results row "webOS 7.6.0 (firmware major
+    // 7)", #1064. Bracketed, no tester run. (a) the 7.6.0 image (HE_DTV_W22P_AFADATAA, libplayerAPIs
+    // sha256 0969903e) reads `option.windowId` at load in `parseLoadMessage` (0x467c6); bracketed by
+    // majors 5 and 10, both admitted on tester evidence; no tester run.
+    7,
+    // Firmware major 8 (the 8.3.1 image): `docs/uri-mode.md` Results row "webOS 8.3.1 (firmware major
+    // 8)". Bracketed, no tester run. (a) the 8.3.1 image (HE_DTV_W23O_AFABATAA, OLED65C3PUA firmware
+    // 03.33.25, libplayerAPIs sha256 e5ab26e1) reads `option.windowId` at load in `parseLoadMessage`
+    // (0x47014); bracketed by majors 5 and 10, both admitted on tester evidence; no tester run.
+    8,
+    // Firmware major 9 (the 9.2.4 image): `docs/uri-mode.md` Results row "webOS 9.2.4 / 10.3.1
+    // (33.31.68)", #1064. Bracketed, no tester run. (a) the 9.2.4 image (HE_DTV_W24G_AFABATAA,
+    // libplayerAPIs sha256 cc08e2b8) reads `option.windowId` at load in `parseLoadMessage` (0x4385c);
+    // bracketed by majors 5 and 10, both admitted on tester evidence; no tester run.
+    9,
+    // webOS 25 (firmware 10.3.1, 33.31.68), LG C2: `docs/uri-mode.md` Results row "webOS 9.2.4 / 10.3.1
+    // (33.31.68)", #1064. (a) the 10.3 image reads `option.windowId` at load; (b) the product run of
+    // 2026-11-14 (a debug build the tester does not name, answering the request for the CI build of
+    // run 43421880266, main at 2d565dc9f; one audio track, no subtitles) logged `evidence=override`
+    // and `uri: exported window placed src=3840x1608 rv=1` (2.39:1), both seeks landing on seekDone,
+    // and reported "aspect ratio correct, picture is full width with black bars, audio is playing,
+    // pause, resume, seek working" (pause and resume rest on those words: the paste has no pause
+    // line); two earlier product runs, one on main at 68527cb2 that pasted no lines and one on a 16:9
+    // Dolby Vision MKV, support it and are not relied on; (c) a drive probe on an older build
+    // printed seek=hit and audio=ok but pause=unconfirmed (paused_event=yes, no position while
+    // paused), so amendment (1) is used: the replay test
+    // `uri_drive_webos_25_c2_run_replays_to_pause_froze_from_the_paused_event_and_resume` grades its
+    // recorded numbers (pause at 2410, first position after resume 2729) pause=froze on
+    // pause_basis=paused_event_and_resume. Amendment (2) is not used.
+    10,
+];
 
 /// The canvas the exported window is placed over: the destination of EVERY placement, the whole
 /// 1920x1080 canvas, as Feed (`feed_pump`) and the developer probe (`uriprobe_drive`) place it. Only
@@ -102,7 +187,7 @@ pub struct Config {
     pub transport: &'static dyn UriMedia,
     pub display: &'static dyn DisplaySink,
     /// The process's plane owner: grants the one ACB binding and releases it.
-    pub plane: &'static plx_platform::tv::plane::PlaneOwner,
+    pub plane: &'static plx_os::tv::plane::PlaneOwner,
     pub clock: Box<dyn MonotonicClock>,
     pub app_id: String,
     pub binding: Binding,
@@ -113,7 +198,7 @@ pub struct Config {
 }
 
 pub use plx_playback_contract::uri::{NativeTrackIndex, UriSource};
-use plx_playback_contract::uri::native_index;
+use plx_playback_contract::uri::{native_index, UriNotReady};
 
 struct StagedSource { attempt: AttemptId, key: SourceKey, source: UriSource, deadline_ms: u64 }
 
@@ -152,7 +237,7 @@ pub struct UriBackend {
     played_once: bool,
     subscribed: bool,
     dispatching: Option<PendingControl>,
-    controls: BTreeMap<plx_platform::tv::uri::RequestId, PendingControl>,
+    controls: BTreeMap<plx_os::tv::uri::RequestId, PendingControl>,
     pending: VecDeque<DriverEvent>,
     close_reported: bool,
     quarantine_reported: bool,
@@ -294,6 +379,8 @@ impl UriBackend {
         }
         if self.config.binding == Binding::Acb
             && (self.config.display.window_mode() != VP_ACB || !self.acb_gate(mt)) {
+            plx_base::eventlog::log(
+                "uri-acb: the ACB gate refused this start (see the `acb gate` and `acb handle=uri` lines); nothing was opened and the Start is refused");
             return self.refuse_before_open(attempt, Failure::Unsupported);
         }
         let window_id = match self.config.binding {
@@ -536,7 +623,7 @@ impl UriBackend {
     /// `seekDone`): the startup plan's wait is over. It lands on the event alone, in whatever order
     /// the call's own reply came (first, later or, for all this knows, never), and one that already
     /// refused is gone from the ledger, so a `seekDone` after a refusal lands nothing.
-    fn land_seek(&mut self, request: plx_platform::tv::uri::RequestId, acknowledged: bool,
+    fn land_seek(&mut self, request: plx_os::tv::uri::RequestId, acknowledged: bool,
         current_time: Option<i64>) {
         if !self.controls.get(&request).is_some_and(|pending| matches!(pending.kind, ControlKind::Seek)) {
             return;
@@ -557,7 +644,7 @@ impl UriBackend {
         }
     }
 
-    fn retire_control(&mut self, request: plx_platform::tv::uri::RequestId) {
+    fn retire_control(&mut self, request: plx_os::tv::uri::RequestId) {
         // A confirmed request cannot correlate a later selection of the same native index.
         // Keep the lifecycle's request set aligned with the interactive command ledger.
         self.lifecycle.step(LifeEvent::Retire { request }, &mut Vec::new());
@@ -769,7 +856,8 @@ impl UriBackend {
                     label: if source.is_derived() { "derived-envelope" } else { "observed-envelope" } })
                 .ok_or("the service reported no source envelope for these video facts")
         };
-        let executed = acb_drive::execute(op, mt, self.config.display, self.config.plane, &mut descriptor,
+        let executed = acb_drive::execute(op, mt, self.config.display, self.config.plane, &self.config.app_id,
+            &mut descriptor,
             &mut |_, line| plx_base::eventlog::log(&format!("uri-acb: {line}")));
         if let (true, Some(session)) = (executed.touched, self.lifecycle.session()) {
             self.feed(LifeEvent::AcbTouched { session }, mt, now_ms);
@@ -1055,6 +1143,10 @@ impl DriverSet for UriBackend {
 /// The adapter's view of this driver beyond `DriverSet`: the contract names no driver crate, so the
 /// player holds `Box<dyn UriDriver>` and the composition root boxes a [`UriBackend`] into it.
 impl UriDriver for UriBackend {
+    fn display(&self) -> DisplayEvidence {
+        display_evidence(self.config.binding, self.config.display.window_mode())
+    }
+
     fn stage_source(&mut self, attempt: AttemptId, key: SourceKey, source: UriSource)
         -> Result<(), Failure> {
         UriBackend::stage_source(self, attempt, key, source)
@@ -1065,24 +1157,77 @@ impl UriDriver for UriBackend {
     fn plane_owned(&self) -> bool { UriBackend::plane_owned(self) }
 
     fn maps_track(&self, selection: TrackSelection) -> bool { UriBackend::maps_track(self, selection) }
+
+    /// On an ACB display the URI engine's handle is made here, when the first source is offered
+    /// (#1394), so a create or initialize that fails declines the offer and Feed plays the title.
+    /// The Start's own gate stays the backstop. Every other binding has nothing to set up.
+    fn ready_to_start(&mut self, mt: &MainThread) -> Result<(), UriNotReady> {
+        if self.config.binding != Binding::Acb || self.config.display.window_mode() != VP_ACB {
+            return Ok(());
+        }
+        let gate = acb_drive::uri_handle_gate(mt, self.config.display, self.config.plane,
+            &self.config.app_id, false, false);
+        if gate.ready { Ok(()) } else { Err(UriNotReady::Driver(ACB_HANDLE_UNAVAILABLE)) }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// What the driver reports of its display path, for every binding on every display mode: the
+    /// table the route's evidence used to compute from a `Binding` and `VP_EXPORTED` itself. The ACB
+    /// plane is ready whatever the mode says (its handle is made later and asked about by
+    /// `ready_to_start`); the exported window only on a display in the mode that exports it and
+    /// with a real canvas; an unbound executor never; and no path places a preview rectangle.
     #[test]
-    fn composition_selects_the_acb_plane_only_when_the_gate_holds() {
-        use plx_platform::tv::plane::PlaneFacts;
-        use plx_platform::tv::sink::{VP_ACB, VP_NONE};
-        let facts = PlaneFacts { handle: true, player_type: 0 };
-        // The exported-window table has no say on an ACB display: not even a listed major changes
-        // the ACB answer, and a failed gate stays Unbound rather than falling to the exported window.
+    fn the_display_a_driver_reports_follows_its_binding_and_the_display_mode() {
+        use plx_os::tv::sink::VP_NONE;
+        use plx_playback_contract::uri::{DisplayReadiness, UriNotReady};
+        let modes = [VP_ACB, VP_EXPORTED, VP_NONE];
+        for mode in modes {
+            let acb = display_evidence(Binding::Acb, mode);
+            assert!(acb.is_ready(), "the ACB plane is ready on mode {mode}");
+            assert_eq!(acb.tag, TAG_ACB);
+            let unbound = display_evidence(Binding::Unbound, mode);
+            assert_eq!(unbound.readiness, DisplayReadiness::NotReady(UriNotReady::DisplayUnavailable),
+                "an unbound executor shows nothing on mode {mode}");
+            assert_eq!(unbound.tag, TAG_UNBOUND);
+            for evidence in [acb, unbound, display_evidence(Binding::Exported { canvas: EXPORTED_CANVAS }, mode)] {
+                assert!(!evidence.preview_rectangle, "no path places a preview rectangle");
+            }
+        }
+        let exported = Binding::Exported { canvas: EXPORTED_CANVAS };
+        assert!(display_evidence(exported, VP_EXPORTED).is_ready(), "the exported window on its own mode");
+        assert_eq!(display_evidence(exported, VP_EXPORTED).tag, TAG_EXPORTED);
+        for mode in [VP_ACB, VP_NONE] {
+            assert!(!display_evidence(exported, mode).is_ready(),
+                "the exported window needs the display mode that exports it (mode {mode})");
+        }
+        for canvas in [(0, 1080), (1920, 0), (0, 0), (-1, 1080)] {
+            assert!(!display_evidence(Binding::Exported { canvas }, VP_EXPORTED).is_ready(),
+                "an exported window needs a real canvas: {canvas:?}");
+        }
+    }
+
+    /// The driver's text for a handle it could not make is what the offer's decline line has always
+    /// said, byte for byte: nothing else pins it.
+    #[test]
+    fn the_acb_handle_reason_reads_as_the_decline_line_always_did() {
+        assert_eq!(ACB_HANDLE_UNAVAILABLE, "the ACB handle for the URI engine could not be created");
+        assert_eq!(UriNotReady::Driver(ACB_HANDLE_UNAVAILABLE).log_name(),
+            "the ACB handle for the URI engine could not be created");
+    }
+
+    #[test]
+    fn composition_selects_the_acb_plane_on_an_acb_display_before_its_handle_exists() {
+        use plx_os::tv::sink::{VP_ACB, VP_NONE};
+        // The URI engine's handle is created when the first source is offered (#1394), so an ACB
+        // display is able to take URI plays at composition: "not created yet" is not "unbound". The
+        // gate the Start re-checks decides each play. The exported-window table has no say on an
+        // ACB display: not even a listed major changes the answer.
         for (major, strata) in [(0, &[][..]), (4, &[][..]), (11, &[11][..]), (11, &[][..])] {
-            let at = |mode, plane, initialized| product_binding(mode, plane, initialized, major, strata);
-            assert_eq!(at(VP_ACB, facts, true), Binding::Acb, "major {major}");
-            assert_eq!(at(VP_ACB, facts, false), Binding::Unbound, "a created handle is not an initialized one");
-            assert_eq!(at(VP_ACB, PlaneFacts { handle: true, player_type: 10 }, true), Binding::Unbound);
-            assert_eq!(at(VP_ACB, PlaneFacts::ABSENT, true), Binding::Unbound);
-            assert_eq!(at(VP_NONE, facts, true), Binding::Unbound);
+            let at = |mode| product_binding(mode, major, strata);
+            assert_eq!(at(VP_ACB), Binding::Acb, "major {major}");
+            assert_eq!(at(VP_NONE), Binding::Unbound);
         }
     }
 
@@ -1090,30 +1235,24 @@ mod tests {
     /// (production's is `EXPORTED_STRATA`; a test passes its own, so no table forks the build).
     #[test]
     fn the_exported_window_is_selected_only_for_a_listed_firmware_major() {
-        use plx_platform::tv::plane::PlaneFacts;
-        use plx_platform::tv::sink::{VP_ACB, VP_NONE};
+        use plx_os::tv::sink::{VP_ACB, VP_NONE};
         let exported = Binding::Exported { canvas: EXPORTED_CANVAS };
         assert_eq!(EXPORTED_CANVAS, (1_920, 1_080));
-        // A 5+ set has no ACB handle; a handle that exists must not change the answer either.
-        for plane in [PlaneFacts::ABSENT, PlaneFacts { handle: true, player_type: 0 }] {
-            for initialized in [false, true] {
-                let at = |mode, major, strata: &[u32]| product_binding(mode, plane, initialized, major, strata);
-                assert_eq!(at(VP_EXPORTED, 11, &[11]), exported, "a listed major");
-                assert_eq!(at(VP_EXPORTED, 5, &[5, 11]), exported, "one of several");
-                assert_eq!(at(VP_EXPORTED, 10, &[11]), Binding::Unbound, "an unlisted major");
-                assert_eq!(at(VP_EXPORTED, 12, &[11]), Binding::Unbound, "nothing is inferred from a neighbour");
-                assert_eq!(at(VP_EXPORTED, 0, &[11]), Binding::Unbound, "unknown firmware");
-                assert_eq!(at(VP_EXPORTED, 0, &[0, 11]), Binding::Unbound, "0 is never admitted, even if listed");
-                assert_eq!(at(VP_EXPORTED, 11, &[]), Binding::Unbound, "an empty table admits nothing");
-                assert_eq!(at(VP_NONE, 11, &[11]), Binding::Unbound, "no window path to bind");
-                assert_ne!(at(VP_ACB, 11, &[11]), exported, "the table is for the exported window only");
-            }
-        }
+        let at = |mode, major, strata: &[u32]| product_binding(mode, major, strata);
+        assert_eq!(at(VP_EXPORTED, 11, &[11]), exported, "a listed major");
+        assert_eq!(at(VP_EXPORTED, 5, &[5, 11]), exported, "one of several");
+        assert_eq!(at(VP_EXPORTED, 10, &[11]), Binding::Unbound, "an unlisted major");
+        assert_eq!(at(VP_EXPORTED, 12, &[11]), Binding::Unbound, "nothing is inferred from a neighbour");
+        assert_eq!(at(VP_EXPORTED, 0, &[11]), Binding::Unbound, "unknown firmware");
+        assert_eq!(at(VP_EXPORTED, 0, &[0, 11]), Binding::Unbound, "0 is never admitted, even if listed");
+        assert_eq!(at(VP_EXPORTED, 11, &[]), Binding::Unbound, "an empty table admits nothing");
+        assert_eq!(at(VP_NONE, 11, &[11]), Binding::Unbound, "no window path to bind");
+        assert_ne!(at(VP_ACB, 11, &[11]), exported, "the table is for the exported window only");
     }
 
     use super::*;
-    use plx_platform::tv::sink::{NoSink, PlaneUnload, ScriptedPlaneSink, ScriptedWindowSink, WindowCall};
-    use plx_platform::tv::uri::{CloseStatus, RequestId, SessionId, UriPoll, UriReply};
+    use plx_os::tv::sink::{NoSink, PlaneUnload, ScriptedPlaneSink, ScriptedWindowSink, WindowCall};
+    use plx_os::tv::uri::{CloseStatus, RequestId, SessionId, UriPoll, UriReply};
     use plx_playback_contract::{BackendState, Event as ContractEvent, Fidelity,
         Fx as ContractFx, InitialPlayback, Intent, Requirements, SourceKind, StopReason};
     use std::sync::{atomic::{AtomicU64, Ordering}, Mutex};
@@ -1202,24 +1341,24 @@ mod tests {
     impl Rig {
         fn new() -> Self {
             Self::with(Binding::Unbound, Box::leak(Box::new(NoSink)),
-                Box::leak(Box::new(plx_platform::tv::plane::PlaneOwner::new())))
+                Box::leak(Box::new(plx_os::tv::plane::PlaneOwner::new())))
         }
-        /// An ACB-bound backend over a scripted sink and its own plane owner, booted as a normal boot
-        /// boots it: Feed's handle (player type 10) and the URI engine's (player type 0, the
-        /// measured sequence), each confirmed initialized.
-        fn acb() -> (Self, &'static ScriptedPlaneSink, &'static plx_platform::tv::plane::PlaneOwner) {
+        /// An ACB-bound backend over a scripted sink and its own plane owner with both handles already
+        /// made: Feed's (player type 10, a boot's) and the URI engine's (player type 0, the measured
+        /// sequence, which an offer would otherwise create on demand), each confirmed initialized.
+        fn acb() -> (Self, &'static ScriptedPlaneSink, &'static plx_os::tv::plane::PlaneOwner) {
             let sink: &'static ScriptedPlaneSink =
                 Box::leak(Box::new(ScriptedPlaneSink::new(PlaneUnload { rv: 1, task: 5 })));
-            let plane: &'static plx_platform::tv::plane::PlaneOwner =
-                Box::leak(Box::new(plx_platform::tv::plane::PlaneOwner::new()));
-            plane.boot(plx_platform::tv::plane::PlaneFacts { handle: true, player_type: 10 });
-            plane.boot_handle(plx_platform::tv::plane::PlaneHandle::Uri,
-                plx_platform::tv::plane::PlaneFacts { handle: true, player_type: 0 },
-                plx_platform::tv::plane::HandleSeat { id: 0, initialized: true });
+            let plane: &'static plx_os::tv::plane::PlaneOwner =
+                Box::leak(Box::new(plx_os::tv::plane::PlaneOwner::new()));
+            plane.boot(plx_os::tv::plane::PlaneFacts { handle: true, player_type: 10 });
+            plane.boot_handle(plx_os::tv::plane::PlaneHandle::Uri,
+                plx_os::tv::plane::PlaneFacts { handle: true, player_type: 0 },
+                plx_os::tv::plane::HandleSeat { id: 0, initialized: true });
             (Self::with(Binding::Acb, sink, plane), sink, plane)
         }
         fn with(binding: Binding, display: &'static dyn DisplaySink,
-            plane: &'static plx_platform::tv::plane::PlaneOwner) -> Self {
+            plane: &'static plx_os::tv::plane::PlaneOwner) -> Self {
             let clock = std::sync::Arc::new(AtomicU64::new(0));
             let bus = Box::leak(Box::new(Bus::new()));
             let driver = UriBackend::new(Config { transport: bus, display, plane,
@@ -2079,7 +2218,7 @@ mod tests {
     /// The firmware's completion callbacks of the bind's window and PLAYING calls (the ids the
     /// scripted sink answered `plane_finish` with).
     fn plane_tasks() -> (i64, i64) {
-        use plx_platform::tv::sink::{SCRIPTED_DISPLAY_TASK, SCRIPTED_PLAYING_TASK};
+        use plx_os::tv::sink::{SCRIPTED_DISPLAY_TASK, SCRIPTED_PLAYING_TASK};
         (i64::from(SCRIPTED_DISPLAY_TASK), i64::from(SCRIPTED_PLAYING_TASK))
     }
 
@@ -2233,9 +2372,9 @@ mod tests {
         let (display, playing) = plane_tasks();
         let sink: &'static ScriptedPlaneSink =
             Box::leak(Box::new(ScriptedPlaneSink::new(PlaneUnload { rv: 1, task: 5 })));
-        let plane: &'static plx_platform::tv::plane::PlaneOwner =
-            Box::leak(Box::new(plx_platform::tv::plane::PlaneOwner::new()));
-        plane.boot(plx_platform::tv::plane::PlaneFacts { handle: true, player_type: 0 });
+        let plane: &'static plx_os::tv::plane::PlaneOwner =
+            Box::leak(Box::new(plx_os::tv::plane::PlaneOwner::new()));
+        plane.boot(plx_os::tv::plane::PlaneFacts { handle: true, player_type: 0 });
         let mut rig = Rig::with(Binding::Unbound, sink, plane);
         rig.opened();
         assert_eq!(presented(&rig.service_plays()), 0);
@@ -2248,17 +2387,17 @@ mod tests {
     #[test]
     fn acb_start_refuses_unless_every_gate_fact_holds() {
         // The URI engine's handle as the boot recorded it; Feed's is irrelevant to this gate.
-        let boot = |handle, player_type, initialized| -> &'static plx_platform::tv::plane::PlaneOwner {
-            let plane = Box::leak(Box::new(plx_platform::tv::plane::PlaneOwner::new()));
-            plane.boot_handle(plx_platform::tv::plane::PlaneHandle::Uri,
-                plx_platform::tv::plane::PlaneFacts { handle, player_type },
-                plx_platform::tv::plane::HandleSeat { id: 0, initialized });
+        let boot = |handle, player_type, initialized| -> &'static plx_os::tv::plane::PlaneOwner {
+            let plane = Box::leak(Box::new(plx_os::tv::plane::PlaneOwner::new()));
+            plane.boot_handle(plx_os::tv::plane::PlaneHandle::Uri,
+                plx_os::tv::plane::PlaneFacts { handle, player_type },
+                plx_os::tv::plane::HandleSeat { id: 0, initialized });
             plane
         };
         let scripted = || -> &'static ScriptedPlaneSink {
             Box::leak(Box::new(ScriptedPlaneSink::new(PlaneUnload { rv: 1, task: 5 })))
         };
-        let cases: [(&str, &'static ScriptedPlaneSink, &'static dyn DisplaySink, &'static plx_platform::tv::plane::PlaneOwner); 4] = {
+        let cases: [(&str, &'static ScriptedPlaneSink, &'static dyn DisplaySink, &'static plx_os::tv::plane::PlaneOwner); 4] = {
             let (a, b, c, d) = (scripted(), scripted(), scripted(), scripted());
             [("a created handle is not an initialized one", a, a, boot(true, 0, false)),
              ("the measured sequence initialized player type 0", b, b, boot(true, 10, true)),
@@ -2273,6 +2412,112 @@ mod tests {
             // The refusal leaves the backend startable.
             assert!(rig.driver.exit_disposition() == ExitDisposition::Clean, "{case}");
         }
+    }
+
+    /// What a normal boot leaves: Feed's handle (player type 10) booted and the URI engine's NOT. The
+    /// sink answers `ids` to the creates it is asked for.
+    fn boot_without_the_uri_handle(ids: &[std::os::raw::c_long])
+        -> (&'static ScriptedPlaneSink, &'static plx_os::tv::plane::PlaneOwner) {
+        let sink: &'static ScriptedPlaneSink =
+            Box::leak(Box::new(ScriptedPlaneSink::new(PlaneUnload { rv: 1, task: 5 })));
+        sink.create_ids.lock().unwrap().extend(ids.iter().copied());
+        let plane: &'static plx_os::tv::plane::PlaneOwner =
+            Box::leak(Box::new(plx_os::tv::plane::PlaneOwner::new()));
+        plane.boot(plx_os::tv::plane::PlaneFacts { handle: true, player_type: 10 });
+        (sink, plane)
+    }
+
+    /// #1394: the boot no longer makes the URI engine's handle. The offer makes it; where no offer did
+    /// (the probe, a driver started without one) the Start's own gate makes it (player type 0, on the
+    /// main thread, before anything is opened) and every later Start reuses it.
+    #[test]
+    fn the_first_acb_start_creates_the_uri_handle_once_and_a_later_start_reuses_it() {
+        let (sink, plane) = boot_without_the_uri_handle(&[22]);
+        let mut first = Rig::with(Binding::Acb, sink, plane);
+        assert!(sink.created_player_types().is_empty(), "composing the driver creates nothing");
+        let log = plx_base::eventlog::with_private_log(|| {
+            assert_eq!(first.start(A), DispatchResult::Queued);
+            std::fs::read_to_string(plx_base::eventlog::events_log()).unwrap_or_default()
+        });
+        assert_eq!(sink.created_player_types(), [0], "player type 0, once");
+        assert!(plane.initialized(plx_os::tv::plane::PlaneHandle::Uri));
+        assert!(log.contains("acb handle=uri ptype=0 create=22 initialized=true\n"), "{log}");
+        let mut second = Rig::with(Binding::Acb, sink, plane);
+        assert_eq!(second.start(A), DispatchResult::Queued);
+        assert_eq!(sink.created_player_types(), [0], "a second play creates no second handle");
+    }
+
+    /// A create that fails refuses THAT Start (`Failure::Unsupported`, the route's existing refused-Start
+    /// path), with the reason in the log, before anything is opened; it is not retried.
+    #[test]
+    fn a_failed_on_demand_create_refuses_the_start_with_a_reason_and_is_not_retried() {
+        let (sink, plane) = boot_without_the_uri_handle(&[]);
+        let mut rig = Rig::with(Binding::Acb, sink, plane);
+        let log = plx_base::eventlog::with_private_log(|| {
+            assert_eq!(rig.start(A), DispatchResult::Refused(Failure::Unsupported));
+            std::fs::read_to_string(plx_base::eventlog::events_log()).unwrap_or_default()
+        });
+        assert!(log.contains("acb handle=uri ptype=0 create=0 initialized=false\n"), "{log}");
+        assert!(log.contains("nothing was opened and the Start is refused"), "{log}");
+        assert!(rig.bus_methods().is_empty(), "nothing was opened");
+        assert!(rig.driver.exit_disposition() == ExitDisposition::Clean);
+        let mut again = Rig::with(Binding::Acb, sink, plane);
+        assert_eq!(again.start(A), DispatchResult::Refused(Failure::Unsupported));
+        assert_eq!(sink.created_player_types(), [0], "a failed create is not retried");
+    }
+
+    /// #1394: the offer is where the handle is made. A driver on an ACB display whose handle is not
+    /// there yet makes it when asked whether it is ready, once, and a Start after it finds it.
+    #[test]
+    fn readiness_on_an_acb_display_creates_the_uri_handle_once() {
+        let (sink, plane) = boot_without_the_uri_handle(&[22]);
+        let mut rig = Rig::with(Binding::Acb, sink, plane);
+        assert!(sink.created_player_types().is_empty());
+        let log = plx_base::eventlog::with_private_log(|| {
+            assert_eq!(rig.driver.ready_to_start(&rig.mt), Ok(()));
+            std::fs::read_to_string(plx_base::eventlog::events_log()).unwrap_or_default()
+        });
+        assert_eq!(sink.created_player_types(), [0]);
+        assert!(log.contains("acb handle=uri ptype=0 create=22 initialized=true\n"), "{log}");
+        assert_eq!(rig.driver.ready_to_start(&rig.mt), Ok(()));
+        assert_eq!(rig.start(A), DispatchResult::Queued);
+        assert_eq!(sink.created_player_types(), [0], "neither the second ask nor the Start made another");
+    }
+
+    /// A create that fails makes the driver not ready, with the reason the offer logs; the failure is
+    /// recorded, so asking again makes no second attempt. The Start's gate still refuses.
+    #[test]
+    fn readiness_after_a_failed_create_says_so_and_is_not_retried() {
+        let (sink, plane) = boot_without_the_uri_handle(&[]);
+        let mut rig = Rig::with(Binding::Acb, sink, plane);
+        let declined = Err(UriNotReady::Driver(ACB_HANDLE_UNAVAILABLE));
+        assert_eq!(rig.driver.ready_to_start(&rig.mt), declined);
+        assert_eq!(rig.driver.ready_to_start(&rig.mt), declined);
+        assert_eq!(sink.created_player_types(), [0], "one attempt");
+        assert_eq!(rig.start(A), DispatchResult::Refused(Failure::Unsupported), "the backstop");
+        assert_eq!(sink.created_player_types(), [0]);
+    }
+
+    /// Nothing to set up off the ACB display: an exported-window driver is ready, as is an ACB-bound
+    /// driver over a display that is not ACB (its Start refuses), and neither makes a handle.
+    #[test]
+    fn readiness_off_the_acb_display_is_ready_and_makes_no_handle() {
+        let (sink, plane) = boot_without_the_uri_handle(&[22]);
+        let mut exported = Rig::with(Binding::Exported { canvas: (1920, 1080) }, sink, plane);
+        assert_eq!(exported.driver.ready_to_start(&exported.mt), Ok(()));
+        let mut elsewhere = Rig::with(Binding::Acb, Box::leak(Box::new(NoSink)), plane);
+        assert_eq!(elsewhere.driver.ready_to_start(&elsewhere.mt), Ok(()));
+        assert!(sink.created_player_types().is_empty());
+    }
+
+    /// The handle is made for a display that can have one: a driver composed over any other display
+    /// refuses its Start before the gate and so makes none.
+    #[test]
+    fn a_start_on_a_display_that_is_not_acb_creates_no_handle() {
+        let (sink, plane) = boot_without_the_uri_handle(&[22]);
+        let mut rig = Rig::with(Binding::Acb, Box::leak(Box::new(NoSink)), plane);
+        assert_eq!(rig.start(A), DispatchResult::Refused(Failure::Unsupported));
+        assert!(sink.created_player_types().is_empty());
     }
 
     #[test]
@@ -2312,7 +2557,7 @@ mod tests {
         assert!(events.iter().any(|event| matches!(event, DriverEvent::Observation { observation:
             Observation::Playback(Observed { value: Playback::ReadyAwaitPlay, .. }), .. })));
         assert_eq!(sink.calls(), ["plane_media_id m1"]);
-        assert_eq!(plane.phase(), plx_platform::tv::plane::Phase::Bound);
+        assert_eq!(plane.phase(), plx_os::tv::plane::Phase::Bound);
         assert!(rig.driver.plane_owned(), "from the owner's grant on, the plane is this attempt's");
         for (t, expect) in [(199, 1), (200, 2), (399, 2), (400, 2), (599, 2), (600, 3), (899, 3), (900, 4)] {
             rig.at(t);
@@ -2372,7 +2617,7 @@ mod tests {
         assert!(sink.calls().is_empty(), "nothing binds before the service has loaded the media");
         rig.subscription_says(CAPTURED_LOAD_COMPLETED);
         assert_eq!(sink.calls(), ["plane_media_id m1"]);
-        assert_eq!(plane.phase(), plx_platform::tv::plane::Phase::Bound);
+        assert_eq!(plane.phase(), plx_os::tv::plane::Phase::Bound);
         for t in [200, 400, 600, 900] { rig.at(t); rig.driver.poll(&rig.mt); }
         let len = captured_envelope().to_string().len();
         assert_eq!(sink.calls(), ["plane_media_id m1", "plane_loaded",
@@ -2464,9 +2709,9 @@ mod tests {
     fn acb_a_refused_bind_is_a_typed_failure_that_unloads_nothing() {
         let (mut rig, sink, plane) = Rig::acb();
         // Another backend (Feed, over its own handle) already holds the plane.
-        assert_eq!(plane.bind(sink, &rig.mt, plx_platform::tv::plane::PlaneHandle::Feed,
-            plx_platform::tv::plane::BindPolicy::Rebind, "other"),
-            plx_platform::tv::plane::BindVerdict::Granted);
+        assert_eq!(plane.bind(sink, &rig.mt, plx_os::tv::plane::PlaneHandle::Feed,
+            plx_os::tv::plane::BindPolicy::Rebind, "other"),
+            plx_os::tv::plane::BindVerdict::Granted);
         rig.acb_loading();
         rig.bus.say("subscribe", ENVELOPE);
         let events = rig.driver.poll(&rig.mt);
@@ -2482,8 +2727,8 @@ mod tests {
         let (mut rig, sink, plane) = Rig::acb();
         // Feed's handle held the plane and is being released: the URI engine's bind waits for that
         // handle's UNLOADED.
-        plane.bind(sink, &rig.mt, plx_platform::tv::plane::PlaneHandle::Feed,
-            plx_platform::tv::plane::BindPolicy::Rebind, "previous");
+        plane.bind(sink, &rig.mt, plx_os::tv::plane::PlaneHandle::Feed,
+            plx_os::tv::plane::BindPolicy::Rebind, "previous");
         plane.unload(sink, &rig.mt);
         rig.acb_loading();
         rig.bus.say("subscribe", ENVELOPE);
@@ -2515,11 +2760,11 @@ mod tests {
         // The firmware's callback for the UNLOADED task (and another task's, which is no fence).
         sink.mailbox.push(4, 1);
         rig.driver.poll(&rig.mt);
-        assert_ne!(plane.phase(), plx_platform::tv::plane::Phase::Released);
+        assert_ne!(plane.phase(), plx_os::tv::plane::Phase::Released);
         sink.mailbox.push(5, 1);
         let events = rig.driver.poll(&rig.mt);
         assert!(events.contains(&DriverEvent::Release { attempt: A, status: ReleaseStatus::Released }), "{events:?}");
-        assert_eq!(plane.phase(), plx_platform::tv::plane::Phase::Released);
+        assert_eq!(plane.phase(), plx_os::tv::plane::Phase::Released);
         assert_eq!(rig.driver.exit_disposition(), ExitDisposition::Clean);
         assert!(!rig.driver.plane_owned());
     }
@@ -2557,12 +2802,12 @@ mod tests {
         rig.driver.poll(&rig.mt);
         rig.driver.dispatch(&rig.mt, A, rig.command, Operation::Stop(StopReason::Stop));
         rig.driver.poll(&rig.mt);
-        assert_eq!(plane.phase(), plx_platform::tv::plane::Phase::Releasing);
+        assert_eq!(plane.phase(), plx_os::tv::plane::Phase::Releasing);
         // The owner measures its deadline on its own monotonic clock.
-        std::thread::sleep(std::time::Duration::from_millis(plx_platform::tv::plane::RELEASE_FENCE_MS + 100));
+        std::thread::sleep(std::time::Duration::from_millis(plx_os::tv::plane::RELEASE_FENCE_MS + 100));
         let events = rig.driver.poll(&rig.mt);
         assert!(events.contains(&DriverEvent::Release { attempt: A, status: ReleaseStatus::Quarantined }), "{events:?}");
-        assert_eq!(plane.phase(), plx_platform::tv::plane::Phase::Quarantined(plx_platform::tv::plane::Why::Deadline));
+        assert_eq!(plane.phase(), plx_os::tv::plane::Phase::Quarantined(plx_os::tv::plane::Why::Deadline));
         assert_eq!(rig.driver.exit_disposition(), ExitDisposition::PreserveNativeOwnership);
         assert_eq!(sink.unload_count(), 1);
     }
@@ -2618,9 +2863,29 @@ mod tests {
         /// `VP_EXPORTED`) over a sink that records every window verb and accepts every placement.
         fn exported() -> (Self, &'static ScriptedWindowSink) {
             let sink: &'static ScriptedWindowSink = Box::leak(Box::new(ScriptedWindowSink::new(1)));
-            let plane = Box::leak(Box::new(plx_platform::tv::plane::PlaneOwner::new()));
+            let plane = Box::leak(Box::new(plx_os::tv::plane::PlaneOwner::new()));
             (Self::with(Binding::Exported { canvas: FULL }, sink, plane), sink)
         }
+    }
+
+    /// The driver reports exactly what `display_evidence` computes from how it is composed and from
+    /// the display it was given: an ACB driver is ready, an exported driver over a display in the
+    /// exported mode is ready, and an exported driver over a display that is not, or an unbound
+    /// one, is not.
+    #[test]
+    fn the_driver_reports_the_display_its_binding_and_its_sink_compose() {
+        let (acb, _, _) = Rig::acb();
+        assert_eq!(acb.driver.display(), display_evidence(Binding::Acb, VP_ACB));
+        assert!(acb.driver.display().is_ready());
+        let (exported, sink) = Rig::exported();
+        assert_eq!(exported.driver.display(),
+            display_evidence(Binding::Exported { canvas: FULL }, sink.window_mode()));
+        assert!(exported.driver.display().is_ready(), "the scripted window sink is in the exported mode");
+        assert!(!Rig::new().driver.display().is_ready(), "an unbound driver shows nothing");
+        let plane = Box::leak(Box::new(plx_os::tv::plane::PlaneOwner::new()));
+        let elsewhere = Rig::with(Binding::Exported { canvas: FULL }, Box::leak(Box::new(NoSink)), plane);
+        assert!(!elsewhere.driver.display().is_ready(),
+            "an exported binding over a display that is not in the exported mode shows nothing");
     }
 
     #[test]
@@ -2697,7 +2962,7 @@ mod tests {
     #[test]
     fn only_the_exported_binding_creates_or_places_a_window() {
         let sink: &'static ScriptedWindowSink = Box::leak(Box::new(ScriptedWindowSink::new(1)));
-        let plane = Box::leak(Box::new(plx_platform::tv::plane::PlaneOwner::new()));
+        let plane = Box::leak(Box::new(plx_os::tv::plane::PlaneOwner::new()));
         let mut rig = Rig::with(Binding::Unbound, sink, plane);
         rig.opened();
         rig.subscription_says(CAPTURED_VIDEO_INFO);

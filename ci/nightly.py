@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """One nightly prerelease per UTC day, cut from `main` — plan, notes, the site's "latest nightly"
 pointer, and retention. Stdlib only; the only subprocess this file ever shells out to is `git` (for
-`plan`, over the checkout it already has) and `gh` (for `latest-json` and `prune`, over the network
-the workflow already has a token for).
+`plan`, over the checkout it already has) and `gh` (for `latest-json`, `repo-json` and `prune`,
+over the network the workflow already has a token for).
+
+Nightly RELEASES live in their own repository, `RELEASE_REPO`, so that watching the main
+repository's releases announces real releases only. Their `nightly/v*` TAGS stay in the source
+repository: `plan` diffs against the previous one, the notes' compare link spans two of them, and a
+release in `RELEASE_REPO` cannot point at a commit that repository does not have (its own copy of
+the tag sits on that repository's `main`). So the commit a release was built from is read from the
+source repository's tag, never from the release's `target_commitish`.
 
 Nightly is a THIRD install beside stable and debug (`ci/flavor.py`'s `nightly` flavour): its own app
 id, its own tile, its own sign-in, always a `RELEASE=1` build, reporting a dated version
@@ -18,6 +25,7 @@ Five subcommands, each independently testable as a pure function plus a thin CLI
   repo-json   — the Homebrew Channel repository at `plxnative.com/nightly/repo.json`: the index,
                 the newest nightly's manifest and a description page; an empty index if none.
   prune       — delete nightly releases (and their tags) older than N days, keeping the newest.
+  release-repo — print `RELEASE_REPO`, so the workflow publishes where this file reads.
 
 `--selftest` runs the pure-logic tests below `make check` also runs (see `ci/flavor.py` for the
 established shape of a same-file selftest); it needs no git repository and no network.
@@ -27,6 +35,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import re
 import subprocess
 import sys
@@ -44,6 +53,11 @@ ROOT = Path(__file__).resolve().parent.parent
 #: stable release (`v...`) must never be mistaken for a nightly by either of them.
 TAG_PREFIX = "nightly/v"
 
+#: Where nightly releases are published (see the module docstring). Writing to it needs a token
+#: scoped to that repository — the workflow's own `GITHUB_TOKEN` can write only to the source
+#: repository — which the workflows pass as `NIGHTLY_RELEASE_TOKEN`.
+RELEASE_REPO = "plxnative/plx-native-nightly"
+
 #: The Homebrew Channel repository this file generates. A nightly is NOT in the webosbrew
 #: catalogue (that listing is keyed to the stable app id), so Homebrew Channel users add this URL
 #: under Settings > Add repository instead — `docs/nightly-builds.md` is the guide. The files live
@@ -52,6 +66,12 @@ TAG_PREFIX = "nightly/v"
 SITE_ORIGIN = "https://plxnative.com"
 REPO_JSON_URL = f"{SITE_ORIGIN}/nightly/repo.json"
 GUIDE_URL = f"{SITE_ORIGIN}/nightly/"
+SAMSUNG_GUIDE_URL = f"{GUIDE_URL}samsung/"
+SAMSUNG_ALPHA = (
+    "It has never been run on a real Samsung TV - only on Samsung's TV emulator. "
+    "For Samsung TVs from 2021 or newer (Tizen 6.0 or newer) only. "
+    "It may not start at all."
+)
 PACKAGE_ID = "com.beb.plxnative.nightly"
 #: The manifest `build-package.yml` generates for the nightly package and `publish` attaches to the
 #: release under this name; also what is served beside `repo.json`.
@@ -127,7 +147,7 @@ def changed_outside_site_docs(paths: "list[str]") -> bool:
     return any(not (p.startswith("site/") or p.startswith("docs/")) for p in paths if p.strip())
 
 
-def plan_decision(dry: bool, prev_tag: "str | None", changed: "list[str]") -> "tuple[bool, str]":
+def plan_decision(dry: bool, prev_tag: "str | None", changed: "list[str]", *, force: bool = False) -> "tuple[bool, str]":
     """The `(skip, reason)` decision, isolated from git and the clock so `--selftest` can cover it
     directly. `changed` is `git diff --name-only prev_tag..head`'s output, meaningful only when
     `prev_tag` is not `None` and `dry` is false — the two cases that skip ever fires for.
@@ -139,6 +159,8 @@ def plan_decision(dry: bool, prev_tag: "str | None", changed: "list[str]") -> "t
     """
     if dry:
         return False, "dry run (pull_request or dry_run input) — always builds regardless of what changed"
+    if force:
+        return False, "manual dispatch requested a new nightly even if main is unchanged"
     if prev_tag is None:
         return False, "no previous nightly tag — first nightly"
     if changed_outside_site_docs(changed):
@@ -146,7 +168,7 @@ def plan_decision(dry: bool, prev_tag: "str | None", changed: "list[str]") -> "t
     return True, f"no commit outside site/ and docs/ since {prev_tag}"
 
 
-def cmd_plan(date: str, head: str, dry: bool) -> int:
+def cmd_plan(date: str, head: str, dry: bool, force: bool = False) -> int:
     """Print `$GITHUB_OUTPUT`-shaped `key=value` lines: `version`, `label`, `tag`, `prev_tag`,
     `skip`, `reason`. Refuses (non-zero, `::error::`) if `tag` already exists — same-day rebuilds
     are refused by design; delete the release and its tag first if a genuine re-cut is wanted.
@@ -170,9 +192,9 @@ def cmd_plan(date: str, head: str, dry: bool) -> int:
 
     prev_tag = newest_nightly_tag()
     changed = []
-    if not dry and prev_tag is not None:
+    if not (dry or force) and prev_tag is not None:
         changed = [p for p in _git(["diff", "--name-only", f"{prev_tag}..{head}"]).splitlines() if p]
-    skip, reason = plan_decision(dry, prev_tag, changed)
+    skip, reason = plan_decision(dry, prev_tag, changed, force=force)
 
     print(f"version={version}")
     print(f"label={label}")
@@ -184,7 +206,7 @@ def cmd_plan(date: str, head: str, dry: bool) -> int:
 
 
 def render_notes(*, label: str, sha: str, prev_tag: "str | None", ipk: str, sha256: str, repo: str,
-                  changes: "list[str]") -> str:
+                  changes: "list[str]", tpk: str = "", tpk_sha256: str = "") -> str:
     """The release body. Markdown, no hard wrapping (each sentence stays on one line — a reader's
     browser wraps it, a `sed`-based diff of two notes should not have to fight line breaks that
     carry no meaning), and every link absolute so the body reads the same copied out of the page as
@@ -216,7 +238,18 @@ def render_notes(*, label: str, sha: str, prev_tag: "str | None", ipk: str, sha2
             f"[Latest stable release]({latest_release_link})"
         )
 
+    samsung = "## Samsung (Tizen)\n\nNo Samsung build tonight."
+    if tpk:
+        samsung = (
+            "## Samsung (Tizen) - SUPER ALPHA\n\n"
+            f"{SAMSUNG_ALPHA} "
+            f"[If you try it, please send us a log]({SAMSUNG_GUIDE_URL}#send-a-log).\n\n"
+            f"Install `{tpk}` with Apps2Samsung. [Samsung installation guide]({SAMSUNG_GUIDE_URL})\n\n"
+            "The exact SDL build inputs are attached as `tizen-sdl-source.tar`.\n\n"
+            f"```\n{tpk_sha256}  {tpk}\n```"
+        )
     return "\n\n".join([
+        "## LG (webOS)",
         f"Automatic build of `main` at [`{short_sha}`]({commit_link}). It installs beside "
         "PlxNative as a separate app, \"PlxNative Nightly\", with its own launcher tile and its "
         "own sign-in — your regular PlxNative install is untouched.",
@@ -244,10 +277,17 @@ def render_notes(*, label: str, sha: str, prev_tag: "str | None", ipk: str, sha2
         f"```\n{sha256}  {ipk}\n```\n\n"
         "This package bundles FFmpeg under LGPL-2.1-or-later; the complete corresponding source is "
         "attached below. Nightly builds are deleted after 30 days.",
+
+        samsung,
     ])
 
 
 def cmd_notes(args: argparse.Namespace) -> int:
+    if bool(args.tpk) != bool(args.tpk_sha256) or (args.tpk and (
+        args.tpk != f"plxnative-tizen-v{args.label}-armv7.tpk" or not re.fullmatch(r"[0-9a-f]{64}", args.tpk_sha256)
+    )):
+        print("::error::Samsung notes require the expected TPK filename and its SHA-256", file=sys.stderr)
+        return 1
     changes_raw = _git([
         "log", "--first-parent", "--format=- %s", f"{args.prev_tag}..{args.sha}",
         "--", ".", ":!site", ":!docs",
@@ -255,7 +295,7 @@ def cmd_notes(args: argparse.Namespace) -> int:
     changes = [line for line in changes_raw.splitlines() if line]
     print(render_notes(
         label=args.label, sha=args.sha, prev_tag=args.prev_tag or None,
-        ipk=args.ipk, sha256=args.sha256, repo=args.repo, changes=changes,
+        ipk=args.ipk, sha256=args.sha256, repo=args.repo, changes=changes, tpk=args.tpk, tpk_sha256=args.tpk_sha256,
     ))
     return 0
 
@@ -264,10 +304,51 @@ def _gh_json(args: "list[str]") -> object:
     return json.loads(_run(["gh", *args]))
 
 
-def _nightly_releases(repo: str) -> "list[dict]":
-    releases = _gh_json(["api", f"repos/{repo}/releases", "--paginate"])
-    assert isinstance(releases, list)
-    return [r for r in releases if r.get("tag_name", "").startswith(TAG_PREFIX)]
+def _nightly_releases(source_repo: str) -> "list[dict]":
+    """Every nightly release, each tagged with the repository it lives in (`_repo`).
+
+    Reads `RELEASE_REPO` and the source repository both. Nightlies cut before releases moved to
+    `RELEASE_REPO` are still in the source repository until `prune` retires them, and reading both
+    keeps the site serving the newest one across the switch instead of an empty repository until
+    the first nightly lands in the new place. Once the source repository has no `nightly/v*`
+    release left, its half of this returns nothing.
+    """
+    found = []
+    for repo in dict.fromkeys([RELEASE_REPO, source_repo]):
+        releases = _gh_json(["api", f"repos/{repo}/releases", "--paginate"])
+        assert isinstance(releases, list)
+        found += [{**r, "_repo": repo} for r in releases
+                  if r.get("tag_name", "").startswith(TAG_PREFIX)]
+    return found
+
+
+_FULL_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def commit_from_release(release: dict, source_repo: str) -> "str | None":
+    """The source commit when the release itself names it, else `None`. Pure.
+
+    Only a release published IN the source repository targets the built commit; one in
+    `RELEASE_REPO` targets that repository's own branch, and its commit has to come from the
+    source repository's tag (`_source_commit`)."""
+    target = release.get("target_commitish", "")
+    if release.get("_repo") == source_repo and _FULL_SHA.fullmatch(target):
+        return target
+    return None
+
+
+def _source_commit(release: dict, source_repo: str) -> str:
+    known = commit_from_release(release, source_repo)
+    if known:
+        return known
+    ref = _gh_json(["api", f"repos/{source_repo}/git/ref/tags/{release['tag_name']}"])
+    assert isinstance(ref, dict)
+    obj = ref["object"]
+    if obj["type"] == "tag":  # an annotated tag: follow it to the commit
+        tag = _gh_json(["api", f"repos/{source_repo}/git/tags/{obj['sha']}"])
+        assert isinstance(tag, dict)
+        obj = tag["object"]
+    return obj["sha"]
 
 
 def pick_latest_release(releases: "list[dict]") -> "dict | None":
@@ -278,7 +359,7 @@ def pick_latest_release(releases: "list[dict]") -> "dict | None":
     return max(releases, key=lambda r: r["created_at"])
 
 
-def latest_json_payload(release: dict, sha256: str) -> dict:
+def latest_json_payload(release: dict, sha256: str, commit: str) -> dict:
     """The `{version, tag, commit, date, ipk_url, sha256, release_url}` shape the site's
     `latest.json` serves, built from one release object (as `gh api` returns it) and the already-
     fetched sha256 text. Pure — split out from `cmd_latest_json` so `--selftest` can cover the
@@ -294,7 +375,7 @@ def latest_json_payload(release: dict, sha256: str) -> dict:
     return {
         "version": label,
         "tag": tag,
-        "commit": release["target_commitish"],
+        "commit": commit,
         "date": date,
         "ipk_url": ipk_asset["browser_download_url"],
         "sha256": sha256.split()[0],
@@ -319,7 +400,7 @@ def cmd_latest_json(repo: str) -> int:
         return 0
     with urllib.request.urlopen(sha_asset["browser_download_url"]) as resp:  # noqa: S310 — public asset
         sha256_text = resp.read().decode()
-    print(json.dumps(latest_json_payload(release, sha256_text)))
+    print(json.dumps(latest_json_payload(release, sha256_text, _source_commit(release, repo))))
     return 0
 
 
@@ -426,7 +507,7 @@ def pick_servable_release(releases: "list[dict]") -> "tuple[dict, dict, dict] | 
 
 
 def build_repo_files(release: "dict | None", sha256_text: str, manifest_text: "str | None",
-                     repo: str) -> "dict[str, str]":
+                     repo: str, commit: str = "") -> "dict[str, str]":
     """Every file `plxnative.com/nightly/` serves for the Homebrew Channel repository, as
     `{filename: text}`. Pure — takes what `gh api` and the asset downloads already returned, so
     `--selftest` covers it without a network.
@@ -450,7 +531,7 @@ def build_repo_files(release: "dict | None", sha256_text: str, manifest_text: "s
         "repo.json": json.dumps(repo_index(repo), indent=2) + "\n",
         MANIFEST_NAME: json.dumps(manifest, indent=2) + "\n",
         "description.html": description_html(
-            label=label, sha=release["target_commitish"], release_url=release["html_url"],
+            label=label, sha=commit, release_url=release["html_url"],
             repo=repo),
     }
 
@@ -466,10 +547,12 @@ def cmd_repo_json(repo: str, out_dir: str) -> int:
     manifest that DISAGREES with its own release is a failure (see `repo_manifest`)."""
     picked = pick_servable_release(_nightly_releases(repo))
     release = sha_text = manifest_text = None
+    commit = ""
     if picked is not None:
         release, sha_asset, manifest_asset = picked
         sha_text, manifest_text = _download(sha_asset), _download(manifest_asset)
-    files = build_repo_files(release, sha_text or "", manifest_text, repo)
+        commit = _source_commit(release, repo)
+    files = build_repo_files(release, sha_text or "", manifest_text, repo, commit)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     for name, text in files.items():
@@ -498,7 +581,21 @@ def select_prune_victims(releases: "list[dict]", days: int, now: datetime) -> "l
     return [r for r in rest if _created(r) < cutoff]
 
 
+def _release_repo_env() -> "dict[str, str]":
+    """The environment for a `gh` call that writes to `RELEASE_REPO`: the ambient `GH_TOKEN` is
+    the workflow's own, which cannot."""
+    token = os.environ.get("NIGHTLY_RELEASE_TOKEN", "")
+    if not token:
+        raise _fail(f"NIGHTLY_RELEASE_TOKEN is required to delete releases in {RELEASE_REPO}")
+    return {**os.environ, "GH_TOKEN": token}
+
+
 def cmd_prune(repo: str, days: int, dry_run: bool) -> int:
+    """Retention over BOTH places a nightly can live (`_nightly_releases`), so the newest one is
+    kept whichever repository it is in and the source repository's pre-move nightlies age out on
+    the same 30-day clock. A release in `RELEASE_REPO` takes that repository's tag with it, and
+    the source repository's tag of the same name goes too; one in the source repository is
+    deleted with its tag there, as before."""
     releases = _nightly_releases(repo)
     victims = select_prune_victims(releases, days, datetime.now(timezone.utc))
     if not victims:
@@ -506,13 +603,19 @@ def cmd_prune(repo: str, days: int, dry_run: bool) -> int:
               "besides the newest)")
         return 0
     for r in victims:
-        tag = r["tag_name"]
+        tag, where = r["tag_name"], r["_repo"]
         if dry_run:
-            print(f"would delete {tag} (created {r['created_at']})")
+            print(f"would delete {tag} in {where} (created {r['created_at']})")
             continue
-        subprocess.run(["gh", "release", "delete", tag, "--repo", repo, "--cleanup-tag", "-y"],
-                        check=True)
-        print(f"deleted {tag} and its tag")
+        env = _release_repo_env() if where != repo else None
+        subprocess.run(["gh", "release", "delete", tag, "--repo", where, "--cleanup-tag", "-y"],
+                       check=True, env=env)
+        if where != repo:
+            gone = subprocess.run(["gh", "api", "-X", "DELETE", f"repos/{repo}/git/refs/tags/{tag}"],
+                                  capture_output=True, text=True)
+            if gone.returncode != 0 and "Reference does not exist" not in gone.stderr:
+                raise _fail(f"could not delete {repo}'s tag {tag}: {gone.stderr.strip()}")
+        print(f"deleted {tag} in {where} and its tag")
     return 0
 
 
@@ -556,11 +659,14 @@ def _selftest() -> int:
                                   changed=["rust-modules/src/app.rs"])
     check(skip is False, "not dry, prev_tag set, an app file changed -> do not skip")
 
+    skip, reason = plan_decision(dry=False, prev_tag="nightly/v0.7.0-nightly-20260918", changed=[], force=True)
+    check(skip is False and "manual dispatch" in reason, "a manual retry can build unchanged main")
+
     # notes rendering
     body = render_notes(
         label="0.7.0-nightly-20260919", sha="abc1234def5678900000000000000000000000",
         prev_tag="nightly/v0.7.0-nightly-20260918", ipk="plxnative-v0.7.0-nightly-20260919.ipk",
-        sha256="deadbeef" * 8, repo="GLinnik21/plx-native",
+        sha256="deadbeef" * 8, repo="plxnative/plx-native",
         changes=["- session: one in-memory cache owned by the session module (#136)"],
     )
     check("PlxNative Nightly" in body, "notes name the nightly tile")
@@ -579,26 +685,43 @@ def _selftest() -> int:
           "the first paragraph is not internally hard-wrapped")
     first_notes = render_notes(
         label="0.7.0-nightly-20260919", sha="0" * 40, prev_tag=None,
-        ipk="plxnative-v0.7.0-nightly-20260919.ipk", sha256="0" * 64, repo="GLinnik21/plx-native",
+        ipk="plxnative-v0.7.0-nightly-20260919.ipk", sha256="0" * 64, repo="plxnative/plx-native",
         changes=[],
     )
     check("First nightly." in first_notes, "no prev_tag -> 'First nightly.'")
     check("## Changes\n\n" in first_notes, "no prev_tag -> '## Changes' heading, not '## Changes since' with nothing after it")
     check("## Changes since" not in first_notes,
           "no prev_tag -> never renders the dangling '## Changes since' heading")
+    check("No Samsung build tonight." in first_notes and "SUPER ALPHA" not in first_notes,
+          "a missing Tizen artifact does not advertise an install")
+    tpk = "plxnative-tizen-v0.7.0-nightly-20260919-armv7.tpk"
+    samsung_notes = render_notes(
+        label="0.7.0-nightly-20260919", sha="0" * 40, prev_tag=None,
+        ipk="plxnative-v0.7.0-nightly-20260919.ipk", sha256="0" * 64, repo="plxnative/plx-native",
+        changes=[], tpk=tpk, tpk_sha256="1" * 64,
+    )
+    samsung_guide = (Path(__file__).resolve().parents[1] / "docs/samsung-nightly.md").read_text()
+    for phrase in ("SUPER ALPHA", SAMSUNG_ALPHA, "If you try it, please send us a log"):
+        check(phrase in samsung_notes and phrase in " ".join(samsung_guide.split()),
+              f"the Samsung guide and notes both carry {phrase!r}")
+    check(f"{'1' * 64}  {tpk}" in samsung_notes and f"{SAMSUNG_GUIDE_URL}#send-a-log" in samsung_notes,
+          "Samsung notes give the exact artifact, checksum and log instructions")
 
     # latest-json field mapping
     fake_release = {
         "tag_name": "nightly/v0.7.0-nightly-20260919",
         "target_commitish": "abc1234def5678900000000000000000000000",
-        "html_url": "https://github.com/GLinnik21/plx-native/releases/tag/nightly%2Fv0.7.0-nightly-20260919",
+        "html_url": "https://github.com/plxnative/plx-native/releases/tag/nightly%2Fv0.7.0-nightly-20260919",
         "assets": [
             {"name": "plxnative-v0.7.0-nightly-20260919.ipk",
              "browser_download_url": "https://example.invalid/ipk"},
             {"name": "nightly.sha256", "browser_download_url": "https://example.invalid/sha256"},
         ],
     }
-    payload = latest_json_payload(fake_release, "deadbeef  plxnative-v0.7.0-nightly-20260919.ipk\n")
+    payload = latest_json_payload(fake_release, "deadbeef  plxnative-v0.7.0-nightly-20260919.ipk\n",
+                                  "f" * 40)
+    check(payload["commit"] == "f" * 40,
+          "latest.json commit is the source commit passed in, not the release's target")
     check(payload["version"] == "0.7.0-nightly-20260919", "latest.json version is the bare label")
     check(payload["tag"] == "nightly/v0.7.0-nightly-20260919", "latest.json tag is the full ref")
     check(payload["date"] == "20260919", "latest.json date is pulled from the label")
@@ -633,7 +756,7 @@ def _selftest() -> int:
         "ipkHash": {"sha256": "ab" * 32}, "iconUri": "https://example.invalid/i.png",
     }
     ipk_name = "plxnative-v0.8.0-nightly-20261006.ipk"
-    ipk_url = "https://github.com/GLinnik21/plx-native/releases/download/x/plxnative-v0.8.0.ipk"
+    ipk_url = "https://github.com/plxnative/plx-native/releases/download/x/plxnative-v0.8.0.ipk"
     out = repo_manifest(good_manifest, ipk_url=ipk_url, ipk_name=ipk_name,
                         sha256=("ab" * 32) + "  file.ipk\n", label=label)
     check(out["ipkUrl"] == ipk_url and out["version"] == "0.8.20261006",
@@ -668,7 +791,7 @@ def _selftest() -> int:
     check(refuses(good_manifest, lbl="0.6.2-nightly-20261006"),
           "a trunk manifest (0.8.<date>) does not match a 0.6.2 maintenance-line label")
 
-    index = repo_index("GLinnik21/plx-native")
+    index = repo_index("plxnative/plx-native")
     pkg = index["packages"][0]
     check(pkg["id"] == PACKAGE_ID and pkg["manifestUrl"] == f"{SITE_ORIGIN}/nightly/{MANIFEST_NAME}",
           "repo.json names the nightly id and the manifest staged beside it")
@@ -676,12 +799,13 @@ def _selftest() -> int:
     check(pkg["fullDescriptionUrl"].startswith("https://") and pkg["iconUri"].startswith("https://"),
           "repo.json's description and icon URLs are absolute https")
 
-    rel = {**fake_release, "html_url": "https://github.com/GLinnik21/plx-native/releases/tag/x",
+    rel = {**fake_release, "html_url": "https://github.com/plxnative/plx-native/releases/tag/x",
            "assets": fake_release["assets"] + [{"name": MANIFEST_NAME,
                                                 "browser_download_url": "https://example.invalid/m"}]}
     rel["assets"][0] = {"name": "plxnative-v0.8.0-nightly-20261006.ipk", "browser_download_url": ipk_url}
     rel["tag_name"] = "nightly/v" + label
-    files = build_repo_files(rel, ("ab" * 32) + "  x\n", json.dumps(good_manifest), "GLinnik21/plx-native")
+    files = build_repo_files(rel, ("ab" * 32) + "  x\n", json.dumps(good_manifest), "plxnative/plx-native",
+                             "abc1234def5678900000000000000000000000")
     check(set(files) == {"repo.json", MANIFEST_NAME, "description.html"},
           "a nightly with a manifest yields the index, the manifest and the description page")
     check(json.loads(files[MANIFEST_NAME])["ipkUrl"] == ipk_url, "the served manifest points at the release's .ipk")
@@ -722,6 +846,17 @@ def _selftest() -> int:
           and pick_servable_release([]) is None,
           "no complete nightly at all -> nothing servable (an empty index)")
 
+    # which commit a release names, by the repository it lives in
+    sha40 = "0123456789abcdef0123456789abcdef01234567"
+    check(commit_from_release({"_repo": "o/src", "target_commitish": sha40}, "o/src") == sha40,
+          "a pre-move release in the source repository names its commit as its target")
+    check(commit_from_release({"_repo": RELEASE_REPO, "target_commitish": "main"}, "o/src") is None,
+          "a release in the release repository targets its own branch, so its commit comes from the tag")
+    check(commit_from_release({"_repo": "o/src", "target_commitish": "main"}, "o/src") is None,
+          "a source-repository release targeting a branch name does not pass for a commit")
+    check(RELEASE_REPO != "o/src" and RELEASE_REPO.endswith("/plx-native-nightly"),
+          "nightlies publish to the dedicated nightly repository")
+
     # the install text in the notes
     check(REPO_JSON_URL in body and "Add repository" in body and "dev-manager-desktop" in body,
           "notes lead with the Homebrew Channel repository and keep the by-hand route")
@@ -744,6 +879,9 @@ def main() -> int:
     p_plan.add_argument("--dry", action="store_true",
                          help="never skip and never refuse an existing tag — this run will not publish")
 
+    p_plan.add_argument("--force-new-nightly", action="store_true",
+                        help="build if main is unchanged, preserving the same-day tag check")
+
     p_notes = sub.add_parser("notes")
     p_notes.add_argument("--label", required=True)
     p_notes.add_argument("--sha", required=True)
@@ -751,6 +889,8 @@ def main() -> int:
     p_notes.add_argument("--ipk", required=True)
     p_notes.add_argument("--sha256", required=True)
     p_notes.add_argument("--repo", required=True)
+    p_notes.add_argument("--tpk", default="")
+    p_notes.add_argument("--tpk-sha256", default="")
 
     p_latest = sub.add_parser("latest-json")
     p_latest.add_argument("--repo", required=True)
@@ -764,6 +904,8 @@ def main() -> int:
     p_prune.add_argument("--days", type=int, default=30)
     p_prune.add_argument("--dry-run", action="store_true")
 
+    sub.add_parser("release-repo")
+
     ap.add_argument("--selftest", action="store_true")
 
     args = ap.parse_args()
@@ -773,7 +915,7 @@ def main() -> int:
         return _selftest()
 
     if args.cmd == "plan":
-        return cmd_plan(args.date, args.head, args.dry)
+        return cmd_plan(args.date, args.head, args.dry, args.force_new_nightly)
     if args.cmd == "notes":
         return cmd_notes(args)
     if args.cmd == "latest-json":
@@ -782,6 +924,9 @@ def main() -> int:
         return cmd_repo_json(args.repo, args.out_dir)
     if args.cmd == "prune":
         return cmd_prune(args.repo, args.days, args.dry_run)
+    if args.cmd == "release-repo":
+        print(RELEASE_REPO)
+        return 0
 
     ap.print_help()
     return 2

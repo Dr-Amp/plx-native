@@ -39,6 +39,14 @@ fn chapter_panel_retains_selection_without_borrowing_hud_focus() {
 }
 
 use super::*;
+
+// Explicit fixture IO adapter; product helpers receive the already captured caption.
+fn busy_surface(ps: &plx_media::route::PlaybackSession, st: S, seen: bool) -> Busy {
+    super::busy_surface(plx_media::player::error_caption(ps), st, seen)
+}
+fn busy_surface_with(ps: &plx_media::route::PlaybackSession, st: S, seen: bool, audio: bool) -> Busy {
+    super::busy_surface_with(plx_media::player::error_caption(ps), st, seen, audio)
+}
 use plx_ui::widgets::{StatusKind, StatusOverlay};
 use super::classic::*;
 use super::geometry::*;
@@ -80,9 +88,9 @@ fn long_hud_titles_fit_before_every_control_slot() {
     let measure = &ShippedMeasure;
     let long = CString::new("An extraordinarily long episode — Über den Wolken — ".repeat(20)).unwrap();
     let clock = plx_ui::marquee::Clock::new();
-    for language in plx_platform::i18n::SHIPPED {
-        let _language = plx_platform::i18n::language_on_this_thread_for_test(language);
-        let compiled = super::loaded::load_classic("test", plx_platform::i18n::current(), measure).compiled;
+    for language in plx_os::i18n::SHIPPED {
+        let _language = plx_os::i18n::language_on_this_thread_for_test(language);
+        let compiled = super::loaded::load_classic("test", plx_os::i18n::current(), measure).compiled;
         let slots = [
             ControlSlot::Discs(Controls::NONE),
             ControlSlot::Discs(Controls { previous: true, next: true }),
@@ -92,26 +100,29 @@ fn long_hud_titles_fit_before_every_control_slot() {
         for slot in slots {
             let right = compiled_title_right(&compiled, slot);
             let items = geometry(&compiled, 0, slot, true, false).items;
+            // What a title draws depends on the cell's right edge and the title, never on which
+            // control holds the focus or how far its pop has run (an unpaused title reads no clock):
+            // drawn once per slot and kicker, not again for every focused control and pop frame.
+            for kicker in [Kicker::Episode(long.as_ptr()), Kicker::Context(long.as_ptr())] {
+                let runs = plx_ui::draw_census::capture_runs(|| {
+                    draw_player_title(Painter::recording(), kicker, long.as_ptr(),
+                        right, measure, false, &clock);
+                });
+                assert_eq!(runs.len(), 2);
+                for run in runs {
+                    assert!(run.text.ends_with('…'), "{}: expected ellipsis: {run:?}", language.tag());
+                    assert_eq!(run.at.x, SB_X);
+                    assert!(measure.width_str(&run.text, run.size, run.bold) <= right - SB_X + 1.0,
+                        "{}: fitted title exceeds the control boundary: {run:?}", language.tag());
+                }
+            }
             let mut row = HudMotion::new();
             for focused in 0..slot.items() {
                 for _ in 0..30 {
                     row.pop.step(Some(focused as usize), 1.0 / 60.0);
                     for i in 0..slot.items() {
                         let Some(rect) = items[i as usize] else { continue };
-                        assert!(right + theme::space::MD <= rect.scaled(row.scale(i)).x + 0.001);
-                    }
-                    for kicker in [Kicker::Episode(long.as_ptr()), Kicker::Context(long.as_ptr())] {
-                        let runs = plx_ui::draw_census::capture_runs(|| {
-                            draw_player_title(Painter::recording(), kicker, long.as_ptr(),
-                                right, measure, false, &clock);
-                        });
-                        assert_eq!(runs.len(), 2);
-                        for run in runs {
-                            assert!(run.text.ends_with('…'), "{}: expected ellipsis: {run:?}", language.tag());
-                            assert_eq!(run.at.x, SB_X);
-                            assert!(measure.width_str(&run.text, run.size, run.bold) <= right - SB_X + 1.0,
-                                "{}: fitted title exceeds the control boundary: {run:?}", language.tag());
-                        }
+                        assert!(right + theme::space::MD <= rect.scaled(row.scale(i, Default::default())).x + 0.001);
                     }
                 }
             }
@@ -147,10 +158,10 @@ fn paused_title_reveals_once_and_resume_restores_ellipsis() {
     });
     let start = paint(true);
     assert!(start[1].text.ends_with('…'));
-    plx_machine::idle::frame_begin(2.0);
+    plx_machine::motion::report::frame_begin(2.0);
     let moving = paint(true);
     assert!(moving[1].at.x < SB_X);
-    plx_machine::idle::frame_begin(30.0);
+    plx_machine::motion::report::frame_begin(30.0);
     let ended = paint(true);
     assert_eq!(ended[1].at.x, SB_X - (FM.width(long, HUD_TITLE_SZ, true) - (right - SB_X)));
     assert_eq!(paint(true)[1].at.x, ended[1].at.x, "the title must stay at the end");
@@ -173,12 +184,12 @@ fn a_paused_right_to_left_title_reveals_its_end_to_the_left() {
             long.as_ptr(), right, &FM, paused, &clock);
     });
     let _ = paint(true);
-    plx_machine::idle::frame_begin(2.0);
+    plx_machine::motion::report::frame_begin(2.0);
     let moving = paint(true);
     let elapsed = 2000.0 - plx_ui::marquee::TITLE.hold_ms;
     let off = elapsed / 1000.0 * plx_ui::marquee::SPEED;
     assert_eq!(moving[1].at.x, SB_X + window - full + off, "first words flush right, moving right");
-    plx_machine::idle::frame_begin(60.0);
+    plx_machine::motion::report::frame_begin(60.0);
     assert_eq!(paint(true)[1].at.x, SB_X, "the last words rest on the window's left edge");
     assert_eq!(paint(true)[1].at.x, SB_X, "and stay");
 }
@@ -223,7 +234,7 @@ const FM: plx_ui::fixture::FixtureMeasure = plx_ui::fixture::FixtureMeasure;
 /// the presenting side's (`app::run::prepare_window`), ahead of the clear.
 #[test]
 fn the_transport_clocks_are_rasterised_before_the_draw_and_one_second_ahead() {
-    let _locale = plx_platform::i18n::language_on_this_thread_for_test(plx_platform::i18n::Preference::En);
+    let _locale = plx_os::i18n::language_on_this_thread_for_test(plx_os::i18n::Preference::En);
     let _g = plx_base::testlock::serial();
     plx_gfx::text::reset_prewarm_for_test();
     let sz = theme::size::CAPTION;
@@ -282,7 +293,7 @@ fn the_transport_clocks_are_rasterised_before_the_draw_and_one_second_ahead() {
     while plx_gfx::text::prewarm_pending() {
         plx_ui::panel_motion::PanelMotion::drain_queued_text_for_test();
     }
-    let time = plx_platform::i18n::current().time_of_day([22, 35]).unwrap();
+    let time = plx_os::i18n::current().time_of_day([22, 35]).unwrap();
     for text in [b"-0:36".as_slice(), b"-0:35".as_slice(), "\u{b7}".as_bytes(), time.as_bytes()] {
         assert!(
             plx_gfx::text::prewarm_resident_for_test(text, sz, 0),
@@ -907,7 +918,7 @@ fn a_dead_producer_reads_out_whether_or_not_a_picture_was_up() {
 }
 
 fn readout_of(e: &plx_media::player::ErrorShape) -> FailureReadout {
-    let cx = plx_media::player::FailureContext { forced: true, can_retry: true, repair_idle: true };
+    let cx = plx_media::player::FailureContext { forced: true, can_retry: true, quality_carriable: true, repair_idle: true };
     FailureReadout::of(e, plx_media::player::failure_actions(e.kind, cx), "0.7.0 · webOS 4.5 · code".into())
 }
 
@@ -956,7 +967,7 @@ fn the_diagnostics_footer_sits_below_the_row_inside_the_safe_bottom_band() {
 fn every_failure_row_fits_the_screen_in_every_language() {
     use plx_base::fontcov::advances::ShippedMeasure;
     use plx_ui::fit::HEADROOM;
-    use plx_platform::i18n::{language_on_this_thread_for_test};
+    use plx_os::i18n::{language_on_this_thread_for_test};
     use plx_media::player::FailureAction as A;
     let rows: [&[A]; 3] = [
         &[A::PlayAutomatically, A::TryAgain, A::Back],
@@ -964,7 +975,7 @@ fn every_failure_row_fits_the_screen_in_every_language() {
         &[A::Repair, A::Back],
     ];
     let mut out = Vec::new();
-    for language in plx_platform::i18n::SHIPPED {
+    for language in plx_os::i18n::SHIPPED {
         let _guard = language_on_this_thread_for_test(language);
         for row in rows {
             let labels: Vec<&'static std::ffi::CStr> = row.iter().map(|a| failure_action_label(*a)).collect();
@@ -989,9 +1000,9 @@ fn the_jail_help_note_fits_the_note_slot_in_every_language() {
     use plx_base::fontcov::advances::ShippedMeasure;
     use plx_ui::fit::HEADROOM;
     use plx_ui::text_view::TextView;
-    use plx_platform::i18n::{language_on_this_thread_for_test, msg};
+    use plx_os::i18n::{language_on_this_thread_for_test, msg};
     let mut out = Vec::new();
-    for language in plx_platform::i18n::SHIPPED {
+    for language in plx_os::i18n::SHIPPED {
         let _guard = language_on_this_thread_for_test(language);
         let help = msg::widgets_reason_jail_help();
         let fits = !TextView::new(help, theme::size::CAPTION, theme::TEXT_TERTIARY)
@@ -1011,9 +1022,9 @@ fn the_jail_help_note_fits_the_note_slot_in_every_language() {
 fn every_forced_verdict_fits_the_reason_slot_in_every_language() {
     use plx_base::fontcov::advances::ShippedMeasure;
     use plx_ui::fit::HEADROOM;
-    use plx_platform::i18n::{language_on_this_thread_for_test, msg};
+    use plx_os::i18n::{language_on_this_thread_for_test, msg};
     let mut out = Vec::new();
-    for language in plx_platform::i18n::SHIPPED {
+    for language in plx_os::i18n::SHIPPED {
         let _guard = language_on_this_thread_for_test(language);
         for s in [msg::widgets_verdict_forced_no_original(), msg::widgets_verdict_forced_container(),
             msg::widgets_verdict_forced_video(), msg::widgets_verdict_forced_audio(),
@@ -1626,7 +1637,7 @@ fn classic_resolved_through_the_compile_is_classics_table() {
     use super::command::HudCommand;
     use super::model::HudModel;
     use plx_base::fontcov::advances::ShippedMeasure;
-    let hud = super::loaded::load_classic("test", plx_platform::i18n::english(), &ShippedMeasure);
+    let hud = super::loaded::load_classic("test", plx_os::i18n::english(), &ShippedMeasure);
     let compiled = &*hud.compiled;
     let model = HudModel::default();
     for episode in [false, true] {
@@ -1679,14 +1690,14 @@ mod playbar_options {
 
     #[test]
     fn the_remaining_clock_can_include_a_local_end_time() {
-        let _locale = plx_platform::i18n::language_on_this_thread_for_test(plx_platform::i18n::Preference::En);
+        let _locale = plx_os::i18n::language_on_this_thread_for_test(plx_os::i18n::Preference::En);
         let mut b = bar(Knob::Tick, TransportMark::None);
         let plain = runs(b, PlaybarLook::default());
         assert!(plain.iter().any(|r| r.text == "-10:00"));
         b.end_time = Some([22, 35]);
         let look = with_end_time_width(PlaybarLook::default(), 320.0);
         let with_end = runs(b, look);
-        let time = plx_platform::i18n::current().time_of_day([22, 35]).unwrap();
+        let time = plx_os::i18n::current().time_of_day([22, 35]).unwrap();
         let combined = with_end.iter().filter(|r| r.align == 0).collect::<Vec<_>>();
         assert_eq!(combined.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), ["-10:00", "\u{b7}", time.as_str()]);
         assert_eq!(combined[1].ink, theme::TEXT_SEPARATOR);
@@ -1771,12 +1782,12 @@ mod playbar_options {
 // --- PR8 stage 2a: what the screen reads to open, travel and close a section ---
 
 fn compiled_classic() -> std::sync::Arc<crate::hud_format::compile::Compiled> {
-    super::loaded::load_classic("0.0.0-test", plx_platform::i18n::english(), &plx_base::fontcov::advances::ShippedMeasure).compiled
+    super::loaded::load_classic("0.0.0-test", plx_os::i18n::english(), &plx_base::fontcov::advances::ShippedMeasure).compiled
 }
 
 fn compiled_reference() -> std::sync::Arc<crate::hud_format::compile::Compiled> {
     let text = include_str!("../hud_format/fixtures/reference/hud.json");
-    super::loaded::load(&crate::hud_format::fixtures::with_hud_resources("reference", &text), "0.0.0-test", plx_platform::i18n::english(), &plx_base::fontcov::advances::ShippedMeasure)
+    super::loaded::load(&crate::hud_format::fixtures::with_hud_resources("reference", &text), "0.0.0-test", plx_os::i18n::english(), &plx_base::fontcov::advances::ShippedMeasure)
         .expect("the reference loads")
         .compiled
 }

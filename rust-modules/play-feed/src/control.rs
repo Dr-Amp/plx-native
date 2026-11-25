@@ -22,7 +22,7 @@ use plx_base::task::MainThread;
 use plx_playback_contract::feed::{
     AcceptedLoadOutcome, CtorGate, DvWithdrawal, FeedCommand, FeedControl, FeedFacts, FeedLoad, FeedSeek,
     FeedOpen, FeedStop, FeedTransportAction, LoadTick, OpenRequest, PausedSeekStep,
-    PresentationTick, ReleaseHandoff, ResetScope, SeekMode, SeekPause, StuckSeekAction,
+    HoldRoute, PresentationTick, ReleaseHandoff, ResetScope, SeekMode, SeekPause, StuckSeekAction,
     UnblockFacts, UserPauseOutcome, UserResumeOutcome,
 };
 use plx_playback_contract::demux::DemuxSession;
@@ -131,9 +131,9 @@ impl FeedLoad for FeedBackend {
         feed_pump::tick_load(&mut self.resources, mt, now, segmented_hls, speed_deadline_ms, no_audio)
     }
 
-    fn tick_presentation(&mut self, mt: &MainThread, segmented_hls: bool, immersive: bool)
+    fn tick_presentation(&mut self, mt: &MainThread, route: HoldRoute, immersive: bool)
         -> PresentationTick {
-        feed_pump::tick_presentation(&mut self.resources, mt, segmented_hls, immersive)
+        feed_pump::tick_presentation(&mut self.resources, mt, route, immersive)
     }
 
     fn ctor_gate(&mut self, mt: &MainThread) -> CtorGate {
@@ -370,7 +370,7 @@ pub(crate) mod tests {
     use crate::send_ptr::SendPtr;
     use crate::shared::HlsUserPause;
     use crate::shared::{FEED_SHARED, FEED_TX};
-    use plx_platform::tv::sink::{NoSink, VideoSink};
+    use plx_os::tv::sink::{NoSink, VideoSink};
     use std::os::raw::c_char;
 
     fn sink() -> &'static dyn VideoSink { &NoSink }
@@ -395,7 +395,7 @@ pub(crate) mod tests {
         },
         release: ReleaseHooks {
             raw_sink: sink,
-            plane: plx_platform::tv::plane::installed(),
+            plane: plx_os::tv::plane::installed(),
             on_release_step: |_| {},
             on_exported_window_destroy: || {},
             spawn_unload: |_| None,

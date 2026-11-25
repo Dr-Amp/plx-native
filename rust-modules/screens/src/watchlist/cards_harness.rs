@@ -27,6 +27,10 @@ impl Host for WatchHost {
     type Memory = PageMemory;
 }
 
+impl crate::registry::ScreenInputsLike for WatchHost {
+    fn screen_inputs<'a>(_: &Cx<'a, Self>) -> &'a crate::registry::ScreenInputs { crate::registry::caption_fixture() }
+}
+
 pub(crate) const ENTRY: EntryId = EntryId(9);
 
 /// A row titled `<i>`, a movie of 2000 + i.
@@ -70,6 +74,7 @@ pub(crate) fn tiles(n: usize) -> Vec<WatchTile> {
 pub(crate) struct Harness {
     pub(crate) screen: WatchlistScreen,
     pub(crate) focus: Option<FocusKey<u32>>,
+    pub(crate) modal: plx_machine::machine::ModalRead,
     press: f32,
     ms: u32,
     n: usize,
@@ -89,7 +94,7 @@ impl Harness {
         let n = rows.len();
         let policy = PolicyPin::default_setting();
         let screen = WatchlistScreen::new(rows, WatchlistOptionsState::default()).at_entry(ENTRY);
-        let mut h = Self { screen, focus: None, press: 1.0, ms: 0, n, _policy: policy };
+        let mut h = Self { screen, focus: None, modal: Default::default(), press: 1.0, ms: 0, n, _policy: policy };
         // the stack lays its sections out on the first event it sees
         h.step(ScreenEvent::Tick(Tick { ms: 0, dt_us: 16_667 }));
         h
@@ -103,6 +108,7 @@ impl Harness {
             press: PressRead { scale: self.press, owner: self.focus, ..Default::default() },
             focus: FocusRead { current: self.focus, ..Default::default() },
             owner: InputOwner::Entry(ENTRY),
+            modal: self.modal, page_image: Default::default(), hold_hint: Default::default(),
         }
     }
 
@@ -125,6 +131,7 @@ impl Harness {
             press: PressRead { scale: self.press, owner: self.focus, ..Default::default() },
             focus: FocusRead { current: self.focus, ..Default::default() },
             owner: InputOwner::Entry(ENTRY),
+            modal: self.modal, page_image: Default::default(), hold_hint: Default::default(),
         };
         {
             let _discovery = plx_ui::frame::backdrop::discover(sources.clone());
@@ -146,6 +153,7 @@ impl Harness {
             press: PressRead { scale: self.press, owner: self.focus, ..Default::default() },
             focus: FocusRead { current: self.focus, ..Default::default() },
             owner: InputOwner::Entry(ENTRY),
+            modal: self.modal, page_image: Default::default(), hold_hint: Default::default(),
         };
         {
             let _discovery = plx_ui::frame::backdrop::discover(sources.clone());
@@ -166,6 +174,7 @@ impl Harness {
             press: PressRead { scale: self.press, owner: self.focus, ..Default::default() },
             focus: FocusRead { current: self.focus, ..Default::default() },
             owner: InputOwner::Entry(ENTRY),
+            modal: self.modal, page_image: Default::default(), hold_hint: Default::default(),
         };
         let screen = &mut self.screen;
         plx_ui::draw_census::capture_text(|| {
@@ -186,6 +195,7 @@ impl Harness {
             press: PressRead { scale: self.press, owner: self.focus, ..Default::default() },
             focus: FocusRead { current: self.focus, ..Default::default() },
             owner: InputOwner::Entry(ENTRY),
+            modal: self.modal, page_image: Default::default(), hold_hint: Default::default(),
         };
         let screen = &mut self.screen;
         plx_ui::draw_census::capture_runs(|| {
@@ -207,6 +217,7 @@ impl Harness {
             press: PressRead { scale: self.press, owner: self.focus, ..Default::default() },
             focus: FocusRead { current: self.focus, ..Default::default() },
             owner: InputOwner::Entry(ENTRY),
+            modal: self.modal, page_image: Default::default(), hold_hint: Default::default(),
         };
         let screen = &mut self.screen;
         plx_ui::draw_census::capture(|| {
@@ -244,9 +255,19 @@ impl Harness {
 
     /// Step one event; returns the effects it queued and whether the step reported page motion.
     pub(crate) fn step_fx(&mut self, ev: ScreenEvent<WatchHost>) -> (Vec<plx_machine::machine::Stamped<WatchHost>>, bool) {
+        let (out, moving, _) = self.step_all(ev);
+        (out, moving)
+    }
+
+    /// Step one event; whether it raised typed PAGE damage (what retakes a frozen host's snapshot).
+    pub(crate) fn damages(&mut self, ev: ScreenEvent<WatchHost>) -> bool {
+        self.step_all(ev).2
+    }
+
+    fn step_all(&mut self, ev: ScreenEvent<WatchHost>) -> (Vec<plx_machine::machine::Stamped<WatchHost>>, bool, bool) {
         let mut present = plx_machine::present::Present::new();
         let mut out = Vec::new();
-        let (_, moving) = plx_machine::idle::scoped_motion(|| {
+        let (_, moving) = plx_machine::motion::report::scoped_motion(|| {
             let cx = Cx {
                 views: (),
                 tick: Tick { ms: self.ms, dt_us: 16_667 },
@@ -254,6 +275,7 @@ impl Harness {
                 press: PressRead { scale: self.press, owner: self.focus, ..Default::default() },
                 focus: FocusRead { current: self.focus, ..Default::default() },
                 owner: InputOwner::Entry(ENTRY),
+                modal: self.modal, page_image: Default::default(), hold_hint: Default::default(),
             };
             let mut fx = Effects::new(
                 &mut out,
@@ -262,7 +284,7 @@ impl Harness {
             );
             Machine::<WatchHost>::step(&mut self.screen, &ev, &cx, &mut fx);
         });
-        (out, moving || present.page_moving())
+        (out, moving || present.page_moving(), present.page_damaged())
     }
 
     pub(crate) fn step(&mut self, ev: ScreenEvent<WatchHost>) -> bool {

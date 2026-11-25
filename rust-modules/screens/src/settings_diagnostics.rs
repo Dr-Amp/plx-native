@@ -11,7 +11,7 @@
 //! [`AppFx::PlaybackTrace`] and the status returns as an addressed `AppMsg::PlaybackTrace`.
 
 use super::*;
-use plx_platform::playback_trace::{Command, Status};
+use plx_os::playback_trace::{Command, Status};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) enum DiagId {
@@ -28,6 +28,13 @@ impl FormId for DiagId {
             DiagId::Delete => 3,
         })
     }
+    fn a11y(&self) -> Option<&'static str> {
+        Some(match self {
+            DiagId::Trace => "trace",
+            DiagId::Export => "export",
+            DiagId::Delete => "delete",
+        })
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -39,7 +46,7 @@ pub(super) enum DiagAction {
 
 /// The page's rows from the trace status alone.
 pub(super) fn diagnostics_form(status: Status) -> Form<DiagId, DiagAction, SettingsPage> {
-    use plx_platform::i18n::msg;
+    use plx_os::i18n::msg;
     let record = FormSection::new("")
         .disabled(status == Status::Saving)
         .item(DiagId::Trace, RowKind::Toggle, DiagAction::Trace,
@@ -56,9 +63,9 @@ pub(super) fn diagnostics_form(status: Status) -> Form<DiagId, DiagAction, Setti
 /// string family (a saved, saving or exported log is not a recording).
 pub(super) fn root_value(status: Status) -> &'static str {
     if status == Status::Recording {
-        plx_platform::i18n::msg::widgets_toggle_on()
+        plx_os::i18n::msg::widgets_toggle_on()
     } else {
-        plx_platform::i18n::msg::widgets_toggle_off()
+        plx_os::i18n::msg::widgets_toggle_off()
     }
 }
 
@@ -93,7 +100,7 @@ impl DiagnosticsPage {
     pub(super) fn at(entry: EntryId, status: Status) -> Self {
         let mut page = Self {
             entry,
-            form: FormTable::new(super::super::registry::BAND),
+            form: FormTable::page(super::super::registry::BAND),
             state: DiagState { sel: DiagId::Trace.key(), status },
         };
         page.rebuild();
@@ -102,16 +109,14 @@ impl DiagnosticsPage {
 
     fn rebuild(&mut self) {
         let keep = self.form.selected_id().cloned().unwrap_or(DiagId::Trace);
-        self.form.table.compact = false;
-        self.form.table.board_metrics(true);
         self.form.set(diagnostics_form(self.state.status), Some(&keep));
         self.form.table.list_focused = true;
     }
 
     fn view(&self) -> TableScreen<'_> {
-        use plx_platform::i18n::msg;
+        use plx_os::i18n::msg;
         TableScreen::new(
-            Header::new(RouteLayout::settings_page(), Some(msg::settings_title()), msg::settings_trace_section(), msg::settings_trace_export_detail()),
+            Header::new(RouteLayout::screen(), Some(msg::settings_title()), msg::settings_trace_section(), msg::settings_trace_export_detail()),
             &self.form.table, GroupId(0), self.entry,
         )
         .keyed(&self.form)
@@ -157,7 +162,7 @@ impl Machine<InnerHost> for DiagnosticsPage {
                 if matches!(self.state.status, Status::Recording | Status::Saving) {
                     fx.push(Fx::App(AppFx::PlaybackTrace(Command::Status)));
                 }
-                self.form.table.update(t.dt(), RouteLayout::settings_page().sectioned_table().h);
+                self.form.table.update(t.dt(), RouteLayout::screen().sectioned_table().h);
                 Handled::Yes
             }
             ScreenEvent::FocusMoved { to, .. } => {
@@ -189,7 +194,7 @@ plx_ui::focusable_via_view!(DiagnosticsPage, InnerHost, view);
 impl Screen<InnerHost> for DiagnosticsPage {
     fn name(&self) -> &'static str { super::super::registry::word::DIAGNOSTICS }
     fn state(&self) -> &dyn LogicalState { &self.state }
-    fn crumb(&self, _cx: &Cx<'_, InnerHost>) -> Option<Cow<'_, str>> { Some(Cow::Borrowed(plx_platform::i18n::msg::settings_title())) }
+    fn crumb(&self, _cx: &Cx<'_, InnerHost>) -> Option<Cow<'_, str>> { Some(Cow::Borrowed(plx_os::i18n::msg::settings_title())) }
     fn prepare(&mut self, _b: &mut Budget, _cx: &Cx<'_, InnerHost>) {}
     fn draw(&mut self, f: &mut DrawFrame<'_, '_, InnerHost>) {
         plx_ui::screen::Part::<InnerHost>::draw(&mut self.view(), f, Rect::FULL);

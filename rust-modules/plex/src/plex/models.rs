@@ -569,7 +569,7 @@ pub fn catalog_hex_of_guid(guid: &str) -> Option<[u8; 12]> {
 }
 
 /// WORKER. The catalog id to write to: the one the row already carries, else the one the item's own
-/// server record names. `fetch` is `|| client.metadata(rk).map(|m| m.guid)` (or `grandparent`'s
+/// server record names. `fetch` is `|| client.metadata_background(rk).map(|m| m.guid)` (or `grandparent`'s
 /// `show_rk` read for an episode's show); it is not called when `known` is set, so a press from a
 /// row that was decoded with its guid costs no round trip. `None` is a server that did not answer
 /// or an item with no `plex://movie|show` identity.
@@ -590,6 +590,8 @@ pub struct ListingFacts {
     pub video_resolution: Option<String>,
     /// A video stream of `Media[0]` is HDR ([`Stream::is_hdr`]).
     pub hdr: bool,
+    /// A video stream of `Media[0]` carries Dolby Vision (`DOVIPresent`); such a row is `hdr` too.
+    pub dolby_vision: bool,
     pub content_rating: Option<String>,
     /// 0..10.
     pub audience_rating: Option<f32>,
@@ -626,14 +628,12 @@ impl Metadata {
         let count = |n: i64| (n > 0).then(|| n.min(i64::from(u32::MAX)) as u32);
         let media = self.media_version(None).map(|(_, m)| m);
         let leaf_count = count(self.leaf_count);
+        let video = || media.into_iter().flat_map(|x| &x.part).flat_map(|p| &p.stream).filter(|s| s.stream_type == 1);
         ListingFacts {
             genre: self.genre.first().and_then(|g| some(&g.tag)),
             video_resolution: media.and_then(|x| some(&x.video_resolution)),
-            hdr: media
-                .into_iter()
-                .flat_map(|x| x.part.iter())
-                .flat_map(|p| p.stream.iter())
-                .any(|s| s.stream_type == 1 && s.is_hdr()),
+            hdr: video().any(Stream::is_hdr),
+            dolby_vision: video().any(|s| s.dovi_present != 0),
             content_rating: some(&self.content_rating),
             audience_rating: (self.audience_rating > 0.0).then_some(self.audience_rating as f32),
             duration_ms: (self.duration > 0).then_some(self.duration),

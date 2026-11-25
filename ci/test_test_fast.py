@@ -72,6 +72,13 @@ def make(*args, env=None, home=None):
     return subprocess.run(["make", *args], cwd=ROOT, env=full, capture_output=True, text=True)
 
 
+def ignored_target(name):
+    target = Path("rust-modules") / name
+    # Git refuses to traverse a symlink even to answer check-ignore.
+    probe = target if (ROOT / target).is_symlink() else target / "debug/x"
+    return subprocess.run(["git", "check-ignore", "-q", str(probe)], cwd=ROOT).returncode == 0
+
+
 class FakeCargoHome:
     def __enter__(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -155,7 +162,7 @@ class TestFastRuns(unittest.TestCase):
             self.assertEqual(call["target_dir"], TDIR)
             self.assertTrue(call["cwd"].endswith("rust-modules"), call["cwd"])
             self.assertEqual(call["runtime_dir_set"], "yes")
-            self.assertRegex(call["args"], r"^\+\S+ test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_playback_contract -p plx_play_uri -p plx_play_feed -p plx_media_codecs -p plx_appkit -p plx_screens --no-run --message-format=json-render-diagnostics$")
+            self.assertRegex(call["args"], r"^\+\S+ test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_os -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_playback_contract -p plx_play_uri -p plx_play_feed -p plx_media_codecs -p plx_appkit -p plx_screens -p plx_shell_sdl -p plx_platform_webos -p plx_platform_desktop -p plx_platform_tizen -p plx_owp --no-run --message-format=json-render-diagnostics$")
             # The filter goes to each test binary (the runner builds first, then runs), not to cargo.
             self.assertEqual(len(fake.bin_calls()), call["args"].split().count("-p"))
             self.assertTrue(all(line.endswith("args=route::") for line in fake.bin_calls()), fake.bin_calls())
@@ -164,7 +171,7 @@ class TestFastRuns(unittest.TestCase):
         with FakeCargoHome() as fake:
             self.assertEqual(fake.run("test-fast").returncode, 0)
             (call,) = fake.calls()
-            self.assertRegex(call["args"], r"^\+\S+ test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_playback_contract -p plx_play_uri -p plx_play_feed -p plx_media_codecs -p plx_appkit -p plx_screens --no-run --message-format=json-render-diagnostics$")
+            self.assertRegex(call["args"], r"^\+\S+ test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_os -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_playback_contract -p plx_play_uri -p plx_play_feed -p plx_media_codecs -p plx_appkit -p plx_screens -p plx_shell_sdl -p plx_platform_webos -p plx_platform_desktop -p plx_platform_tizen -p plx_owp --no-run --message-format=json-render-diagnostics$")
             self.assertNotIn("--features", call["args"])
             self.assertEqual(len(fake.bin_calls()), call["args"].split().count("-p"))
             self.assertTrue(all(line.endswith("args=") for line in fake.bin_calls()), fake.bin_calls())
@@ -185,9 +192,7 @@ class TestFastRuns(unittest.TestCase):
 
 class TheDirIsFencedOff(unittest.TestCase):
     def test_gitignored(self):
-        out = subprocess.run(["git", "check-ignore", "-q", f"rust-modules/{TDIR}/debug/x"],
-                             cwd=ROOT)
-        self.assertEqual(out.returncode, 0, f"rust-modules/{TDIR}/ must be in .gitignore")
+        self.assertTrue(ignored_target(TDIR))
 
     def test_cargo_seed_handles_only_target_and_target_release(self):
         text = (ROOT / "tools/cargo-seed.py").read_text()

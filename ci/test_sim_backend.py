@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """Every simulator build that drops the default features still selects the Feed backend.
 
-`hostsim` swaps the television's native video sink for the simulator's (`plx_play_feed::ffi_host`),
-but that stand-in is the Feed backend's, so it exists only when `play-feed` is built. A simulator
-built `--no-default-features --features hostsim` selects NO backend: its app installs `NoSink`, so
-Play can only ever reach the failure read-out and the clock sink (`plxnative-clocksink`) has nothing
-to arm. Three builds drift into that state because they drop `devtools` and `devtriggers` with
-`--no-default-features` and then list `hostsim` alone: the `.app` bundle (`ci/mkmacapp.py`), the
-screenshot simulator (`make screenshots-sim`) and the demo-video simulator (`make site-video-sim`);
-so does the CI step that type-checks the simulator feature set, which then proves nothing about the
+The simulator is its own platform (`plx_platform_desktop`, which `sim` compiles, and whose binary
+`plxnative-sim` it is), and the video sink
+it hands the application is the Feed backend's host sink (`plx_play_feed::ffi_host`), which exists
+only when `play-feed` is built. A simulator built `--no-default-features --features sim` selects
+NO backend: its platform installs `NoSink`, so Play can only ever reach the failure read-out and the
+clock sink (`plxnative-clocksink`) has nothing to arm. Three builds drift into that state because
+they drop `devtools` and `devtriggers` with `--no-default-features` and then list `sim` alone:
+the `.app` bundle (`ci/mkmacapp.py`), the screenshot simulator (`make screenshots-sim`) and the
+demo-video simulator (`make site-video-sim`); so do the CI steps that type-check
+(`ci.yml`) and link (`simulators.yml`) the simulator feature set, which then prove nothing about the
 configuration the other three ship.
 
 The scan finds every cargo command line in the files that can hold one, joins its continuations and
-`--features` flags, and fails the ones that name `hostsim`, pass `--no-default-features` and lack
+`--features` flags, and fails the ones that name `sim`, pass `--no-default-features` and lack
 `play-feed`. The named sites below are asserted to be FOUND, so a rewrite that moves a line out of
 the scan's reach cannot turn the rule into a vacuous pass.
 """
@@ -26,6 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 MAKEFILE = "Makefile"
 MKMACAPP = "ci/mkmacapp.py"
 CI_YML = ".github/workflows/ci.yml"
+SIMULATORS_YML = ".github/workflows/simulators.yml"
 
 
 def feature_flags(tokens):
@@ -91,7 +94,7 @@ def python_cargo_commands(path):
 
 def scan():
     commands = []
-    for path in (MAKEFILE, CI_YML):
+    for path in (MAKEFILE, CI_YML, SIMULATORS_YML):
         commands += text_cargo_commands(path)
     for path in sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "ci").glob("*.py")):
         commands += python_cargo_commands(path)
@@ -99,16 +102,16 @@ def scan():
 
 
 def sim_commands(commands):
-    return [c for c in commands if "hostsim" in c[4]]
+    return [c for c in commands if "sim" in c[4]]
 
 
 class SimulatorBackend(unittest.TestCase):
     def test_the_scan_reaches_the_builds_it_exists_for(self):
         sims = sim_commands(scan())
         reached = {(path, bool(no_default)) for path, _, _, no_default, _ in sims}
-        for site in (MKMACAPP, MAKEFILE, CI_YML):
+        for site in (MKMACAPP, MAKEFILE, CI_YML, SIMULATORS_YML):
             with self.subTest(site):
-                self.assertIn((site, True), reached, f"no `--no-default-features --features hostsim` build found in {site}")
+                self.assertIn((site, True), reached, f"no `--no-default-features --features sim` build found in {site}")
         makefile_lines = " ".join(line for path, _, line, _, _ in sims if path == MAKEFILE)
         for target_flag in ("--bin plxnative-sim", "placeholder-sentinel", "devtriggers"):
             self.assertIn(target_flag, makefile_lines)
@@ -125,11 +128,22 @@ class SimulatorBackend(unittest.TestCase):
             "can never play: add play-feed to its --features",
         )
 
+    def test_every_simulator_build_selects_the_desktop_platform_crate(self):
+        """`plxnative-sim` is the binary of `plx_platform_desktop`, not of the application package. A simulator
+        build or type-check that names no `-p plx_platform_desktop` selects the application package alone, which
+        has no such binary (and whose `sim` feature is not the one the desktop platform forwards)."""
+        builds = [(path, n, line) for path, n, line, _, _ in sim_commands(scan())
+                  if re.search(r"\b(build|check)\b", line) and not re.search(r"\btest\b", line)]
+        self.assertTrue(builds)
+        bad = [f"{path}:{n}: {line}" for path, n, line in builds if "plx_platform_desktop" not in line]
+        self.assertEqual(bad, [], "a simulator build that does not select `-p plx_platform_desktop`")
+
     def test_each_scripted_simulator_build_is_pinned_to_its_features(self):
-        """The three bundle/screenshot/video builds and the CI type-check, spelled out."""
+        """The three bundle/screenshot/video builds and the CI type-check and link, spelled out."""
         pinned = {
-            MKMACAPP: {"hostsim", "play-feed"},
-            CI_YML: {"hostsim", "play-feed"},
+            MKMACAPP: {"sim", "play-feed"},
+            CI_YML: {"sim", "play-feed"},
+            SIMULATORS_YML: {"sim", "play-feed"},
         }
         sims = sim_commands(scan())
         for site, expected in pinned.items():
@@ -144,12 +158,14 @@ class SimulatorBackend(unittest.TestCase):
             m = re.match(r"^([A-Za-z0-9_.-]+):(?!=)", line)
             if m:
                 target = m.group(1)
-            if target in ("screenshots-sim", "site-video-sim") and "hostsim" in line:
-                by_target.setdefault(target, set()).update(feature_flags(re.split(r"\s+", line))[1])
+            if target in ("screenshots-sim", "site-video-sim"):
+                flags = feature_flags(re.split(r"\s+", line))[1]
+                if "sim" in flags:  # one cargo line that names the feature, not any line of the recipe
+                    by_target.setdefault(target, set()).update(flags)
         for target in ("screenshots-sim", "site-video-sim"):
             with self.subTest(target):
                 self.assertIn("play-feed", by_target.get(target, set()), f"make {target} lacks play-feed")
-                self.assertIn("hostsim", by_target[target])
+                self.assertIn("sim", by_target[target])
 
 
 if __name__ == "__main__":

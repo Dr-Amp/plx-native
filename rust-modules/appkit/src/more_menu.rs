@@ -78,6 +78,7 @@
 //! the picture already satisfies does nothing at all. That is a user-initiated switch and not an
 //! adaptive one — nothing measures a link or moves a rung on its own.
 #![allow(non_upper_case_globals)]
+use plx_ui::a11y::{A11y, A11yPath};
 use plx_ui::frame::Budget;
 use plx_ui::geom::IndexElem;
 use plx_machine::machine::{Cx, EntryId, FocusKey, GroupId, Host, Measure};
@@ -85,8 +86,8 @@ use plx_ui::screen::{At, Dir, DrawFrame, Focusable, GroupSpec, Part, Placed, Ste
 use plx_ui::form::{Activation, Form, FormId, FormSection, FormTable, RowKey, RowKind};
 use crate::player_hud::command::HudCommand;
 use plx_ui::page_stack::{
-    self, popover_group_of, popover_groups, popover_neighbour, popover_place,
-    popover_register_stops, popover_seat, PageStack, PopoverPanel,
+    self, popover_a11y, popover_a11y_elems, popover_group_of, popover_groups, popover_neighbour,
+    popover_place, popover_register_stops, popover_seat, PageStack, PopoverPanel,
 };
 use plx_ui::panel_motion::PanelMotion;
 use plx_ui::table::Row;
@@ -135,7 +136,7 @@ pub fn folded_rows(
     meta: plx_data::metadata::MetadataView<'_>,
 ) -> Vec<FoldedRow> {
     use crate::player_hud::command::{Section, TrackTab};
-    use plx_platform::i18n::msg;
+    use plx_os::i18n::msg;
     folds
         .iter()
         .filter_map(|fold| {
@@ -170,8 +171,8 @@ impl MorePage {
     /// The title band's text.
     fn title(self) -> String {
         match self {
-            Self::Quality => plx_platform::i18n::msg::widgets_menu_quality().to_string(),
-            Self::Speed => plx_platform::i18n::msg::widgets_menu_speed().to_string(),
+            Self::Quality => plx_os::i18n::msg::widgets_menu_quality().to_string(),
+            Self::Speed => plx_os::i18n::msg::widgets_menu_speed().to_string(),
         }
     }
 
@@ -343,6 +344,60 @@ impl FormId for MoreRow {
     }
 }
 
+impl MoreRow {
+    /// **The row's name in the menu's accessibility ids** (`plx_ui::a11y`), relative to the menu: one
+    /// word per row IDENTITY, never a position, so the Quality rungs and the speeds keep their ids
+    /// when the offered set changes. The root's drill-ins are `quality` and `speed`, the switches
+    /// `stats` and `diagnostics`, a folded command `fold.<command>`; the Quality page's rungs are
+    /// `rung.<name>` and the Speed page's `rate.<thousandths>` (1500 is 1.5x). A page shows one of
+    /// these sets at a time, so no two rows of a view share an id. An exhaustive match, so a new
+    /// rung or command cannot compile without a name, as it cannot without a focus key.
+    fn a11y_path(&self) -> A11yPath {
+        use plx_media::route::Quality;
+        let path = A11yPath::new();
+        match self {
+            MoreRow::OpenQuality => path.name("quality"),
+            MoreRow::OpenSpeed => path.name("speed"),
+            MoreRow::Act(action) => match action {
+                Action::None => path.name("none"),
+                Action::ToggleStats => path.name("stats"),
+                Action::SendDiagnostics => path.name("diagnostics"),
+                Action::SetQuality(quality) => path.name("rung").name(match quality {
+                    Quality::Auto => "auto",
+                    Quality::Original => "original",
+                    Quality::P1080High => "p1080_high",
+                    Quality::P1080 => "p1080",
+                    Quality::P720 => "p720",
+                    Quality::P720Low => "p720_low",
+                    Quality::P480 => "p480",
+                }),
+                Action::SetSpeed(thousandths) => path.name("rate").index(usize::try_from(*thousandths).unwrap_or(0)),
+                Action::Hud(command) => path.name("fold").name(match command {
+                    HudCommand::Previous => "previous",
+                    HudCommand::Next => "next",
+                    HudCommand::OpenTracks(_) => "tracks",
+                    HudCommand::ToggleSection(crate::player_hud::command::Section::Chapters) => "chapters",
+                    HudCommand::ToggleSection(crate::player_hud::command::Section::Info) => "info",
+                    HudCommand::FromBeginning => "from_beginning",
+                    HudCommand::GoToDetail => "go_to_detail",
+                    HudCommand::TogglePlay => "play_pause",
+                    HudCommand::Seek(_) => "seek",
+                    HudCommand::OpenMore(_) => "more",
+                    HudCommand::ToggleStats => "stats",
+                }),
+            },
+        }
+    }
+}
+
+/// Whether the Quality section is withheld for this session: under Force Direct Play (no rung can change what plays) and
+/// when no composed backend can carry a rung (no Feed, and the URI provider certifies no converted output:
+/// [`plx_media::route::PlaybackSession::quality_pick_carriable`]), where a pick would persist a ceiling a playing original
+/// cannot honour. `forced` below is this answer.
+fn quality_withheld(ps: &plx_media::route::PlaybackSession) -> bool {
+    plx_media::route::forced_direct_play(ps) || !ps.quality_pick_carriable()
+}
+
 /// Is the Quality row offered? Force Direct Play never offers one (no rung can change what plays),
 /// and an empty ladder has nothing to open onto — a row leading to an empty page would read as a
 /// menu that failed to load.
@@ -362,7 +417,7 @@ fn root_form(
     speeds: &[i32],
     folded: &[FoldedRow],
 ) -> MoreForm {
-    let mut options = FormSection::new(plx_platform::i18n::msg::widgets_menu_options());
+    let mut options = FormSection::new(plx_os::i18n::msg::widgets_menu_options());
     for a in rows.iter().copied().filter(|a| !matches!(a, Action::SetQuality(_))) {
         options = options.item(MoreRow::Act(a), RowKind::Button, a, row_for(ps, a));
     }
@@ -371,7 +426,7 @@ fn root_form(
         MoreRow::OpenQuality,
         RowKind::Nav(MorePage::Quality),
         Action::None,
-        Row::new(plx_platform::i18n::msg::widgets_menu_quality()).value(quality_readout(ps, current)),
+        Row::new(plx_os::i18n::msg::widgets_menu_quality()).value(quality_readout(ps, current)),
     )
     // Offered under Force Direct Play too: a speed changes how fast the picture plays, not what
     // the server sends. Not offered where this playback cannot play any speed but 1x
@@ -381,7 +436,7 @@ fn root_form(
         MoreRow::OpenSpeed,
         RowKind::Nav(MorePage::Speed),
         Action::None,
-        Row::new(plx_platform::i18n::msg::widgets_menu_speed()).value(speed_label(speed)),
+        Row::new(plx_os::i18n::msg::widgets_menu_speed()).value(speed_label(speed)),
     );
     let mut form = Form::new().section(quality);
     // The commands the package places nowhere: after Quality and Speed, before Options, in the compiler's order.
@@ -409,7 +464,7 @@ fn speed_form(ps: &plx_media::route::PlaybackSession, speed: i32, speeds: &[i32]
 /// A speed's name: `Normal` at 1x, else the multiplier (`plx_media::player::rate_name`).
 fn speed_label(permille: i32) -> String {
     if permille == plx_media::player::RATE_NORMAL {
-        return plx_platform::i18n::msg::widgets_speed_normal().to_string();
+        return plx_os::i18n::msg::widgets_speed_normal().to_string();
     }
     plx_media::player::rate_name(permille)
 }
@@ -424,7 +479,7 @@ fn quality_readout(ps: &plx_media::route::PlaybackSession, current: plx_media::r
     let joined = |second: String| format!("{} \u{b7} {second}", current.short_label());
     match (current, plx_media::route::playing_quality(ps)) {
         (Quality::Original | Quality::Auto, PlayingQuality::Converted) => {
-            joined(plx_platform::i18n::msg::widgets_menu_quality_converted().to_owned())
+            joined(plx_os::i18n::msg::widgets_menu_quality_converted().to_owned())
         }
         (Quality::Auto, PlayingQuality::Original) => joined(Quality::Original.label()),
         (Quality::Auto, PlayingQuality::Rung(lines)) => joined(format!("{lines}p")),
@@ -454,7 +509,7 @@ fn quality_form(
         |sec, a| {
             let mut row = row_for(ps, a);
             if a == Action::SetQuality(current) && quality_conversion_note(ps, current) {
-                row = row.detail(plx_platform::i18n::msg::widgets_menu_quality_converted_note());
+                row = row.detail(plx_os::i18n::msg::widgets_menu_quality_converted_note());
             }
             sec.choice(MoreRow::Act(a), a, row, |id| {
                 *id == MoreRow::Act(Action::SetQuality(current))
@@ -465,10 +520,10 @@ fn quality_form(
 }
 
 impl MoreMenuState {
-    fn open_focused(ps: &plx_media::route::PlaybackSession, page: Option<MorePage>, folded: Vec<FoldedRow>) -> Self {
-        let forced = plx_media::route::forced_direct_play(ps);
+    fn open_focused(ps: &plx_media::route::PlaybackSession, page: Option<MorePage>, folded: Vec<FoldedRow>, current: plx_media::route::Quality) -> Self {
+        let forced = quality_withheld(ps);
         let rows = rows_for(forced);
-        let current = plx_media::route::quality();
+
         let speed = plx_media::player::selected_rate(ps).unwrap_or(plx_media::player::RATE_NORMAL);
         let speeds = plx_media::player::speed_offer(ps);
         let mut form = FormTable::new(plx_ui::table_screen::BAND_BASE);
@@ -594,12 +649,16 @@ impl MoreMenuState {
     /// pick), and the page pops to the root when Quality stops being offered. The panel's height
     /// follows, and the card animates to it ([`Self::update`]). Returns whether it rebuilt.
     pub fn refresh(&mut self, ps: &plx_media::route::PlaybackSession) -> bool {
-        let forced = plx_media::route::forced_direct_play(ps);
+        self.refresh_with_quality(ps, self.current)
+    }
+
+    pub fn refresh_with_quality(&mut self, ps: &plx_media::route::PlaybackSession, current: plx_media::route::Quality) -> bool {
+        let forced = quality_withheld(ps);
         self.refresh_to(
             ps,
             forced,
             rows_for(forced),
-            plx_media::route::quality(),
+            current,
             plx_media::player::selected_rate(ps).unwrap_or(plx_media::player::RATE_NORMAL),
             plx_media::player::speed_offer(ps),
         )
@@ -692,13 +751,13 @@ impl MoreMenuState {
     /// row. A page that is not offered for this playback (Quality under Force Direct Play, Speed
     /// when the playback takes only one) opens the root instead.
     pub fn new_on(ps: &plx_media::route::PlaybackSession, page: Option<MorePage>) -> Self {
-        Self::open_focused(ps, page, Vec::new())
+        Self::open_focused(ps, page, Vec::new(), plx_media::route::Quality::Original)
     }
 
     /// [`Self::new_on`] with the folded rows ([`folded_rows`]) listed on the root between Speed and Options.
     /// A page opened directly still pops to that root, so its folded rows are there on BACK.
     pub fn new_folded(ps: &plx_media::route::PlaybackSession, page: Option<MorePage>, folded: Vec<FoldedRow>) -> Self {
-        Self::open_focused(ps, page, folded)
+        Self::open_focused(ps, page, folded, plx_media::route::Quality::Original)
     }
 
     /// Every row's focus key, in drawn order (for a test that walks the rows).
@@ -778,6 +837,16 @@ impl MoreMenuState {
     /// the frame the panel mounts — see `TrackMenuState::warm_open`, which this mirrors.
     pub fn warm_open(&self, measure: &dyn plx_machine::machine::Measure) {
         self.motion.warm_open(&self.form.table, || self.panel_rect(measure), measure);
+    }
+
+    /// Construction from the host's captured effective quality, never a process preference read.
+    pub fn new_folded_with_quality(ps: &plx_media::route::PlaybackSession, page: Option<MorePage>, folded: Vec<FoldedRow>, current: plx_media::route::Quality) -> Self {
+        Self::open_focused(ps, page, folded, current)
+    }
+
+    pub fn update_with_quality(&mut self, dt: f32, measure: &dyn plx_machine::machine::Measure, ps: &plx_media::route::PlaybackSession, current: plx_media::route::Quality) {
+        self.refresh_with_quality(ps, current);
+        self.update(dt, measure, ps);
     }
 
     pub fn update(&mut self, dt: f32, measure: &dyn plx_machine::machine::Measure, ps: &plx_media::route::PlaybackSession) {
@@ -872,6 +941,28 @@ where
     fn seat(&self, _g: GroupId, _from: Placed, _cx: &Cx<'_, H>) -> FocusKey<H::Elem> {
         popover_seat(self.state, self.entry)
     }
+    /// A row is its [`MoreRow::a11y_path`], relative to the menu (the overlay screen that composes
+    /// this part places the menu under its own namespace). The inverse is the default walk: a page
+    /// of a popover is a handful of rows.
+    fn a11y(&self, key: &H::Elem, _cx: &Cx<'_, H>) -> Option<A11y<'_>> {
+        popover_a11y(&self.state.form, key, MoreRow::a11y_path)
+    }
+    fn a11y_elems(&self, g: GroupId, _cx: &Cx<'_, H>, out: &mut Vec<H::Elem>) {
+        popover_a11y_elems(&self.state.form, g, self.group, out)
+    }
+}
+
+impl MoreMenuPart<'_> {
+    /// **What a press of the row `key` performs**, for a row that performs one (the Quality and Speed drill-ins
+    /// open a page and have none): the row's [`Action`], read off the form's binding the way `a11y` reads
+    /// its id. The overlay screen asks it to name the title a folded row plays.
+    pub fn action_at<E: IndexElem>(&self, key: &E) -> Option<Action> {
+        let form = &self.state.form;
+        match form.binding_at(form.index_of_key(RowKey(key.index()?))?)?.id {
+            MoreRow::Act(action) => Some(action),
+            MoreRow::OpenQuality | MoreRow::OpenSpeed => None,
+        }
+    }
 }
 
 impl<H: Host> Part<H> for MoreMenuPart<'_>
@@ -897,8 +988,8 @@ where
 /// be a row here too — there is none, and the debug assert in [`MoreMenuState::open_focused`] is
 /// what would catch one being added on one side only.
 ///
-/// **`forced` (Force Direct Play) drops the Quality section entirely.** Every rung is a request for
-/// the server to convert, and Force forbids conversion, so under it no rung can change what plays:
+/// **`forced` (Force Direct Play, or a composition that converts nothing) drops the Quality section entirely.** Every rung is a request for
+/// the server to convert, and Force forbids conversion (a no-Feed composition cannot perform one), so under it no rung can change what plays:
 /// a row that cannot change the outcome is not offered (the same rule as the failure read-out's
 /// `player::failure_actions`). Pure over the flag so both shapes are testable without a session.
 fn rows_for(forced: bool) -> Vec<Action> {
@@ -911,7 +1002,7 @@ fn rows_for(forced: bool) -> Vec<Action> {
             .collect()
     };
     v.push(Action::ToggleStats);
-    if plx_platform::labcfg::menu_row_enabled() {
+    if plx_os::labcfg::menu_row_enabled() {
         v.push(Action::SendDiagnostics);
     }
     v
@@ -919,12 +1010,12 @@ fn rows_for(forced: bool) -> Vec<Action> {
 
 fn label(a: Action) -> std::borrow::Cow<'static, str> {
     match a {
-        Action::ToggleStats => plx_platform::i18n::msg::widgets_menu_stats().into(),
+        Action::ToggleStats => plx_os::i18n::msg::widgets_menu_stats().into(),
         // the rung names itself — rate and frame in one string, because the row already carries
         // the picker's leading mark (see this module's doc)
         Action::SetQuality(q) => q.label().into(),
         Action::SetSpeed(r) => speed_label(r).into(),
-        Action::SendDiagnostics => plx_platform::i18n::msg::widgets_menu_diagnostics().into(),
+        Action::SendDiagnostics => plx_os::i18n::msg::widgets_menu_diagnostics().into(),
         Action::None => "".into(),
         // a folded row is labelled by its `FoldedRow`, which knows the content
         Action::Hud(_) => "".into(),
@@ -1444,6 +1535,23 @@ mod tests {
         }
     }
 
+    /// **A composition that converts nothing offers no Quality row either**: no Feed, and no URI resolver that certifies a
+    /// converted output (here none at all; `plx_media`'s `a_quality_pick_no_composed_backend_can_carry_is_refused_and_leaves_the_route_alone`
+    /// covers the Tizen resolver that is installed and certifies none). A rung picked there would persist a ceiling the playing
+    /// original cannot honour and queue a Retranscode no pump consumes, so the ladder is not offered. A Feed (webOS) keeps it.
+    #[test]
+    fn a_composition_that_converts_nothing_offers_no_quality_row() {
+        plx_media::speed_audio::force_speed_decoder_for_test(true); // a host test loads no FFmpeg
+        let mut ps = plx_media::route::PlaybackSession::default();
+        ps.install_backends(plx_media::route::BackendSet::URI);
+        let st = MoreMenuState::new(&ps);
+        assert!(!st.rows.iter().any(|a| matches!(a, Action::SetQuality(_))), "{:?}", st.rows);
+        assert!(!quality_offered(&st.rows, st.forced));
+        ps.install_backends(plx_media::route::BackendSet::BOTH);
+        let st = MoreMenuState::new(&ps);
+        assert!(quality_offered(&st.rows, st.forced), "a composition with a Feed keeps the ladder");
+    }
+
     /// **Force Direct Play leaves no Quality row and no page**: no rung can change what plays under
     /// it, so none is offered and a quality entry lands on the root's first row, Playback speed.
     #[test]
@@ -1585,9 +1693,9 @@ mod tests {
         let ps = plx_media::route::PlaybackSession::default();
         let m = plx_base::fontcov::advances::ShippedMeasure;
         let step = |st: &mut MoreMenuState| {
-            plx_machine::idle::frame_begin(DT);
+            plx_machine::motion::report::frame_begin(DT);
             st.update(DT, &m, &ps);
-            plx_machine::idle::present_moving()
+            plx_machine::motion::report::present_moving()
         };
         let mut st = menu(false, plx_media::route::quality());
         st.motion.step(DT, st.panel_rect(&m));
@@ -1629,9 +1737,9 @@ mod tests {
         let ps = plx_media::route::PlaybackSession::default();
         let m = plx_base::fontcov::advances::ShippedMeasure;
         let step = |st: &mut MoreMenuState| {
-            plx_machine::idle::frame_begin(DT);
+            plx_machine::motion::report::frame_begin(DT);
             st.update(DT, &m, &ps);
-            plx_machine::idle::present_moving()
+            plx_machine::motion::report::present_moving()
         };
         // opened under Force Direct Play: no Quality row, a short panel
         let mut st = menu(true, plx_media::route::quality());
@@ -1664,6 +1772,7 @@ mod tests {
 #[cfg(test)]
 mod focus_tests {
     use super::*;
+    use plx_ui::a11y::Role;
     use plx_machine::machine::{FocusRead, InputOwner, PressRead, Tick};
 
     struct HostFixture;
@@ -1686,6 +1795,7 @@ mod focus_tests {
             focus: FocusRead::default(),
             press: PressRead::default(),
             owner: InputOwner::Entry(entry),
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
         })
     }
 
@@ -1705,6 +1815,11 @@ mod focus_tests {
         let mut form = FormTable::new(plx_ui::table_screen::BAND_BASE);
         form.table.compact = true;
         form.set(Form::new().section(sec), None);
+        menu_of(form)
+    }
+
+    /// A menu showing `form`, with nothing else about it asked of a playback.
+    fn menu_of(form: MoreTable) -> MoreMenuState {
         MoreMenuState {
             form,
             rows: Vec::new(),
@@ -1723,6 +1838,91 @@ mod focus_tests {
     /// The focus element of the row at `index` — the keys are identities, not positions.
     fn elem(st: &MoreMenuState, index: usize) -> u32 {
         st.form.key_at(index).expect("a bound row").0
+    }
+
+    /// Every row of `form` as the menu projects it: `(id, role)` in row order, after the menu
+    /// passes the `a11y` conformance suite (every row projects, ids are unique, the inverse finds
+    /// each row and the group lists no more rows than it declares).
+    fn projected(form: MoreForm) -> Vec<(String, Role)> {
+        plx_media::speed_audio::force_speed_decoder_for_test(true); // a host test loads no FFmpeg
+        let e = EntryId(4);
+        let mut table = FormTable::new(plx_ui::table_screen::BAND_BASE);
+        table.table.compact = true;
+        table.set(form, None);
+        let st = menu_of(table);
+        let part = MoreMenuPart { state: &st, entry: e, group: GroupId(0) };
+        with_cx(e, |cx| {
+            plx_ui::a11y::conformance(&part, cx);
+            let mut keys = Vec::new();
+            <MoreMenuPart as Focusable<HostFixture>>::a11y_elems(&part, GroupId(0), cx, &mut keys);
+            keys.iter()
+                .map(|k| {
+                    let a = <MoreMenuPart as Focusable<HostFixture>>::a11y(&part, k, cx).expect("a row projects");
+                    (a.path.to_string(), a.role)
+                })
+                .collect()
+        })
+    }
+
+    /// **A menu's rows are named by identity** and the menu conforms: the rungs are `rung.<name>`
+    /// and the switch `stats`, in row order, whatever keys the rows were given.
+    #[test]
+    fn rows_are_named_by_identity_and_conform() {
+        plx_media::speed_audio::force_speed_decoder_for_test(true); // a host test loads no FFmpeg
+        let e = EntryId(4);
+        let st = three_row_menu();
+        let part = MoreMenuPart { state: &st, entry: e, group: GroupId(0) };
+        with_cx(e, |cx| {
+            plx_ui::a11y::conformance(&part, cx);
+            let at = |i: usize| {
+                <MoreMenuPart as Focusable<HostFixture>>::a11y(&part, &elem(&st, i), cx)
+                    .map(|a| (a.path.to_string(), a.role))
+            };
+            assert_eq!(at(0), Some(("rung.original".to_string(), Role::Button)));
+            assert_eq!(at(1), Some(("rung.auto".to_string(), Role::Button)));
+            assert_eq!(at(2), Some(("stats".to_string(), Role::Button)));
+            // the title band's pointer-only key and a key of no row project nothing
+            let none = |key: u32| <MoreMenuPart as Focusable<HostFixture>>::a11y(&part, &key, cx).is_none();
+            assert!(none(plx_ui::page_stack::TITLE_KEY));
+            assert!(none(9999));
+            // the inverse is the row's key, and only for a path of this menu
+            let find = |text: &str| {
+                let path = A11yPath::parse_relative(text).expect("a relative path");
+                <MoreMenuPart as Focusable<HostFixture>>::a11y_find(&part, &path, cx)
+            };
+            assert_eq!(find("rung.auto"), Some(elem(&st, 1)));
+            assert_eq!(find("rung.p480"), None);
+        });
+    }
+
+    /// **Each page of the real forms conforms.** The root names its drill-ins `quality` and `speed`,
+    /// a folded command `fold.<command>` and the switch `stats`; the Quality page's rungs are
+    /// `rung.<name>` and the Speed page's speeds `rate.<thousandths>`. A drill-in and a choice are a
+    /// `Row`, a command a `Button`.
+    #[test]
+    fn every_page_of_the_menu_names_its_rows() {
+        use plx_media::route::Quality;
+        plx_media::speed_audio::force_speed_decoder_for_test(true); // a host test loads no FFmpeg
+        let ps = plx_media::route::PlaybackSession::default();
+        let rows = [Action::SetQuality(Quality::Auto), Action::SetQuality(Quality::P720), Action::ToggleStats];
+        let folded = [FoldedRow { command: HudCommand::Previous, label: "Previous" }];
+        let rate = plx_media::player::RATE_NORMAL;
+        let speeds = plx_media::player::PLAY_RATES;
+
+        let root = projected(root_form(&ps, &rows, false, Quality::Auto, rate, &speeds, &folded));
+        let ids: Vec<&str> = root.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["quality", "speed", "fold.previous", "stats"]);
+        assert_eq!(root[0].1, Role::Row, "a drill-in");
+        assert_eq!(root[2].1, Role::Button, "a folded command");
+
+        let quality = projected(quality_form(&ps, &rows, Quality::Auto));
+        let ids: Vec<&str> = quality.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["rung.auto", "rung.p720"]);
+        assert!(quality.iter().all(|(_, role)| *role == Role::Row), "a choice");
+
+        let page = projected(speed_form(&ps, rate, &speeds));
+        assert_eq!(page.len(), speeds.len());
+        assert!(page.iter().any(|(id, _)| *id == format!("rate.{rate}")));
     }
 
     /// **UP/DOWN step by one row and clamp at both ends**, over `TableView::next_selectable`,
@@ -1807,7 +2007,7 @@ mod focus_tests {
     #[test]
     fn every_row_fits_the_panel_in_every_language() {
         plx_media::speed_audio::force_speed_decoder_for_test(true); // a host test loads no FFmpeg
-        use plx_platform::i18n::{language_on_this_thread_for_test, SHIPPED};
+        use plx_os::i18n::{language_on_this_thread_for_test, SHIPPED};
         let ps = plx_media::route::PlaybackSession::default();
         let mut out = Vec::new();
         let rows = rows_for(false);
@@ -1863,7 +2063,7 @@ mod focus_tests {
             let meta = plx_data::stores::metadata::MetadataStore::default();
             let mut folded = folded_rows(&every, &full, meta.view());
             assert_eq!(folded.len(), every.len(), "{}: every command offers a row", language.tag());
-            for go in [plx_platform::i18n::msg::widgets_info_go_show(), plx_platform::i18n::msg::widgets_info_go_movie()] {
+            for go in [plx_os::i18n::msg::widgets_info_go_show(), plx_os::i18n::msg::widgets_info_go_movie()] {
                 folded[6].label = go;
                 for q in plx_media::route::QUALITY_LADDER {
                     let mut root = MoreMenuState::new(&ps);
@@ -1884,9 +2084,9 @@ mod focus_tests {
     fn quality_row(fixture: plx_media::route::EnhTestFixture, rung: Option<plx_media::abr::Rung>) -> (String, String) {
         let (ps, _) = plx_media::route::enhancement_test_session(plx_media::route::EnhTestFixture { rung, ..fixture });
         let current = plx_media::route::quality();
-        let mut root = MoreMenuState::new(&ps);
+        let mut root = MoreMenuState::new_folded_with_quality(&ps, None, Vec::new(), current);
         let value = super::tests::value_of(&mut root, MoreRow::OpenQuality).expect("a value");
-        let mut page = MoreMenuState::new(&ps);
+        let mut page = MoreMenuState::new_folded_with_quality(&ps, None, Vec::new(), current);
         page.rows = rows_for(false);
         page.focus_key(MoreRow::OpenQuality.key().0);
         page.push(&ps, MorePage::Quality);
@@ -1905,8 +2105,8 @@ mod focus_tests {
     fn the_quality_row_reads_choice_then_what_is_playing() {
         use plx_media::route::{EnhTestFixture, Quality};
         let _g = plx_base::testlock::serial();
-        let note = plx_platform::i18n::msg::widgets_menu_quality_converted_note();
-        let converted = plx_platform::i18n::msg::widgets_menu_quality_converted();
+        let note = plx_os::i18n::msg::widgets_menu_quality_converted_note();
+        let converted = plx_os::i18n::msg::widgets_menu_quality_converted();
         let original = Quality::Original.label();
         let auto = Quality::Auto.label();
         let fixture = |remux, quality| EnhTestFixture { remux, quality, ..Default::default() };
@@ -1959,7 +2159,7 @@ mod focus_tests {
     /// The converted read-out and note fit the panel in every shipped language.
     #[test]
     fn the_converted_marks_fit_in_every_language() {
-        use plx_platform::i18n::{language_on_this_thread_for_test, SHIPPED};
+        use plx_os::i18n::{language_on_this_thread_for_test, SHIPPED};
         let _g = plx_base::testlock::serial();
         let (ps, _) = plx_media::route::enhancement_test_session(plx_media::route::EnhTestFixture {
             remux: Some(false),
@@ -2115,7 +2315,7 @@ mod folded_tests {
     const REFERENCE: &str = include_str!("hud_format/fixtures/reference/hud.json");
 
     fn compiled(text: &str) -> Arc<crate::hud_format::compile::Compiled> {
-        load(&crate::hud_format::fixtures::with_hud_resources("reference", &text), "0.0.0-test", plx_platform::i18n::english(), &plx_ui::fixture::FixtureMeasure).expect("the fixture loads").compiled
+        load(&crate::hud_format::fixtures::with_hud_resources("reference", &text), "0.0.0-test", plx_os::i18n::english(), &plx_ui::fixture::FixtureMeasure).expect("the fixture loads").compiled
     }
 
     /// A frame's model for an episode with both neighbours (or a movie with none), chapters and a detail page.
@@ -2276,6 +2476,20 @@ mod folded_tests {
 
     /// The three numbers [`need_h`] is built from are the real table's: the root at its tallest standard shape, with
     /// zero to seven folded rows (the most a package can fold), is as tall as the formula says.
+    #[test]
+    fn captured_preference_quality_opens_and_refreshes_from_owner_inputs() {
+        use plx_media::route::{PlaybackSession, Quality};
+        let ps = PlaybackSession::IDLE;
+        let mut a = MoreMenuState::new_folded_with_quality(&ps, None, Vec::new(), Quality::P720);
+        let b = MoreMenuState::new_folded_with_quality(&ps, None, Vec::new(), Quality::Original);
+        assert_eq!(a.current, Quality::P720);
+        assert_eq!(b.current, Quality::Original);
+        assert!(a.refresh_with_quality(&ps, Quality::P1080));
+        assert_eq!(a.current, Quality::P1080);
+        assert_eq!(b.current, Quality::Original);
+        assert!(!a.refresh_with_quality(&ps, Quality::P1080));
+    }
+
     #[test]
     fn root_height_is_the_tables() {
         plx_media::speed_audio::force_speed_decoder_for_test(true); // a host test loads no FFmpeg

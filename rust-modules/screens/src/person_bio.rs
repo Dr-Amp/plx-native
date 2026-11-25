@@ -126,7 +126,7 @@ impl PersonBioScreen {
     ///
     /// **Doing that from a key handler does not fail as a skipped test. It fails as a LINK ERROR.**
     /// This screen's `step` is called by the host suite, `cargo test --lib` builds without
-    /// `--features hostsim`, and nothing then supplies SDL_ttf or GL — so one `.min(pages)` on this
+    /// `--features sim`, and nothing then supplies SDL_ttf or GL — so one `.min(pages)` on this
     /// line once stopped the whole suite from BUILDING, with an undefined `_TTF_SizeUTF8` naming
     /// `plx_gfx::text` and nothing about this panel. It cost a bisect to find. Anything reachable
     /// from a key handler here has to stay clear of text measurement.
@@ -481,8 +481,8 @@ fn page_state(person: &Person) -> (f32, usize) {
 pub fn meta_runs(roles: &str, born: &str, died: &str, birthplace: &str) -> Vec<String> {
     let mut runs = Vec::new();
     if !roles.trim().is_empty() { runs.push(roles.trim().to_owned()); }
-    if !born.trim().is_empty() { runs.push(plx_platform::i18n::msg::browse_person_born(born.trim())); }
-    if !died.trim().is_empty() { runs.push(plx_platform::i18n::msg::browse_person_died(died.trim())); }
+    if !born.trim().is_empty() { runs.push(plx_os::i18n::msg::browse_person_born(born.trim())); }
+    if !died.trim().is_empty() { runs.push(plx_os::i18n::msg::browse_person_died(died.trim())); }
     if !birthplace.trim().is_empty() { runs.push(birthplace.trim().to_owned()); }
     runs
 }
@@ -502,10 +502,10 @@ pub fn meta_runs(roles: &str, born: &str, died: &str, birthplace: &str) -> Vec<S
 pub fn library_line(films: usize, shows: usize) -> Option<String> {
     match (films, shows) {
         (0, 0) => None,
-        (films, 0) => Some(plx_platform::i18n::msg::browse_person_library_one(&plx_platform::i18n::msg::browse_person_films(films as i64))),
-        (0, shows) => Some(plx_platform::i18n::msg::browse_person_library_one(&plx_platform::i18n::msg::browse_person_shows(shows as i64))),
-        (films, shows) => Some(plx_platform::i18n::msg::browse_person_library_both(
-            &plx_platform::i18n::msg::browse_person_films(films as i64), &plx_platform::i18n::msg::browse_person_shows(shows as i64))),
+        (films, 0) => Some(plx_os::i18n::msg::browse_person_library_one(&plx_os::i18n::msg::browse_person_films(films as i64))),
+        (0, shows) => Some(plx_os::i18n::msg::browse_person_library_one(&plx_os::i18n::msg::browse_person_shows(shows as i64))),
+        (films, shows) => Some(plx_os::i18n::msg::browse_person_library_both(
+            &plx_os::i18n::msg::browse_person_films(films as i64), &plx_os::i18n::msg::browse_person_shows(shows as i64))),
     }
 }
 
@@ -515,7 +515,7 @@ pub fn library_line(films: usize, shows: usize) -> Option<String> {
 /// head ladder ([`theme::alert`]), the same flow [`head_h`] measures.
 fn draw_head(p: Painter, person: &Person, c: Rect, measure: &dyn plx_machine::machine::Measure) {
     let head = head(c.y);
-    Label::new(plx_platform::i18n::msg::browse_person_eyebrow_c().as_ptr(), theme::size::CAPTION, theme::TEXT_TERTIARY)
+    Label::new(plx_os::i18n::msg::browse_person_eyebrow_c().as_ptr(), theme::size::CAPTION, theme::TEXT_TERTIARY)
         .bold().h(theme::alert::TEXT_ALIGN).v(VAlign::CapTop).draw(p, Rect::new(c.x, head.eyebrow.y, c.w, 0.0));
 
     // The name is ELIDED to the content box, not wrapped: this is an identity, and a two-line name
@@ -583,13 +583,13 @@ fn draw_foot(p: Painter, person: &Person, c: Rect, measure: &dyn plx_machine::ma
     }
     // …and the hint, right-anchored: the widget measures itself, so the whole run ends on the
     // content box's right edge — the same edge the rail and the hairlines end on.
-    let hint = widgets::KeyHint::translated(plx_platform::i18n::msg::widgets_hint_return("\u{fffc}"), HINT_KEY);
+    let hint = widgets::KeyHint::translated(plx_os::i18n::msg::widgets_hint_return("\u{fffc}"), HINT_KEY);
     hint.draw(p, c.x + c.w - hint.width(measure), cy, measure);
 }
 
 // ---------------------------------------------------------------------------------------
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use plx_ui::prose_scroll::scroll_at;
     use plx_ui::consts::{SDLK_DOWN, SDLK_UP};
@@ -831,6 +831,9 @@ mod tests {
         type Init = TestInit;
         type Memory = TestInit;
     }
+    impl crate::registry::ScreenInputsLike for TestHost {
+        fn screen_inputs<'a>(_: &Cx<'a, Self>) -> &'a crate::registry::ScreenInputs { crate::registry::caption_fixture() }
+    }
     impl crate::registry::PersonLike for TestHost {
         fn person<'a>(cx: &Cx<'a, Self>) -> plx_data::person::PersonView<'a> { cx.views }
     }
@@ -843,6 +846,7 @@ mod tests {
             tick: Tick::default(),
             measure,
             press: PressRead::default(),
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
             focus: FocusRead::default(),
             owner: InputOwner::Entry(ENTRY),
         }
@@ -875,6 +879,21 @@ mod tests {
             edge: Edge::Down,
             at_edge: false,
         }
+    }
+
+    /// The sheet declares no group, so it has no element to name: the id conformance holds, and holds
+    /// because there is nothing to project (the default `a11y_elems` is the right answer).
+    #[test]
+    fn the_bio_sheet_has_no_element_to_name() {
+        assert!(!person_bio_conforms().is_empty());
+    }
+
+    /// The biography sheet mounted as the registry mounts it and run through the id conformance
+    /// (`AppArg::PersonBio`; the coverage table calls this).
+    pub(crate) fn person_bio_conforms() -> plx_ui::a11y::Namespaces {
+        let measure = plx_ui::fixture::FixtureMeasure;
+        let cx = cx(&measure);
+        vec![plx_ui::a11y::conform::<TestHost, _>(&PersonBioScreen::new(ENTRY), &cx)]
     }
 
     fn dismissed(out: &[Stamped<TestHost>]) -> bool {

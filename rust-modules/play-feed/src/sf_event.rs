@@ -172,7 +172,8 @@ pub fn media_to_fed(media_ns: i64) -> i64 {
 /// libpf on webOS 4.10 (`CustomPipeline::updateDroppedFrame` → 0x2e = 46,
 /// `updateDisplayedFrame` → 0x2f = 47); every type above 0x1c is two higher on webOS 5+
 /// (Kodi's `if (webOSVersion < 5 && type > ENDOFSTREAM) type += 2`), so 48/49 there. An unknown
-/// major (0, os_info unreadable) is read as the numbering this project has actually measured.
+/// major (0: neither `os_info.json` nor `/usr/lib/os-release` named a release) is read as the
+/// numbering this project has actually measured.
 pub fn sink_counter_kind(ty: c_int, major: u32) -> Option<SinkCounter> {
     let normalised = if major == 0 || major < 5 { ty + 2 } else { ty };
     match normalised {
@@ -258,7 +259,7 @@ pub fn sf_on_event_inner(ty: c_int, num: i64, s: *const c_char, scope: shared::E
         // callback numbering shifts by two between webOS 4 and 5+ (`docs/webos5-port.md` §5):
         // 46/47 on this set are 48/49 on a webOS 5+ set. The harness reads THIS line, never
         // the raw type.
-        note_sink_counter(&FEED_SHARED, ty, num, plx_platform::tv::device::info().major);
+        note_sink_counter(&FEED_SHARED, ty, num, plx_os::tv::device::info().major);
         // **A refusal before the first picture is a VERDICT, not a statistic.** Until 2026-09-03
         // the latch above was all this arm did, and `docs/webos10-lab-report.md` §3.5 records the
         // result on a set that refused the Load asynchronously (`Load()` returned ok=1, then

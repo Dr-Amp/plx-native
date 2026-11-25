@@ -14,9 +14,9 @@
 //! container's own `seat` (`column_near_x`'s contract), `Remembered` from the remembered
 //! cursor — except that an UP/DOWN press into a card lattice (`ElemKind::Card` `Row` or `Grid`)
 //! lands through `seat` too, on the card above or below the cursor ("down, right, up" closes a
-//! square) — `RememberedFirst` is the explicit linked-heading door (remembered cursor, then the
-//! first element), `RememberedNear{rows}` only within `rows` element-widths, `First` at the
-//! extent's head;
+//! square) — `RememberedFirst` is the explicit linked-heading door (remembered cursor reconciled
+//! within its group, then the group's head), `RememberedNear{rows}` only within `rows`
+//! element-widths, `First` at the extent's head;
 //! (5) the engine records the move and emits it; (6) after a landing, the owner's pure
 //! `reconcile(want)` — if the answer differs, `FocusMoved{by: Reconcile}` (the Slot→Item
 //! promotion is exactly this); (7) scope: the input owner's groups only.
@@ -285,10 +285,10 @@ impl<K: Copy + Eq + Hash> FocusEngine<K> {
             },
             Seat::RememberedFirst => {
                 let entry = entry_of(projected);
-                match self.remembered_in(entry, spec.id) {
-                    Some(elem) => FocusKey { entry, elem },
-                    None => f.seat(spec.id, head_of(spec.extent), cx),
-                }
+                self.remembered_in(entry, spec.id)
+                    .map(|elem| f.reconcile(FocusKey { entry, elem }, cx))
+                    .filter(|key| key.entry == entry && f.group_of(&key.elem, cx) == Some(spec.id))
+                    .unwrap_or_else(|| f.seat(spec.id, head_of(spec.extent), cx))
             }
             Seat::RememberedNear { rows } => {
                 let entry = entry_of(projected);
@@ -473,8 +473,10 @@ fn resolve_group(groups: &[GroupSpec], g: GroupId) -> Option<&GroupSpec> {
 }
 
 /// A source placement at a group's head (its top-left corner), for `Seat::First` and a fresh
-/// enter with no source.
-fn head_of(extent: Rect) -> Placed {
+/// enter with no source. Public for a screen whose own default seat sits in ANOTHER group than the
+/// one the container named (Detail's, below its action row): it asks that group's `seat` for the
+/// same placement the engine would have given it.
+pub fn head_of(extent: Rect) -> Placed {
     let r = Rect::new(extent.x, extent.y, 1.0, 1.0);
     Placed {
         rect: r,
@@ -810,6 +812,7 @@ mod tests {
             press: PressRead::default(),
             focus: FocusRead::default(),
             owner: OWNER,
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
         }
     }
 

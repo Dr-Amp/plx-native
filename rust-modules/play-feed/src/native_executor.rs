@@ -14,9 +14,9 @@ use crate::shared::PhysicalShared;
 use crate::shared::{HlsPlayCompletion, HlsPrimeKind, Stage, Transport};
 use crate::SendPtr;
 use plx_base::task::MainThread;
-use plx_platform::tv::sink::VideoSink;
-use plx_platform::tv::sink::UnloadTicket;
-use plx_platform::devcaps::AudioStack;
+use plx_os::tv::sink::VideoSink;
+use plx_os::tv::sink::UnloadTicket;
+use plx_os::devcaps::AudioStack;
 use plx_net::stream::HttpStream;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ffi::CString;
@@ -136,7 +136,7 @@ pub struct ReleaseHooks {
     pub raw_sink: fn() -> &'static dyn VideoSink,
     /// The process's plane owner: whether this device's plane is ACB, and the one that records
     /// (and never waits on) the release's `setState(UNLOADED)`.
-    pub plane: &'static plx_platform::tv::plane::PlaneOwner,
+    pub plane: &'static plx_os::tv::plane::PlaneOwner,
     pub on_release_step: fn(crate::native_release::ReleaseStep),
     pub on_exported_window_destroy: fn(),
     pub spawn_unload: fn(UnloadTicket) -> Option<std::thread::JoinHandle<()>>,
@@ -486,6 +486,7 @@ pub fn launch_native_open(
         seek_retries: 0,
         flushed: false,
         presentation_rearm_pending: false,
+        progressive_hold: crate::feed_state::ProgressiveHoldWatch::default(),
         max_fed_video_pts: 0,
         max_fed_audio_pts: 0,
         audio_start_fp: None,
@@ -723,7 +724,7 @@ fn finish_unloaded_object(
 fn destroy_native_window(mt: &MainThread, sp: &mut TeardownSpans, hooks: &ReleaseHooks) {
     unsafe { (hooks.raw_sink)().destroy_window(mt) };
     sp.mark("destroy_window");
-    if (hooks.raw_sink)().window_mode() == plx_platform::tv::sink::VP_EXPORTED {
+    if (hooks.raw_sink)().window_mode() == plx_os::tv::sink::VP_EXPORTED {
         (hooks.on_exported_window_destroy)();
     }
 }
@@ -888,6 +889,91 @@ pub const PRIME_NS: i64 = 700_000_000;
 // so a genuinely audioless region can't hang.
 pub const PRIME_AUDIO_NS: i64 = 300_000_000;
 pub use crate::feed_state::PRIME_VIDEO_MAX_NS;
+
+/// One lane's media tail in the fed-pts coordinate: what Starfish has accepted, and what the app's
+/// AU queue still holds behind it (the span of the queued AUs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaneTail {
+    pub fed_ns: i64,
+    pub queued_ns: i64,
+}
+
+impl LaneTail {
+    /// The pts the demuxer has read this lane to: what Starfish accepted plus what is queued behind it.
+    pub fn tail_ns(self) -> i64 {
+        self.fed_ns.saturating_add(self.queued_ns.max(0))
+    }
+}
+
+/// **The playable reserve of a progressive stream, in the fed-pts coordinate.** How much media
+/// lies between the presented `position_ns` (`FEED_SHARED.pres_fed`) and the point the demuxer has
+/// read to: each lane's tail is what Starfish accepted plus what the app's AU queue still holds
+/// behind it, and the FURTHER lane counts. A lane that has not opened has a tail near zero and so
+/// never counts (callers may pass `None` for it). `None` when the position is unknown
+/// ([`crate::feed_state::PRES_NONE`]).
+///
+/// **Furthest, not shortest, on purpose.** One demuxer feeds both lanes, so a starved link stops
+/// both tails together and the clock overtakes both: the reserve reaches zero. A lane that simply
+/// ENDS early (a film whose audio outlasts its video, or the reverse) stops advancing while the
+/// stream is perfectly healthy, and a shortest-lane reserve would read that as starvation and hold
+/// a healthy film at the end of its shorter track. Whether both decoder lanes are primed is the
+/// resume's separate `decoder_ready` condition, not this measure's.
+///
+/// This is `hls_buffered_ms` for a stream with no demux-published tails. Working in fed pts on
+/// both sides keeps `pts_shift` and `disp_base` out of it: they cancel.
+pub fn progressive_reserve_ns(position_ns: i64, video: LaneTail, audio: Option<LaneTail>) -> Option<i64> {
+    if position_ns == crate::feed_state::PRES_NONE {
+        return None;
+    }
+    let furthest = audio.map_or(video.tail_ns(), |a| video.tail_ns().max(a.tail_ns()));
+    Some(furthest.saturating_sub(position_ns).max(0))
+}
+
+/// Which clause let a progressive stall hold release the clock, as the resume line names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressiveRelease {
+    /// A queue is at its byte cap: the stream is back to the state it played with when healthy (a
+    /// capped queue), and the demuxer is parked, so nothing more can be buffered ahead of Play. One
+    /// reader feeds both lanes: whichever lane fills first parks it.
+    Full,
+    /// The demuxer finished: nothing more will arrive.
+    Eof,
+}
+
+impl ProgressiveRelease {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Eof => "eof",
+        }
+    }
+}
+
+/// Whether a progressive stall hold may release the clock, and by which clause (no runway
+/// constant). The reserve a stream played with when it was healthy IS its capped queue, so
+/// releasing at the cap restores the healthy state:
+///
+/// * `Full`: the video OR the audio queue is at its byte cap (`queue_full`, the queue's own
+///   producer-park predicate `queued_bytes > max_bytes`, so granted headroom counts): the demuxer
+///   is parked on it, so nothing more can be buffered ahead of Play, and holding on would deadlock
+///   with the sink also full. Audio counts because one sequential reader feeds both lanes and its
+///   queue is the smaller (1 MiB): a lossless track fills it before the video queue's cap, and the
+///   video queue then never reaches its own;
+/// * `Eof`: the demuxer finished (`producer_done`): nothing more will ever arrive, and the last
+///   seconds of a film do not hold 700 ms of fresh media past the playhead.
+///
+/// Both play what there is, so neither waits for `decoder_ready`. The end of the stream is named
+/// first when both hold.
+pub fn progressive_hold_releases(queue_full: bool, producer_done: bool) -> Option<ProgressiveRelease> {
+    if producer_done {
+        Some(ProgressiveRelease::Eof)
+    } else if queue_full {
+        Some(ProgressiveRelease::Full)
+    } else {
+        None
+    }
+}
+
 // Feed-ahead throttle (Kodi-parity): keep the VIDEO lane at most this far ahead of the presented
 // position (FEED_SHARED.pres_fed) instead of feeding greedily to BufferFull. Bounding the buffer to
 // ~1.6s (was ~10-20s: aq 6MB + the pipeline's own ~8MB) makes seeks flush far less, keeps the
@@ -1247,6 +1333,8 @@ pub fn try_prime(mt: &MainThread, eng: &mut Engine, transport: &Transport, hooks
     // rebuffer or ResumePrime) reads the full pipeline high-water. Initial Load/seek remains
     // accepted-only because it is a fresh clock boundary whose old queued tail is not proof about
     // the newly loaded/landed timeline.
+    // A progressive stall hold reads the queues below (a full one or the end of the stream, not the
+    // demux-published tails), so it does not take the HLS pipeline high-water.
     let queued_runway = matches!(prime_kind, HlsPrimeKind::Rebuffer | HlsPrimeKind::Resume);
     let shift = shared.pts_shift.load(Ordering::Relaxed);
     let queued_video = shared.hls_video_tail_ns.load(Ordering::Acquire);
@@ -1310,8 +1398,28 @@ pub fn try_prime(mt: &MainThread, eng: &mut Engine, transport: &Transport, hooks
         // An automatic rebuffer remains Rebuffer even across user Pause/Resume and must still
         // close its own pause-local recovery epoch above.
         HlsPrimeKind::Resume => true,
+        // Nothing to credit: a progressive stream completes no segment. Its certificate is
+        // `progressive_release` below: a queue at its byte cap, or the end of the stream.
+        HlsPrimeKind::ProgressiveRebuffer { .. } => true,
     };
-    if decoder_ready && boundary_ready && transport.feed_allowed() {
+    // A PROGRESSIVE stall hold (the `ProgressiveRebuffer` hold `maybe_begin_rebuffer` takes on a
+    // direct-play stream that ran out of media) has no segments to credit, so `recovery` never
+    // becomes ready for it: its certificate is a queue that cannot grow (the reserve the stream
+    // played with when healthy), or the end of the stream. Everything else about the Play (the
+    // token, the refusal and the stale paths) is the HLS hold's, unchanged.
+    let vq = aq::queue_ptr(&mut eng.aq_video);
+    let progressive_release = match prime_kind {
+        HlsPrimeKind::ProgressiveRebuffer { .. } => {
+            let parked = aq::aq_would_park(vq) || aq::aq_would_park(aq::queue_ptr(&mut eng.aq_audio));
+            progressive_hold_releases(parked, aq::aq_producer_done(vq))
+        }
+        _ => None,
+    };
+    let ready = match prime_kind {
+        HlsPrimeKind::ProgressiveRebuffer { .. } => progressive_release.is_some(),
+        _ => decoder_ready && boundary_ready,
+    };
+    if ready && transport.feed_allowed() {
         let Some((play_token, recovery)) =
             shared.reserve_hls_prime_play(prime_kind, candidate_generation, recovery)
         else {
@@ -1322,7 +1430,7 @@ pub fn try_prime(mt: &MainThread, eng: &mut Engine, transport: &Transport, hooks
             (hooks.mute_for_preroll)(mt);
             // The mute is the feed's own record (the restore gives back what was saved, which is
             // always the pipeline default: the volume is never read back).
-            transport.note_preroll_muted(plx_platform::tv::sink::PIPELINE_DEFAULT_VOLUME);
+            transport.note_preroll_muted(plx_os::tv::sink::PIPELINE_DEFAULT_VOLUME);
         }
         // Snapshot before the call so a callback delivered synchronously by Play counts, but
         // one queued during Flush/Segment does not establish the new clock by itself.
@@ -1345,7 +1453,16 @@ pub fn try_prime(mt: &MainThread, eng: &mut Engine, transport: &Transport, hooks
                 } else if eng.segment_landing.is_none() {
                     shared.seek_landed_epoch.store(shared.seek_epoch.load(Ordering::Relaxed), Ordering::Release);
                 }
-                if prime_kind == HlsPrimeKind::Rebuffer {
+                if let (HlsPrimeKind::ProgressiveRebuffer { since_ms }, Some(release)) =
+                    (prime_kind, progressive_release)
+                {
+                    plx_base::eventlog::log(&format!(
+                        "feed: progressive rebuffer resume n={} reason={} held={}ms",
+                        eng.progressive_hold.holds,
+                        release.name(),
+                        crate::shared::vclock_ms().wrapping_sub(since_ms),
+                    ));
+                } else if prime_kind == HlsPrimeKind::Rebuffer {
                     plx_base::eventlog::log(&format!(
                         "primed: v={}ms a={}ms recovery_n={} debt={}ms runway={}ms -> Play",
                         playable_vbuf / 1_000_000,
@@ -1887,8 +2004,8 @@ pub fn sink_envelope_now(facts: &crate::PayloadFacts, video: crate::LoadVideo, r
         video,
         facts.max_raster,
         crate::fed_fps(facts.fps, rate),
-        &plx_platform::devcaps::caps(),
-        plx_platform::devcaps::measured() && !facts.force_direct_play,
+        &plx_os::devcaps::caps(),
+        plx_os::devcaps::measured() && !facts.force_direct_play,
     )
 }
 
@@ -1921,7 +2038,7 @@ pub struct LoadAudio {
 /// decodes itself at 1x (`app_pcm`, the route's declared shape: DTS under the
 /// lossy gate, FLAC and the like), whatever its codec, and that name is what the lead plan is made
 /// from, so every Load that declares `"audio":"PCM"` is planned a lead. `lead_override_ms` is
-/// the dev trigger's text and `stack` the set's audio stack ([`plx_platform::devcaps::audio_stack`]).
+/// the dev trigger's text and `stack` the set's audio stack ([`plx_os::devcaps::audio_stack`]).
 pub fn load_audio(
     codec: &str, session_rate: i32, app_pcm: bool, lead_override_ms: Option<&str>,
     stack: AudioStack,
@@ -1991,7 +2108,7 @@ pub fn with_app_id(p: &str) -> String {
 /// variant here — via [`app_id_key`], so the anchor cannot drift from what `with_app_id` composed.
 /// A no-op on every webOS 4.x set, where `vp_create_window` returns NULL.
 pub fn with_window_id(mt: &MainThread, p: &str, hooks: &PrepareHooks) -> String {
-    if (hooks.sink)().window_mode() != plx_platform::tv::sink::VP_EXPORTED {
+    if (hooks.sink)().window_mode() != plx_os::tv::sink::VP_EXPORTED {
         return p.to_string();
     }
     let id = unsafe { (hooks.sink)().create_window(mt) };
@@ -2069,7 +2186,7 @@ pub fn prepare_native_open(
             shared.fail_demux_latch(hooks.load_refusal_latch);
             return Err(PrepareRefusal::Refused);
         };
-        if crate::load_video_refused(lv, &plx_platform::devcaps::caps()) {
+        if crate::load_video_refused(lv, &plx_os::devcaps::caps()) {
             plx_base::eventlog::log(&format!(
                 "start_bufferfeed: {} stream but the device table lists no such decoder; refusing the Load",
                 lv.payload_name()
@@ -2113,7 +2230,7 @@ pub fn prepare_native_open(
             // on an output the default was not filmed on.
             let lead_override = plx_base::devtrig::read("pcmavoffset");
             let Some(audio) = load_audio(
-                &codec, session_rate, pcm.is_some(), lead_override.as_deref(), plx_platform::devcaps::audio_stack(),
+                &codec, session_rate, pcm.is_some(), lead_override.as_deref(), plx_os::devcaps::audio_stack(),
             ) else {
                 plx_base::eventlog::log(&format!("start_bufferfeed: unsupported audio codec {codec:?}; refusing incorrect Load declaration"));
                 shared.fail_demux_latch(hooks.load_refusal_latch);
@@ -2245,7 +2362,7 @@ mod audio_stale_ahead_tests {
     }
 }
 
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 mod native_lifecycle_host_seam_tests {
     use super::*;
     use crate::native_release::ReleaseStep;
@@ -2257,7 +2374,7 @@ mod native_lifecycle_host_seam_tests {
     /// observations the composition records (telemetry crumbs) are not the executor's, so they are
     /// no-ops here; `plx_media`'s tests keep the ones that read them.
     fn release_hooks() -> ReleaseHooks {
-        static PLANE: plx_platform::tv::plane::PlaneOwner = plx_platform::tv::plane::PlaneOwner::new();
+        static PLANE: plx_os::tv::plane::PlaneOwner = plx_os::tv::plane::PlaneOwner::new();
         fn no_step(_: ReleaseStep) {}
         fn no_window() {}
         fn no_unload(_: UnloadTicket) -> Option<std::thread::JoinHandle<()>> { None }
@@ -2299,7 +2416,7 @@ mod native_lifecycle_host_seam_tests {
         let first = FEED_SHARED.begin_native_session().expect("first native epoch");
         assert_eq!(unsafe { test_sink().load(c"{}".as_ptr(), first) }, 1);
         assert!(unsafe { test_sink().callback_intercepts(&mt) } > 0);
-        unsafe { test_sink().unload(&plx_platform::tv::sink::UnloadTicket::issue(&mt)) };
+        unsafe { test_sink().unload(&plx_os::tv::sink::UnloadTicket::issue(&mt)) };
         assert!(FEED_SHARED.native_unload_completed(first));
         assert_eq!(unsafe { test_sink().callback_gate_retire(&mt) }, 1);
         assert!(FEED_SHARED.retire_native_session(first));
@@ -2312,7 +2429,7 @@ mod native_lifecycle_host_seam_tests {
             .expect("unproven native epoch");
         assert_eq!(unsafe { test_sink().load(c"{}".as_ptr(), unproven) }, 1);
         crate::ffi_host::force_callback_intercepts_for_test(0);
-        unsafe { test_sink().unload(&plx_platform::tv::sink::UnloadTicket::issue(&mt)) };
+        unsafe { test_sink().unload(&plx_os::tv::sink::UnloadTicket::issue(&mt)) };
         assert_eq!(unsafe { test_sink().callback_gate_retire(&mt) }, 0);
         assert!(FEED_SHARED.retire_native_session(unproven));
         unsafe { test_sink().quarantine(&mt) };
@@ -2380,5 +2497,61 @@ mod native_lifecycle_host_seam_tests {
         assert_eq!(unsafe { test_sink().ready(&mt) }, 0);
         assert_eq!(release_native_object_timed(&mt, epoch, &mut TeardownSpans::new(), &FEED_SHARED, &release_hooks()),
             plx_playback_contract::ReleaseStatus::Quarantined);
+    }
+}
+
+#[cfg(test)]
+mod progressive_stall_tests {
+    use super::*;
+
+    const S: i64 = 1_000_000_000;
+
+    fn lane(fed_s: i64, queued_s: i64) -> LaneTail {
+        LaneTail { fed_ns: fed_s * S, queued_ns: queued_s * S }
+    }
+
+    #[test]
+    fn the_reserve_is_the_furthest_lane_tail_past_the_presented_position() {
+        // video fed to 12 s with 2 s queued behind it (tail 14 s); audio fed to 12 s, nothing queued.
+        assert_eq!(progressive_reserve_ns(10 * S, lane(12, 2), Some(lane(12, 0))), Some(4 * S));
+        // without an opened audio lane only video counts
+        assert_eq!(progressive_reserve_ns(10 * S, lane(12, 2), None), Some(4 * S));
+    }
+
+    /// A film whose audio outlasts its video (or the reverse) has one lane that ends early while the
+    /// stream is healthy: that lane stopping is not starvation.
+    #[test]
+    fn a_lane_that_ends_early_is_not_starvation() {
+        // video ended at 20 s, audio runs to 23 s: at 20.0 s there are 3 s left, not none
+        assert_eq!(progressive_reserve_ns(20 * S, lane(20, 0), Some(lane(23, 0))), Some(3 * S));
+        // audio ended first
+        assert_eq!(progressive_reserve_ns(20 * S, lane(23, 0), Some(lane(20, 0))), Some(3 * S));
+        // both lanes spent: the real zero
+        assert_eq!(progressive_reserve_ns(23 * S, lane(20, 0), Some(lane(23, 0))), Some(0));
+    }
+
+    #[test]
+    fn a_tail_the_clock_has_passed_is_zero_and_an_unknown_position_is_unknown() {
+        assert_eq!(progressive_reserve_ns(13 * S, lane(12, 0), None), Some(0));
+        assert_eq!(progressive_reserve_ns(crate::feed_state::PRES_NONE, lane(12, 2), None), None);
+    }
+
+    /// The viewer-visible rule, one case per clause; the clause is what the resume line names.
+    #[test]
+    fn the_hold_releases_on_a_full_queue_or_the_end_of_the_stream() {
+        use ProgressiveRelease::{Eof, Full};
+        assert_eq!(progressive_hold_releases(false, false), None, "a queue with room keeps holding");
+        assert_eq!(
+            progressive_hold_releases(true, false),
+            Some(Full),
+            "a queue at its byte cap cannot grow: that is the reserve the stream played with"
+        );
+        assert_eq!(progressive_hold_releases(false, true), Some(Eof), "the stream ended: nothing more will arrive");
+        assert_eq!(progressive_hold_releases(true, true), Some(Eof), "the stronger fact is named");
+        assert_eq!(
+            [Full.name(), Eof.name()],
+            ["full", "eof"],
+            "the names the resume line prints and the field checks grep for"
+        );
     }
 }

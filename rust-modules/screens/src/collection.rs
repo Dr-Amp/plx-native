@@ -136,9 +136,9 @@ type MetaKey = (i64, bool, Option<String>);
 /// server stated one.
 fn order_note(collection: &Collection) -> &'static str {
     match collection.order {
-        Some(CollectionOrder::Release) => plx_platform::i18n::msg::browse_collection_order_release(),
-        Some(CollectionOrder::Title) => plx_platform::i18n::msg::browse_collection_order_title(),
-        Some(CollectionOrder::Custom) => plx_platform::i18n::msg::browse_collection_order_custom(),
+        Some(CollectionOrder::Release) => plx_os::i18n::msg::browse_collection_order_release(),
+        Some(CollectionOrder::Title) => plx_os::i18n::msg::browse_collection_order_title(),
+        Some(CollectionOrder::Custom) => plx_os::i18n::msg::browse_collection_order_custom(),
         None => "",
     }
 }
@@ -154,15 +154,15 @@ fn head_alpha(scroll: f32) -> f32 {
 /// tile's caption uses: `fmt::collection_count`), or the kind alone ([`meta_key`]).
 fn meta_line(collection: &Collection) -> CString {
     match meta_key(collection) {
-        (_, true, _) => plx_platform::i18n::msg::browse_collection_kind_c().to_owned(),
-        (count, false, _) => CString::new(plx_platform::i18n::msg::browse_collection_meta(&plx_ui::fmt::collection_count(collection.subtype.as_deref(), count)))
+        (_, true, _) => plx_os::i18n::msg::browse_collection_kind_c().to_owned(),
+        (count, false, _) => CString::new(plx_os::i18n::msg::browse_collection_meta(&plx_ui::fmt::collection_count(collection.subtype.as_deref(), count)))
             .unwrap_or_default(),
     }
 }
 
 pub fn member_label(item: &PmsMovie) -> String {
     match item.kind {
-        2 if item.season_index > 0 => plx_platform::i18n::msg::browse_collection_season_mark(item.season_index as i64),
+        2 if item.season_index > 0 => plx_os::i18n::msg::browse_collection_season_mark(item.season_index as i64),
         3 => plx_ui::fmt::episode_address(item.season_index as i64, item.ep_index as i64),
         _ => String::new(),
     }
@@ -173,12 +173,12 @@ pub fn member_label(item: &PmsMovie) -> String {
 /// already wears its address ([`member_label`], "S3 · E4" or "SEASON 3", a persistent mark that
 /// stays), so its caption does not say it twice: where the setting would fall back to the address it
 /// names the show instead (`CaptionFacts::address_on_art`).
-fn member_caption(item: &PmsMovie) -> TileLabel {
+fn member_caption(item: &PmsMovie, policy: &plx_ui::caption_policy::CaptionPolicy) -> TileLabel {
     let facts = plx_ui::caption_policy::CaptionFacts {
         address_on_art: item.kind == 3 || (item.kind == 2 && item.season_index > 0),
         ..tile_facts::caption_facts(item)
     };
-    crate::registry::captions::label(&crate::registry::captions::policy(), &facts, None)
+    crate::registry::captions::label(policy, &facts, None)
 }
 
 /// One run of consecutive slots with a key and a label projected: slot `first + n` is `elems[n]`.
@@ -229,6 +229,7 @@ impl Projection {
 /// Built from the screen's FIELDS, not `&CollectionScreen`, so a call can hold it while the grid
 /// itself is borrowed mutably.
 struct Members<'a> {
+    policy: plx_ui::caption_policy::CaptionPolicy,
     collection: &'a Collection,
     cards: &'a CardKeys,
     /// [`Page::proj`], projected by `project` for the cells the page paints or steps to.
@@ -282,9 +283,14 @@ impl<H: Host<Elem = u32>> CardSource<H> for Members<'_> {
     fn index_of(&self, e: &u32) -> Option<usize> { self.index(*e) }
     fn art(&self, i: usize) -> Art<'_> { Art::Poster(self.collection.item(i).map(tile_facts::of)) }
     fn label(&self, i: usize) -> TileLabel {
-        self.collection.item(i).map(member_caption).unwrap_or_default()
+        self.collection.item(i).map(|item| member_caption(item, &self.policy)).unwrap_or_default()
     }
     fn progress(&self, i: usize) -> Option<f32> { self.collection.item(i)?.resume_frac() }
+    /// The member's ratingKey: what a by-id press names to stay on the title it read (the id's
+    /// position, `items.card.<i>`, moves when the listing does).
+    fn subject(&self, i: usize) -> Option<std::borrow::Cow<'_, str>> {
+        self.collection.item(i).map(|item| std::borrow::Cow::Borrowed(item.rk.as_str()))
+    }
     fn overlay(&self, p: Painter, i: usize, tile: &Tile, measure: &dyn Measure) {
         let persistent = self.label_at(i);
         if persistent.is_empty() { return; }
@@ -298,6 +304,8 @@ impl<H: Host<Elem = u32>> CardSource<H> for Members<'_> {
 /// The page's content and the state its sections read. The `Stack` is the screen's other field so
 /// that `self.stack.on(&self.page, ..)` borrows the two apart; every section reads only this.
 struct Page {
+    /// Derived owner/frame policy; refreshed before every event, never read from ambient state.
+    policy: plx_ui::caption_policy::CaptionPolicy,
     entry: EntryId,
     /// The page's argument; `id.rk` adopts the store's resolution of a tag route.
     id: CollectionRef,
@@ -451,7 +459,7 @@ impl Page {
 
     /// The grid's content: `collection` read through this page's projection.
     fn members<'a>(&'a self, collection: &'a Collection) -> Members<'a> {
-        Members { collection, cards: &self.cards, proj: &self.proj }
+        Members { collection, cards: &self.cards, proj: &self.proj, policy: self.policy }
     }
 
     /// Where member element `elem` sits: its slot in the listing, else the last slot a pinned key
@@ -618,13 +626,15 @@ impl<H: ContentLike + CollectionLike> StackPage<H> for Page {
         let collection = self.collection(cx);
         let head = collection.is_some_and(CollectionScreen::shows_head);
         let failed = collection.is_some_and(|c| c.status == CollectionStatus::Failed);
-        out.push(SectionSpec::new(Sec::Head, Kind::Custom { height: GRID_TOP, focusable: head && self.summary_more }, HEADER_GROUP).ranked(1));
-        out.push(SectionSpec::new(Sec::Items, Kind::Grid { spec: GridSpec::new(GRID_TOP, CONTENT_TOP) }, GRID_GROUP));
+        // The sections are named for what they ARE (the accessibility ids: `head.0`, `items.card.<i>`,
+        // `status.0`), not by position: the head or the status comes and goes with the data.
+        out.push(SectionSpec::new(Sec::Head, Kind::Custom { height: GRID_TOP, focusable: head && self.summary_more }, HEADER_GROUP).ranked(1).named("head"));
+        out.push(SectionSpec::new(Sec::Items, Kind::Grid { spec: GridSpec::new(GRID_TOP, CONTENT_TOP) }, GRID_GROUP).named("items"));
         let retry = if failed {
             CollectionScreen::status_overlay(collection, cx.tick.ms, cx.measure).action_frame_measured(cx.measure)
         } else { None };
         out.push(SectionSpec::new(Sec::Status,
-            Kind::Overlay { rect: retry.unwrap_or(CollectionScreen::status_frame()), focusable: retry.is_some() }, STATUS_GROUP).ranked(2));
+            Kind::Overlay { rect: retry.unwrap_or(CollectionScreen::status_frame()), focusable: retry.is_some() }, STATUS_GROUP).ranked(2).named("status"));
     }
 
     fn fallback(&self, _cx: &Cx<'_, H>, out: &mut Vec<Sec>) {
@@ -633,8 +643,8 @@ impl<H: ContentLike + CollectionLike> StackPage<H> for Page {
 
     /// The members are posters: the grid's focused band follows the Under posters setting, as the
     /// Library's does, and `Members::label` words the caption it holds.
-    fn caption_policy(&self, k: Sec) -> Option<plx_ui::caption_policy::CaptionPolicy> {
-        (k == Sec::Items).then(crate::registry::captions::policy)
+    fn caption_policy(&self, cx: &Cx<'_, H>, k: Sec) -> Option<plx_ui::caption_policy::CaptionPolicy> {
+        (k == Sec::Items).then(|| crate::registry::captions::policy_for(H::screen_inputs(cx)))
     }
 
     fn cards<'a>(&'a self, cx: &'a Cx<'_, H>, k: Sec) -> Option<Members<'a>> {
@@ -701,7 +711,7 @@ impl CollectionScreen {
 
     pub fn new(entry: EntryId, id: CollectionRef) -> Self {
         Self {
-            page: Page { entry, id, header_marked: false, cards: CardKeys::new(FIRST_CARD_ELEM),
+            page: Page { policy: crate::registry::caption_policy_of(plx_plex::plex::session::UnderPosters::DEFAULT), entry, id, header_marked: false, cards: CardKeys::new(FIRST_CARD_ELEM),
                 proj: Projection::default(), want: Default::default(), pin_index: Vec::new(), meta: ((0, true, None), CString::default()),
                 return_pending: false, focus_elem: None, restore_elem: None,
                 focus_index: None, restore_index: None, restore_counts: None, counts: (0, Vec::new(), 0),
@@ -882,14 +892,14 @@ impl CollectionScreen {
         measure: &dyn plx_machine::machine::Measure) -> StatusOverlay<'a> {
         match collection.map(|c| c.status).unwrap_or(CollectionStatus::Loading) {
             // placeholder-exempt: builds the value only; counted where drawn (StatusOverlay::draw_geometry, Working)
-            CollectionStatus::Loading => StatusOverlay::new(Self::status_frame(), plx_platform::i18n::msg::browse_collection_loading_c(), StatusKind::Working).phase(tick),
-            CollectionStatus::Empty => StatusOverlay::new(Self::status_frame(), plx_platform::i18n::msg::browse_collection_empty_c(), StatusKind::Empty),
-            CollectionStatus::Unavailable => StatusOverlay::new(Rect::FULL, plx_platform::i18n::msg::browse_collection_unavailable_c(), StatusKind::Failed)
+            CollectionStatus::Loading => StatusOverlay::new(Self::status_frame(), plx_os::i18n::msg::browse_collection_loading_c(), StatusKind::Working).phase(tick),
+            CollectionStatus::Empty => StatusOverlay::new(Self::status_frame(), plx_os::i18n::msg::browse_collection_empty_c(), StatusKind::Empty),
+            CollectionStatus::Unavailable => StatusOverlay::new(Rect::FULL, plx_os::i18n::msg::browse_collection_unavailable_c(), StatusKind::Failed)
                 .page(plx_ui::icons::Icon::PersonBadgeXmark)
-                .reason(plx_platform::i18n::msg::browse_collection_unavailable_reason_c()),
+                .reason(plx_os::i18n::msg::browse_collection_unavailable_reason_c()),
             CollectionStatus::Failed => {
-                let overlay = StatusOverlay::new(Rect::FULL, plx_platform::i18n::msg::browse_home_failed_c(), StatusKind::Failed)
-                    .page(plx_ui::icons::Icon::ServerBadgeMinus).action(plx_platform::i18n::msg::browse_action_retry_c());
+                let overlay = StatusOverlay::new(Rect::FULL, plx_os::i18n::msg::browse_home_failed_c(), StatusKind::Failed)
+                    .page(plx_ui::icons::Icon::ServerBadgeMinus).action(plx_os::i18n::msg::browse_action_retry_c());
                 match collection {
                     Some(c) => overlay.glyph_ceiling(Self::header_text_bottom(c, measure)),
                     None => overlay,
@@ -954,6 +964,11 @@ impl CollectionScreen {
 impl<H: ContentLike + CollectionLike> Machine<H> for CollectionScreen {
     type Ev = ScreenEvent<H>;
     fn step(&mut self, ev: &Self::Ev, cx: &Cx<'_, H>, fx: &mut Effects<'_, H>) -> Handled {
+        // Under posters is a setting Settings changes while it covers the page: noticed here, on
+        // whichever event comes first, and answered with page damage (a returning page raises none).
+        if crate::registry::moved(&mut self.page.policy, crate::registry::captions::policy_for(H::screen_inputs(cx))) {
+            fx.invalidate(Provenance::Nav);
+        }
         // The content index is current before the stack reads it for this event.
         match ev {
             ScreenEvent::Tick(_) => self.resync(cx),
@@ -998,8 +1013,8 @@ impl<H: ContentLike + CollectionLike> Machine<H> for CollectionScreen {
                 fx.invalidate(Provenance::Nav); Handled::Yes
             }
             ScreenEvent::FocusMoved { to, by, .. } => {
-                if matches!(by, By::Dir | By::Pointer) { self.page.return_pending = false; }
-                if self.collection(cx).is_some() && to.elem == HEADER_ELEM && matches!(by, By::Dir | By::Pointer) {
+                if matches!(by, By::Dir | By::Pointer | By::Script) { self.page.return_pending = false; }
+                if self.collection(cx).is_some() && to.elem == HEADER_ELEM && matches!(by, By::Dir | By::Pointer | By::Script) {
                     self.page.header_marked = true;
                 }
                 fx.invalidate(Provenance::Input); Handled::Yes
@@ -1108,7 +1123,10 @@ mod tests {
     }
     /// What this host's container reports as the title of the page beneath the screen: a catalog
     /// string, as every title it reports is (a frame's text is graded against the catalog).
-    pub(super) fn parent() -> &'static str { plx_platform::i18n::msg::browse_chrome_home() }
+    pub(super) fn parent() -> &'static str { plx_os::i18n::msg::browse_chrome_home() }
+    impl crate::registry::ScreenInputsLike for CollectionHost {
+        fn screen_inputs<'a>(_: &Cx<'a, Self>) -> &'a crate::registry::ScreenInputs { crate::registry::caption_fixture() }
+    }
     impl CollectionLike for CollectionHost {
         fn collection<'a>(cx: &Cx<'a, Self>) -> plx_data::collection::CollectionView<'a> { cx.views }
         fn back_to<'a>(_cx: &Cx<'a, Self>) -> Option<std::borrow::Cow<'a, str>> { Some(std::borrow::Cow::Borrowed(parent())) }
@@ -1124,6 +1142,9 @@ mod tests {
         type Views<'a> = plx_data::collection::CollectionView<'a>;
         type Init = super::super::family::NoInit;
         type Memory = PageMemory;
+    }
+    impl crate::registry::ScreenInputsLike for RootedHost {
+        fn screen_inputs<'a>(_: &Cx<'a, Self>) -> &'a crate::registry::ScreenInputs { crate::registry::caption_fixture() }
     }
     impl CollectionLike for RootedHost {
         fn collection<'a>(cx: &Cx<'a, Self>) -> plx_data::collection::CollectionView<'a> { cx.views }
@@ -1144,6 +1165,7 @@ mod tests {
     }
     pub(super) fn cx<'a>(view: plx_data::collection::CollectionView<'a>, focus: Option<plx_machine::machine::FocusKey<u32>>) -> Cx<'a, CollectionHost> {
         Cx { views: view, tick: Tick::default(), measure: &FixtureMeasure,
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
             press: PressRead::default(), focus: FocusRead { current: focus, ..Default::default() },
             owner: InputOwner::Entry(EntryId(9)) }
     }
@@ -1167,7 +1189,7 @@ mod tests {
             (true, Details::None, [Some("The Answer"), None]),
         ] {
             TEST_UNDER_POSTERS.with(|cell| cell.set(Some(UnderPosters { title, details: details.movie_parts(), show_details: details.show_parts(), sort_value: false })));
-            let caption = member_caption(&episode);
+            let caption = member_caption(&episode, &crate::registry::captions::policy());
             TEST_UNDER_POSTERS.with(|cell| cell.set(None));
             assert_eq!([text(&caption.title), text(&caption.caption)], want.map(|line| line.map(str::to_owned)), "title {title}, {details:?}");
         }
@@ -1182,6 +1204,33 @@ mod tests {
         Machine::<CollectionHost>::step(screen, &ev, cx, &mut fx);
         drop(fx);
         out
+    }
+
+    /// **A collection page, covered, notices that Settings changed what its members draw under
+    /// the posters** (`step`'s head): a page returning from under a cover raises no damage of its
+    /// own, and typed page damage is what retakes a frozen host's snapshot.
+    #[test]
+    fn the_collection_damages_the_page_when_the_under_posters_setting_moved_under_a_cover() {
+        use crate::registry::captions::{PolicyPin, FIXTURE_TITLE_ON};
+        use plx_plex::plex::session::UnderPosters;
+        let _guard = plx_base::testlock::serial();
+        let (store, mut screen) = seeded();
+        let mut uncover_under = |setting: UnderPosters| {
+            let _pin = PolicyPin::set(setting);
+            let mut present = plx_machine::present::Present::new();
+            let mut out = Vec::new();
+            let mut fx = Effects::new(&mut out,
+                plx_machine::machine::MachineId::Instance(plx_machine::machine::InstanceId(9)), &mut present);
+            Machine::<CollectionHost>::step(&mut screen, &ScreenEvent::Cover, &cx(store.view(), None), &mut fx);
+            drop(fx);
+            present.page_damaged()
+        };
+        // Probed with `Cover`: this page still damages unconditionally on `Uncover`/`Enter` (a
+        // leftover), and the head compare is the same on whichever event comes first.
+        uncover_under(UnderPosters::DEFAULT);
+        assert!(!uncover_under(UnderPosters::DEFAULT), "control: an unchanged setting damages nothing");
+        assert!(uncover_under(FIXTURE_TITLE_ON), "the Title switch moved the caption policy");
+        assert!(!uncover_under(FIXTURE_TITLE_ON), "...once");
     }
 
     fn opens_summary(out: &[plx_machine::machine::Stamped<CollectionHost>]) -> bool {
@@ -1258,8 +1307,7 @@ mod tests {
     #[test]
     fn the_hold_hint_stands_on_a_resting_member_once_per_install() {
         let _g = plx_base::testlock::serial();
-        plx_ui::hold_hint::reset_learned_for_test();
-        plx_ui::hold_hint::reset_shown_for_test();
+        let hint = std::cell::Cell::new(plx_machine::machine::HoldHintRead::default());
         let (store, mut screen) = seeded();
         let c = store.view().current().unwrap();
         let (a, b) = (screen.key_at(c, 0), screen.key_at(c, 1));
@@ -1267,7 +1315,14 @@ mod tests {
         let mut rest = |screen: &mut CollectionScreen, key, secs: f32| {
             for _ in 0..(secs * 60.0) as u32 {
                 ms += 17;
-                tick_at(screen, &store, Some(key), ms);
+                let mut context = cx(store.view(), Some(key));
+                context.hold_hint = hint.get();
+                let out = step(screen, ScreenEvent::Tick(Tick { ms, dt_us: 16_667 }), &context);
+                let mut read = hint.get();
+                for effect in out {
+                    if let plx_machine::machine::Fx::HoldHint(event) = effect.fx { read.apply(event); }
+                }
+                hint.set(read);
             }
         };
         rest(&mut screen, a, 1.2);
@@ -1277,11 +1332,11 @@ mod tests {
         // a menu open over the page: focus is the menu's, not this page's
         let menu = plx_machine::machine::FocusKey { entry: EntryId(77), elem: 0 };
         rest(&mut screen, menu, 3.0);
-        assert!(!screen.stack.hint_visible() && !plx_ui::hold_hint::shown_this_run(), "never while a menu is open");
+        assert!(!screen.stack.hint_visible() && !hint.get().card, "never while a menu is open");
         // nor on the header, which is not a card
         let header = plx_machine::machine::FocusKey { entry: EntryId(9), elem: HEADER_ELEM };
         rest(&mut screen, header, 3.0);
-        assert!(!screen.stack.hint_visible() && !plx_ui::hold_hint::shown_this_run(), "never on a non-card focus");
+        assert!(!screen.stack.hint_visible() && !hint.get().card, "never on a non-card focus");
         rest(&mut screen, a, 3.6);
         assert!(screen.stack.hint_visible(), "after the dwell, on a settled member");
         rest(&mut screen, menu, 1.0);
@@ -1291,10 +1346,20 @@ mod tests {
         assert!(!screen.stack.hint_visible(), "not twice on the same page");
         let (store2, mut again) = seeded();
         let k = again.key_at(store2.view().current().unwrap(), 0);
-        for n in 0..240 { tick_at(&mut again, &store2, Some(k), 100 + n * 17); }
+        for n in 0..240 {
+            let mut context = cx(store2.view(), Some(k));
+            context.hold_hint = hint.get();
+            let out = step(&mut again, ScreenEvent::Tick(Tick { ms: 100 + n * 17, dt_us: 16_667 }), &context);
+            let mut read = hint.get();
+            for effect in out {
+                if let plx_machine::machine::Fx::HoldHint(event) = effect.fx { read.apply(event); }
+            }
+            hint.set(read);
+        }
         assert!(!again.stack.hint_visible(), "not on a second Collection page");
         // a held OK still shows it, with its fill
         let mut held = cx(store2.view(), Some(k));
+        held.hold_hint = hint.get();
         held.press.held_ms = Some(300);
         step(&mut again, ScreenEvent::Tick(Tick { ms: 5000, dt_us: 16_667 }), &held);
         assert!(again.stack.hint_visible(), "a physical hold shows it regardless");
@@ -1482,7 +1547,7 @@ mod tests {
     /// "6 films", not "6 items", for a movie collection; before the subtype lands it is items.
     #[test]
     fn the_meta_line_counts_in_the_noun_of_the_subtype() {
-        let _g = plx_platform::i18n::language_on_this_thread_for_test(plx_platform::i18n::Preference::En);
+        let _g = plx_os::i18n::language_on_this_thread_for_test(plx_os::i18n::Preference::En);
         let (mut store, _) = seeded();
         store.edit_for_test(|c| { c.child_count = 6; c.subtype = None; });
         assert_eq!(meta_line(store.view().current().unwrap()).to_str().unwrap(), "6 items \u{b7} Collection");
@@ -1506,7 +1571,7 @@ mod tests {
         let overlay = CollectionScreen::status_overlay(Some(c), 0, &FixtureMeasure);
         let f = overlay.frame;
         assert_eq!((f.x, f.y, f.w, f.h), (96.0, 460.0, 1728.0, 475.0));
-        assert_eq!(overlay.caption, plx_platform::i18n::msg::browse_collection_empty_c());
+        assert_eq!(overlay.caption, plx_os::i18n::msg::browse_collection_empty_c());
     }
 
     /// C4b: an unavailable collection is the page-filling Failed verdict at the shared anchor
@@ -1561,6 +1626,7 @@ mod tests {
         assert!(named.iter().any(|run| run == parent()), "the frame draws {:?}: {named:?}", parent());
 
         let rooted = Cx::<RootedHost> { views: store.view(), tick: Tick::default(), measure: &FixtureMeasure,
+            modal: context.modal, page_image: context.page_image, hold_hint: context.hold_hint,
             press: PressRead::default(), focus: FocusRead::default(), owner: InputOwner::Entry(EntryId(9)) };
         assert_eq!(Screen::<RootedHost>::crumb(&screen, &rooted), None, "BACK leaves: nothing to declare");
         let bare = plx_gfx::text::capture_text_runs_for_test(|| {
@@ -1862,12 +1928,12 @@ mod tests {
     fn the_collection_pages_fixed_slots_fit_in_every_language() {
         use plx_base::fontcov::advances::ShippedMeasure;
         use plx_ui::fit::HEADROOM;
-        use plx_platform::i18n::{language_on_this_thread_for_test, msg};
+        use plx_os::i18n::{language_on_this_thread_for_test, msg};
         use plx_machine::machine::Measure;
         let m = ShippedMeasure;
         let mark_budget = (CARD_W - 2.0 * 16.0) * HEADROOM;
         let mut out = Vec::new();
-        for language in plx_platform::i18n::SHIPPED {
+        for language in plx_os::i18n::SHIPPED {
             let _guard = language_on_this_thread_for_test(language);
             let season = PmsMovie { kind: 2, season_index: 99, ..Default::default() };
             let mark = member_label(&season);
@@ -1904,7 +1970,7 @@ mod tests {
     fn every_app_owned_run_on_the_collection_page_comes_from_the_catalog() {
         use plx_ui::screen::DrawFrame;
         let _serial = plx_base::testlock::serial();
-        let _pseudo = plx_platform::i18n::pseudo_on_this_thread_for_test();
+        let _pseudo = plx_os::i18n::pseudo_on_this_thread_for_test();
         let server = ["Set", "Qwerty", "Zzyzx", "Vlox"];
         let season = PmsMovie { rk: "s".into(), kind: 2, season_index: 3, title: "Zzyzx".into(),
             show_title: "Vlox".into(), ..Default::default() };

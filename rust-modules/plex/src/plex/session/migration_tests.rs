@@ -1,6 +1,7 @@
 //! Canonical schema and the shipping client/coordinator path, using synthetic helper transport.
 use super::*;
-use plx_platform::storage::{client, state, wire::*};
+use plx_os::storage::{client, state, wire::*};
+use plx_os::tv::authority::Authority;
 use persistence::CanonicalRead;
 
 fn fixture() -> Session {
@@ -290,7 +291,7 @@ struct MigrationFixture {
     pending: Option<String>,
     data: Option<String>,
     cleared: bool,
-    blocked: Option<plx_platform::storage::StoreError>,
+    blocked: Option<plx_os::storage::StoreError>,
     verified: bool,
     wrong_readback: bool,
     commits: usize,
@@ -448,15 +449,15 @@ fn canonical_cleared_blocked_and_existing_data_all_outrank_reappeared_legacy() {
             ..Default::default()
         },
         MigrationFixture {
-            blocked: Some(plx_platform::storage::StoreError::HelperUnavailable),
+            blocked: Some(plx_os::storage::StoreError::HelperUnavailable),
             ..Default::default()
         },
         MigrationFixture {
-            blocked: Some(plx_platform::storage::StoreError::AuthLocked),
+            blocked: Some(plx_os::storage::StoreError::AuthLocked),
             ..Default::default()
         },
         MigrationFixture {
-            blocked: Some(plx_platform::storage::StoreError::InvalidSchema),
+            blocked: Some(plx_os::storage::StoreError::InvalidSchema),
             ..Default::default()
         },
         MigrationFixture {
@@ -654,7 +655,7 @@ struct Db8 {
     puts: usize,
     gets: usize,
 }
-impl plx_platform::storage::keymanager::Rpc for Db8 {
+impl plx_os::storage::keymanager::Rpc for Db8 {
     fn call(&mut self, uri: &str, payload: &Value) -> Result<Value, ErrorCode> {
         match uri {
             "luna://com.palm.db/get" => {
@@ -685,7 +686,7 @@ impl plx_platform::storage::keymanager::Rpc for Db8 {
 
 #[test]
 fn production_client_coordinator_and_helper_backend_reconcile_committed_lost_reply() {
-    let mut backend = plx_platform::storage::backend::Backend::new(
+    let mut backend = plx_os::storage::backend::Backend::new(
         Db8::default(),
         state::Flavor::Stable,
         "com.beb.plxnative.storage".into(),
@@ -765,10 +766,10 @@ fn production_client_coordinator_and_helper_backend_reconcile_committed_lost_rep
 /// production coordinator and the real helper backend, without reviving any credential.
 #[test]
 fn helper_signout_retains_the_language_and_only_the_delete_all_reset_removes_it() {
-    let mut backend = plx_platform::storage::backend::Backend::new(
+    let mut backend = plx_os::storage::backend::Backend::new(
         Db8::default(), state::Flavor::Stable, "com.beb.plxnative.storage".into());
     let mut transport = |request: Request| Ok(backend.dispatch(request));
-    let session = Session { language: plx_platform::i18n::Preference::Be, ..fixture() }.with_ui_resolution(UiResolution::Hd720);
+    let session = Session { language: plx_os::i18n::Preference::Be, ..fixture() }.with_ui_resolution(UiResolution::Hd720);
     assert!(matches!(
         persistence::commit_session_with(&session, false, SaveAuthority::FreshReauthentication, 4, &mut transport),
         persistence::CanonicalCommit::Durable { .. }));
@@ -776,7 +777,7 @@ fn helper_signout_retains_the_language_and_only_the_delete_all_reset_removes_it(
         persistence::CanonicalCommit::Durable { .. }));
     assert!(matches!(persistence::load_helper_with(&mut transport),
         CanonicalRead::Cleared {
-            kept: Retained { language: plx_platform::i18n::Preference::Be, ui_resolution: UiResolution::Hd720 }, ..
+            kept: Retained { language: plx_os::i18n::Preference::Be, ui_resolution: UiResolution::Hd720 }, ..
         }),
         "sign-out must keep the install-wide language and Interface resolution readable");
     let client::Load::Present(cleared) = client::load_with(&mut transport).unwrap() else {
@@ -787,7 +788,7 @@ fn helper_signout_retains_the_language_and_only_the_delete_all_reset_removes_it(
         persistence::CanonicalCommit::Durable { .. }));
     assert!(matches!(persistence::load_helper_with(&mut transport),
         CanonicalRead::Cleared {
-            kept: Retained { language: plx_platform::i18n::Preference::System, ui_resolution: UiResolution::Hd720 }, ..
+            kept: Retained { language: plx_os::i18n::Preference::System, ui_resolution: UiResolution::Hd720 }, ..
         }),
         "Delete all local data must reset the language (the cleared tenure accepts the removal of `language` alone)");
     let client::Load::Present(reset) = client::load_with(&mut transport).unwrap() else {
@@ -825,7 +826,7 @@ fn stored_preferences(transport: &mut dyn client::Transport) -> Value {
 /// reloaded the way the next boot reads it.
 #[test]
 fn a_preference_returned_to_its_default_is_not_resurrected_by_the_public_rewrite() {
-    let mut backend = plx_platform::storage::backend::Backend::new(
+    let mut backend = plx_os::storage::backend::Backend::new(
         Db8::default(), state::Flavor::Stable, "com.beb.plxnative.storage".into());
     let mut transport = |request: Request| Ok(backend.dispatch(request));
     let base = fixture();
@@ -870,10 +871,10 @@ fn a_preference_returned_to_its_default_is_not_resurrected_by_the_public_rewrite
 /// a session with no key.
 #[test]
 fn helper_signout_forgets_the_learned_server_keys_and_the_next_account_inherits_none() {
-    let mut backend = plx_platform::storage::backend::Backend::new(
+    let mut backend = plx_os::storage::backend::Backend::new(
         Db8::default(), state::Flavor::Stable, "com.beb.plxnative.storage".into());
     let mut transport = |request: Request| Ok(backend.dispatch(request));
-    let session = Session { language: plx_platform::i18n::Preference::Be, ..fixture() };
+    let session = Session { language: plx_os::i18n::Preference::Be, ..fixture() };
     commit_fresh(&session, &mut transport);
 
     // A pin write: public-only, the auth half untouched.
@@ -925,10 +926,10 @@ fn helper_signout_forgets_the_learned_server_keys_and_the_next_account_inherits_
 /// again rather than handed its earlier answer.
 #[test]
 fn helper_signout_forgets_the_plaintext_answers_and_signing_back_in_asks_again() {
-    let mut backend = plx_platform::storage::backend::Backend::new(
+    let mut backend = plx_os::storage::backend::Backend::new(
         Db8::default(), state::Flavor::Stable, "com.beb.plxnative.storage".into());
     let mut transport = |request: Request| Ok(backend.dispatch(request));
-    let session = Session { language: plx_platform::i18n::Preference::Be, ..fixture() };
+    let session = Session { language: plx_os::i18n::Preference::Be, ..fixture() };
     commit_fresh(&session, &mut transport);
 
     // An answer write: public-only, the auth half untouched.
@@ -997,7 +998,7 @@ fn pending_import_retries_only_its_recorded_envelope_and_never_another_legacy_fi
     );
     assert!(matches!(
         boot.state,
-        CanonicalRead::Blocked(plx_platform::storage::StoreError::AuthLocked)
+        CanonicalRead::Blocked(plx_os::storage::StoreError::AuthLocked)
     ));
     assert_eq!(store.pending.as_ref(), Some(&envelope));
     assert_eq!(store.commits, 0);
@@ -1040,7 +1041,7 @@ fn check_v1_extension_bootstrap_roundtrip(keys: &[String]) {
     }
     let extensions = auth["extensions"].clone();
     let protected = serde_json::to_string_pretty(&auth).unwrap();
-    let mut backend = plx_platform::storage::backend::Backend::new(
+    let mut backend = plx_os::storage::backend::Backend::new(
         Db8::default(),
         state::Flavor::Stable,
         "com.beb.plxnative.storage".into(),
@@ -1140,7 +1141,7 @@ fn helper_migration_keeps_opened_session_typed_through_exact_readback() {
         "typed-helper-readback",
         &serde_json::to_value(&expected).unwrap(),
     );
-    let mut backend = plx_platform::storage::backend::Backend::new(
+    let mut backend = plx_os::storage::backend::Backend::new(
         Db8::default(),
         state::Flavor::Stable,
         "com.beb.plxnative.storage".into(),
@@ -1220,8 +1221,8 @@ mod published_06 {
         }
     }
 
-    fn helper(record: Option<Value>) -> plx_platform::storage::backend::Backend<Db8> {
-        plx_platform::storage::backend::Backend::new(
+    fn helper(record: Option<Value>) -> plx_os::storage::backend::Backend<Db8> {
+        plx_os::storage::backend::Backend::new(
             Db8 { record, ..Default::default() },
             state::Flavor::Stable,
             "com.beb.plxnative.storage".into(),
@@ -1229,7 +1230,7 @@ mod published_06 {
     }
 
     fn boot(
-        backend: &mut plx_platform::storage::backend::Backend<Db8>,
+        backend: &mut plx_os::storage::backend::Backend<Db8>,
         opener: &mut Opener,
         candidates: &[std::path::PathBuf],
     ) -> persistence::Bootstrap {
@@ -1325,7 +1326,7 @@ fn fallback_written_file_migrates_into_recovered_missing_db8() {
         serde_json::to_value(session_from_read(&read_legacy_locked())).unwrap(),
         serde_json::to_value(&expected).unwrap()
     );
-    let mut backend = plx_platform::storage::backend::Backend::new(
+    let mut backend = plx_os::storage::backend::Backend::new(
         Db8::default(),
         state::Flavor::Stable,
         "com.beb.plxnative.storage".into(),
@@ -1388,4 +1389,108 @@ fn pending_revocation_prevents_missing_canonical_from_importing_a_marked_snapsho
     assert!(matches!(result.state, CanonicalRead::Missing));
     assert_eq!(store.commits, 0);
     assert!(source.path.exists());
+}
+
+// Which store is canonical is the platform's statement (`plx_os::tv::authority`). The dispatchers
+// take the authority and the helper's transport, so every host runs the helper arm over a
+// transport of its own, and the files arm over one that fails the test if it is reached.
+
+/// The transport the files arm must never reach.
+fn no_helper(_: Request) -> Result<Response, client::ClientError> {
+    panic!("a files authority never talks to the storage helper")
+}
+
+/// The helper arm over the production backend, which holds the record the way DB8 does: the app's
+/// own state root stays empty.
+#[test]
+fn a_helper_authority_reads_and_clears_through_the_helper_and_keeps_no_file() {
+    let _serial = plx_base::testlock::serial();
+    let state = TempCanonicalState::new("authority-helper");
+    let mut backend = plx_os::storage::backend::Backend::new(
+        Db8::default(), state::Flavor::Stable, "com.beb.plxnative.storage".into());
+    let mut transport = |request: Request| Ok(backend.dispatch(request));
+    assert!(matches!(persistence::load_via(Authority::Helper, &mut transport), CanonicalRead::Missing));
+    commit_fresh(&fixture(), &mut transport);
+    let CanonicalRead::Opened { session, .. } = persistence::load_via(Authority::Helper, &mut transport) else {
+        panic!("the helper holds the session")
+    };
+    assert_eq!(session.account_token, "synthetic-account");
+    assert!(matches!(persistence::commit_cleared_via(Authority::Helper, &mut transport),
+        persistence::CanonicalCommit::Durable { .. }));
+    assert!(matches!(persistence::load_via(Authority::Helper, &mut transport), CanonicalRead::Cleared { .. }));
+    assert_eq!(
+        with_io_for_test(|| persistence::cleanup_after_confirmed_clear_via(Authority::Helper, &mut transport, Vec::new())),
+        persistence::ClearCleanupOutcome::Confirmed);
+    assert_eq!(std::fs::read_dir(&state.dir).unwrap().count(), 0, "the helper arm leaves no record file under the state root");
+}
+
+/// The files arm for a platform with no helper (the desktop, a host test, Tizen): the record is the
+/// 0600 file under the state root, and the helper is never asked.
+#[test]
+fn a_files_authority_keeps_the_record_in_files_and_never_asks_the_helper() {
+    let _serial = plx_base::testlock::serial();
+    let state = TempCanonicalState::new("authority-files");
+    let session = fixture();
+    let payload = serde_json::to_string(&session).unwrap();
+    assert!(matches!(persistence::load_via(Authority::Files, &mut no_helper), CanonicalRead::Missing));
+    assert!(matches!(persistence::commit_data_via(Authority::Files, &mut no_helper, payload),
+        persistence::CanonicalCommit::Durable { revision: 1, .. }));
+    assert!(matches!(
+        persistence::write_session_via(Authority::Files, &mut no_helper, &session, SaveAuthority::Routine),
+        persistence::CanonicalCommit::Durable { revision: 2, .. }));
+    assert!(matches!(persistence::migrate_session_via(Authority::Files, &mut no_helper, &session),
+        persistence::CanonicalCommit::Durable { revision: 3, .. }));
+    let CanonicalRead::Data { revision: 3, payload: stored } = persistence::load_via(Authority::Files, &mut no_helper) else {
+        panic!("the files hold the session")
+    };
+    assert_eq!(serde_json::from_str::<Session>(&stored).unwrap().account_token, "synthetic-account");
+    assert!(state.dir.join("session.json").exists());
+    assert!(matches!(persistence::commit_cleared_via(Authority::Files, &mut no_helper),
+        persistence::CanonicalCommit::Durable { revision: 4, .. }));
+    assert!(matches!(persistence::load_via(Authority::Files, &mut no_helper), CanonicalRead::Cleared { revision: 4, .. }));
+    assert_eq!(
+        with_io_for_test(|| persistence::cleanup_after_confirmed_clear_via(Authority::Files, &mut no_helper, Vec::new())),
+        persistence::ClearCleanupOutcome::Confirmed);
+    let boot = persistence::bootstrap_via(Authority::Files, &mut no_helper, &mut opener(), Vec::new());
+    assert!(matches!(boot.state, CanonicalRead::Cleared { revision: 4, .. }), "the record the files hold is read as it is");
+}
+
+/// At this layer a helper that cannot answer is a blocked canonical store: no read, write or
+/// migration is answered from the record files, and a legacy file is neither imported nor retired.
+/// (The session layer above writes its own marked fallback after a non-durable commit; that file is
+/// not the record and is not exercised here.)
+#[test]
+fn a_helper_authority_never_answers_from_the_record_files_when_the_helper_cannot_answer() {
+    use plx_os::storage::StoreError;
+    let _serial = plx_base::testlock::serial();
+    let state = TempCanonicalState::new("authority-helper-down");
+    let legacy = LegacyFile::new("authority-helper-down", &serde_json::to_value(fixture()).unwrap());
+    let session = fixture();
+    let requests = std::cell::Cell::new(0usize);
+    let mut down = |_: Request| {
+        requests.set(requests.get() + 1);
+        Err(client::ClientError::Unavailable)
+    };
+    let unavailable = persistence::CanonicalCommit::Failed(StoreError::HelperUnavailable);
+    assert!(matches!(persistence::load_via(Authority::Helper, &mut down),
+        CanonicalRead::Blocked(StoreError::HelperUnavailable)));
+    assert_eq!(persistence::commit_data_via(Authority::Helper, &mut down, serde_json::to_string(&session).unwrap()),
+        unavailable);
+    assert_eq!(requests.get(), 2);
+    assert_eq!(persistence::commit_data_via(Authority::Helper, &mut down, "not a session".into()),
+        persistence::CanonicalCommit::Failed(StoreError::InvalidSchema),
+        "a payload the helper cannot take is refused before it is sent");
+    assert_eq!(requests.get(), 2);
+    assert_eq!(persistence::write_session_via(Authority::Helper, &mut down, &session, SaveAuthority::Routine), unavailable);
+    assert_eq!(persistence::migrate_session_via(Authority::Helper, &mut down, &session), unavailable);
+    assert_eq!(persistence::commit_cleared_via(Authority::Helper, &mut down), unavailable);
+    assert_eq!(requests.get(), 5, "each of those asked the helper, and only the helper");
+    let boot = persistence::bootstrap_via(Authority::Helper, &mut down, &mut opener(), vec![legacy.path.clone()]);
+    assert!(matches!(boot.state, CanonicalRead::Blocked(StoreError::HelperUnavailable)));
+    assert!(boot.migration.is_none(), "a helper that is down authorizes no import");
+    assert_eq!(
+        persistence::cleanup_after_confirmed_clear_via(Authority::Helper, &mut down, vec![legacy.path.clone()]),
+        persistence::ClearCleanupOutcome::AuthorityNotConfirmed);
+    assert!(legacy.path.exists(), "an unconfirmed clear retires nothing");
+    assert_eq!(std::fs::read_dir(&state.dir).unwrap().count(), 0, "no record file was created under the state root");
 }

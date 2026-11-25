@@ -5,6 +5,8 @@
 
 use super::*;
 use super::test_support::{frame, tick, Pms};
+#[cfg(feature = "play-feed")]
+use super::test_support::PreviewReset;
 use crate::app::deeplink::{self, DeepLink};
 use crate::app::input;
 use plx_plex::plex::ServerId;
@@ -25,7 +27,7 @@ struct Rig {
     ps: plx_media::route::PlaybackSession,
     pa: plx_media::player::adapter::PlayerAdapter,
     d: Dispatcher<AppHost>,
-    bridge: Bridge,
+    bridge: crate::app::runtime_owners::Harness,
     link: DeepLink,
     wait: Option<input::MenuPlayAwait>,
     sid: ServerId,
@@ -41,20 +43,21 @@ impl Rig {
         assert!(plx_net::net::global_init() && plx_net::net::available() && plx_net::net::threaded_tls_ready());
         let mt = unsafe { plx_base::task::MainThread::assume() };
         let pms = Pms::serve(one_movie);
-        let _ = plx_platform::tv::launch::take_all();
+        let _ = plx_os::tv::launch::take_all();
         plx_plex::plex::reset_servers_for_test();
         let sid = plx_plex::plex::register_for_test("deeplink", "127.0.0.1", pms.port, "t", "c-deeplink");
         plx_plex::plex::client_for(sid).unwrap().set_link(plx_plex::plex::probe::Location::Local);
         assert!(plx_plex::plex::set_current(sid));
         let mut d = Dispatcher::<AppHost>::new();
-        let mut bridge = Bridge::for_test(|| 0);
+        let mut owner = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut bridge = owner.bridge();
         frame(&mut d, &mut bridge, root, tick(0), vec![]);
         d.nav.tabs.stack.transition = Box::new(plx_ui::containers::transition::Immediate);
         Rig {
             ps: plx_media::route::PlaybackSession::default(),
             pa: plx_media::player::adapter::PlayerAdapter::new(mt),
             d,
-            bridge,
+            bridge: owner,
             link: DeepLink::default(),
             wait: None,
             sid,
@@ -90,19 +93,20 @@ impl Rig {
         {
             // A test Bridge's store runner parks a detail fetch until the test runs it; run it
             // here, off the frame, where the worker thread would have.
-            self.bridge.run_held_store_jobs_for_test();
+            let mut bridge = self.bridge.bridge();
+            bridge.run_held_store_jobs_for_test();
             {
                 let _frame = plx_base::task::FrameScope::enter();
-                self.bridge.metadata_pump_detail();
+                bridge.metadata_pump_detail();
                 let now = tick(self.i).ms;
                 deeplink::frame(&mut self.d, &mut self.link, &mut self.wait, true, false, now);
                 unsafe {
-                    input::menu_play_tick(&mut self.ps, &mut self.pa, &mut self.d, &mut self.bridge,
+                    input::menu_play_tick(&mut self.ps, &mut self.pa, &mut self.d, &mut bridge,
                         &mut self.wait, now);
                 }
             }
-            super::frame(&mut self.d, &mut self.bridge, tick(self.i), vec![]);
-            self.bridge.assert_no_store_jobs_left_for_test();
+            super::frame(&mut self.d, &mut bridge, tick(self.i), vec![]);
+            bridge.assert_no_store_jobs_left_for_test();
             self.i += 1;
         }
     }
@@ -121,8 +125,8 @@ fn a_paramless_relaunch_right_behind_a_link_does_not_lose_it() {
     let mut rig = Rig::new(AppArg::Home);
     // The cold argv link and a second tile press (no `plex` object) both arrive before a frame
     // takes either: the later, link-less payload must not displace the link.
-    plx_platform::tv::launch::offer(&payload(KNOWN));
-    plx_platform::tv::launch::offer(r#"{"event":"relaunch","parameters":{}}"#);
+    plx_os::tv::launch::offer(&payload(KNOWN));
+    plx_os::tv::launch::offer(r#"{"event":"relaunch","parameters":{}}"#);
     rig.run();
     assert!(rig.stack() == vec![
         AppArg::Home,
@@ -135,13 +139,13 @@ fn a_paramless_relaunch_right_behind_a_link_does_not_lose_it() {
 fn a_link_lands_on_its_detail_page_with_home_alone_behind_it() {
     let mut rig = Rig::new(AppArg::Home);
     // Whatever stands above Home when the link is due is unwound: here, another item's page.
-    open_detail(&mut rig.d, &mut rig.bridge, rig.sid, "other", None, None);
-    frame(&mut rig.d, &mut rig.bridge, AppArg::Content(ContentArg::Detail { sid: rig.sid, rk: "other".into() }),
+    open_detail(&mut rig.d, &mut rig.bridge.bridge(), rig.sid, "other", None, None);
+    frame(&mut rig.d, &mut rig.bridge.bridge(), AppArg::Content(ContentArg::Detail { sid: rig.sid, rk: "other".into() }),
         tick(rig.i), vec![]);
     assert_eq!(rig.stack().len(), 2);
 
     // Arrives the way a relaunch does, mid-session, and is taken by the tick.
-    plx_platform::tv::launch::offer(&payload(KNOWN));
+    plx_os::tv::launch::offer(&payload(KNOWN));
     rig.run();
     assert!(rig.stack() == vec![
         AppArg::Home,
@@ -153,7 +157,7 @@ fn a_link_lands_on_its_detail_page_with_home_alone_behind_it() {
 #[test]
 fn a_key_the_server_does_not_know_leaves_home_in_place() {
     let mut rig = Rig::new(AppArg::Home);
-    plx_platform::tv::launch::offer(&payload("999"));
+    plx_os::tv::launch::offer(&payload("999"));
     rig.run();
     assert!(rig.stack() == vec![AppArg::Home], "Home alone stays");
     plx_plex::plex::reset_servers_for_test();
@@ -164,7 +168,7 @@ fn a_key_the_server_does_not_know_leaves_home_in_place() {
 #[test]
 fn a_link_with_no_account_waits_through_sign_in() {
     let mut rig = Rig::new(AppArg::Login);
-    plx_platform::tv::launch::offer(&payload(KNOWN));
+    plx_os::tv::launch::offer(&payload(KNOWN));
     rig.frames(60);
     assert!(rig.stack() == vec![AppArg::Login], "sign-in stays alone");
     assert!(!rig.link.is_idle(), "the link is still pending");
@@ -185,7 +189,7 @@ fn a_link_waits_under_the_consent_sheet() {
     open_first_run_consent_at(&mut rig.d, 0);
     rig.frames(20);
     assert!(rig.d.surface_up(), "premise: the sheet is up");
-    plx_platform::tv::launch::offer(&payload(KNOWN));
+    plx_os::tv::launch::offer(&payload(KNOWN));
     rig.frames(60);
     assert!(rig.bridge.metadata_view().detail_request_status(rig.sid, KNOWN).is_none(),
         "the link asked for its item under the sheet");
@@ -204,7 +208,7 @@ fn a_link_waits_under_the_consent_sheet() {
 #[test]
 fn a_link_with_a_server_survives_sign_in() {
     let mut rig = Rig::new(AppArg::Login);
-    plx_platform::tv::launch::offer(&payload_naming(&rig));
+    plx_os::tv::launch::offer(&payload_naming(&rig));
     rig.frames(20);
     nav_root(&mut rig.d, AppArg::Home);
     rig.run();
@@ -221,7 +225,7 @@ fn a_link_with_a_server_survives_sign_in() {
 fn a_serverless_link_that_waited_across_sign_in_is_dropped() {
     plx_base::eventlog::with_private_log(|| {
         let mut rig = Rig::new(AppArg::Login);
-        plx_platform::tv::launch::offer(&payload(KNOWN));
+        plx_os::tv::launch::offer(&payload(KNOWN));
         rig.frames(20);
         nav_root(&mut rig.d, AppArg::Home);
         rig.run();
@@ -236,14 +240,6 @@ fn a_serverless_link_that_waited_across_sign_in_is_dropped() {
 #[cfg(feature = "play-feed")]
 fn play_payload(rk: &str) -> String {
     format!(r#"{{"event":"launch","parameters":{{"plex":{{"ratingKey":"{rk}","action":"play"}}}}}}"#)
-}
-
-/// Puts a preview back to Idle when the test ends, however it ends (the machine is process-wide).
-#[cfg(feature = "play-feed")]
-struct PreviewReset;
-#[cfg(feature = "play-feed")]
-impl Drop for PreviewReset {
-    fn drop(&mut self) { plx_media::player::preview::reset_for_test(); }
 }
 
 #[cfg(feature = "play-feed")]
@@ -280,7 +276,7 @@ fn a_play_landing_waits_for_an_abandoning_preview() {
     let mut rig = Rig::new(AppArg::Home);
     let _reset = PreviewReset;
     hold_a_preview(&mut rig);
-    plx_platform::tv::launch::offer(&play_payload(KNOWN));
+    plx_os::tv::launch::offer(&play_payload(KNOWN));
     rig.until_loaded();
     assert!(preview::abandoning(), "premise: the halt left the preview abandoning");
     assert!(!plx_media::route::play_pending(), "the Play went through an engine a preview still holds");
@@ -303,7 +299,7 @@ fn a_play_landing_behind_a_preview_that_never_returns_gives_up() {
         let mut rig = Rig::new(AppArg::Home);
         let _reset = PreviewReset;
         hold_a_preview(&mut rig);
-        plx_platform::tv::launch::offer(&play_payload(KNOWN));
+        plx_os::tv::launch::offer(&play_payload(KNOWN));
         rig.run();
         assert!(!plx_media::route::play_pending(), "the Play went through an engine a preview still holds");
         let log = std::fs::read_to_string(plx_base::eventlog::events_log()).unwrap_or_default();

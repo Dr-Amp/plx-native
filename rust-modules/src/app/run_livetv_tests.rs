@@ -12,7 +12,7 @@ fn live_body(request: &str) -> String {
 fn tuned_live(rig: &mut Rig) -> plx_machine::machine::EntryId {
     let origin = rig.app.pages.nav.top_page().unwrap().id;
     assert!(plx_media::route::request_live(&mut rig.app.player.session,
-        rig.app.bridge.metadata_mut(), plx_platform::devcaps::caps(), rig.sid, "7", "C101", "Family Channel"));
+        rig.app.bridge.metadata_mut(), plx_os::devcaps::caps(), rig.sid, "7", "C101", "Family Channel"));
     rig.entered.recv_timeout(Duration::from_secs(3)).unwrap();
     rig.accept_start();
     frame(&mut rig.app, 16);

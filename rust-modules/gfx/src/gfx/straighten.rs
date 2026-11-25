@@ -20,15 +20,14 @@
 //! # The pass
 //!
 //! A last draw before the swap rewrites the frame `rgb' = a > 0 ? rgb / a : 0`, alpha unchanged,
-//! blending off (`fs_straighten.frag`), over the pixels the frame drew into and no others (below). The
+//! blending off (`fs_straighten.frag`), over the regions booked for conversion (below). The
 //! compositor's multiply then returns exactly the colour the frame drew: `(rgb / a) * a + video * (1 - a)
 //! = rgb + video * (1 - a)`, the premultiplied picture the frame was built as. An opaque pixel (`a = 1`)
-//! and a hole (`a = 0`) are fixed points, which is what makes "the pixels the frame drew into" enough:
-//! every other pixel is the transparent clear.
+//! and a black pixel at any alpha are fixed points of the conversion.
 //!
 //! **Where it runs.** From the application loop (`app/run.rs`'s `present_and_swap`), after the frame's
-//! draw and its one framebuffer readback and before anything else touches the surface, and only on a
-//! frame whose surface is over the BOUND video plane (`Player::video_plane_bound`) that DREW something.
+//! draw and its one framebuffer readback and before anything else touches the surface, and only when a
+//! surface over the bound video plane (`Player::video_plane_bound`) has coverage to convert.
 //! The gate presents every frame while the plane is bound, and about 99 % of those frames are a
 //! transparent clear with no draw call at all. Two reads of the frame's own state decide it: the plane
 //! bit (a function argument, not gfx state: [`super::video_plane_frame`] is restored to `false` before
@@ -36,7 +35,7 @@
 //! chrome is just as translucent) and [`frame_drew`], whether [`note_draw`] booked a draw onto the
 //! surface since [`frame_begin`].
 //!
-//! **Where it draws.** One quad over each box of the surface the frame drew into, and nowhere else. A
+//! **Where it draws.** One quad over each box booked for colour conversion. A
 //! pass over the whole viewport (2.07 M pixels, about 40 fps where the frame ran at about 50 on the dev
 //! set, the same fixture and the release build) touched every tile of a frame that is, for the length of
 //! a film, a subtitle line and a clear. Every draw call in this crate says what it writes
@@ -54,7 +53,9 @@
 //! **What books nothing, and what books everything.** A draw into a target of gfx's own (a blur pass, a
 //! field reduction, a region fill; [`note_bind`] knows from the binds, and a host-page snapshot by
 //! `default_fb`) is not the surface's and books nothing; the draw that puts its pixels on the surface
-//! books its own quad. A draw with no known extent ([`Extent::Target`], or a quad that is not a
+//! books its own quad. Dedicated flat and ramp fills with exact black RGB also add no coverage:
+//! over the transparent clear they leave RGB zero, and earlier coloured draws retain their boxes.
+//! A draw with no known extent ([`Extent::Target`], or a quad that is not a
 //! number) books the whole surface and the pass covers the viewport, as it did before it knew where the
 //! frame drew. A `glClear` is not a draw ([`note_clear`]): the two alphas the app clears the surface to,
 //! 0 and 1, are fixed points, and any other alpha books the whole surface. The scissor is ignored: it
@@ -86,7 +87,7 @@
 //! colour: it must clear every damaged region first and run this pass over exactly that region (the
 //! ledger already holds the boxes a frame drew; it would be reset to the damage instead of to nothing).
 //! The same fact is why untouched pixels may be left alone: a frame starts from a clear, so a pixel no
-//! draw booked is `(0, 0, 0, 0)`.
+//! draw booked over the transparent clear has zero RGB, including under a black scrim.
 //!
 //! # Readbacks
 //!
@@ -161,6 +162,7 @@ pub(crate) fn note_draw(extent: Extent) {
         return;
     }
     let b = match extent {
+        Extent::BlackFill => None,
         Extent::Target => Some(EVERYTHING),
         Extent::Quad(q) => {
             let (vx, vy, _, _) = plx_base::surface::viewport();
@@ -199,7 +201,7 @@ pub fn frame_begin() {
     STRAIGHTENED.with(|s| s.set(false));
 }
 
-/// Has this frame drawn anything onto the presented surface since [`frame_begin`]?
+/// Has this frame booked any pixels for alpha conversion since [`frame_begin`]?
 pub fn frame_drew() -> bool {
     LEDGER.with(|l| !l.borrow().is_empty())
 }
@@ -387,8 +389,7 @@ pub fn init() {
 /// and drew something ([`plan`]); returns whether it ran. Call it LAST, after every draw and every
 /// readback of the frame, before the swap; the surface is `straightened` from then on.
 ///
-/// It draws one quad over each box the frame drew into ([`Ledger`]) and over nothing else: a pixel no
-/// draw touched is the transparent clear, a fixed point, and the boxes are disjoint, so every pixel the
+/// It draws one quad over each box booked for conversion ([`Ledger`]). The boxes are disjoint, so every pixel the
 /// pass visits it visits once. A box is a quad of its own and not a scissor: on this GPU a scissor
 /// bounds what a pass may WRITE and the tiler still walks every tile under the geometry
 /// (`gfx::culled`'s measurement), so only the quad's size removes the work.
@@ -460,7 +461,7 @@ unsafe fn copy_target(vw: c_int, vh: c_int) -> c_uint {
 /// One GL blend factor the simulator's compositor model uses: the data the GL call
 /// ([`UnderBlend::gl`]) and the host test's model ([`UnderBlend::apply`]) both read, so the test
 /// checks the factors the simulator actually sets.
-#[cfg(any(test, feature = "hostsim"))]
+#[cfg(any(test, feature = "sim"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlendFactor {
     One,
@@ -468,7 +469,7 @@ pub enum BlendFactor {
     OneMinusDstAlpha,
 }
 
-#[cfg(any(test, feature = "hostsim"))]
+#[cfg(any(test, feature = "sim"))]
 impl BlendFactor {
     /// The `GLenum`.
     pub const fn gl(self) -> c_uint {
@@ -490,14 +491,14 @@ impl BlendFactor {
 }
 
 /// A `glBlendFuncSeparate` as `(source, destination)` factors for colour and for alpha.
-#[cfg(any(test, feature = "hostsim"))]
+#[cfg(any(test, feature = "sim"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnderBlend {
     pub rgb: (BlendFactor, BlendFactor),
     pub alpha: (BlendFactor, BlendFactor),
 }
 
-#[cfg(any(test, feature = "hostsim"))]
+#[cfg(any(test, feature = "sim"))]
 impl UnderBlend {
     /// The four `glBlendFuncSeparate` arguments.
     pub const fn gl(self) -> [c_uint; 4] {
@@ -524,7 +525,7 @@ impl UnderBlend {
 /// not what the frame was meant to show: a premultiplied pixel it is given comes out multiplied by its
 /// own alpha, which is exactly the fault the pass exists to remove, so the simulator shows the bug
 /// without the pass and the fix with it.
-#[cfg(any(test, feature = "hostsim"))]
+#[cfg(any(test, feature = "sim"))]
 pub const UNDER: UnderBlend = UnderBlend {
     rgb: (BlendFactor::OneMinusDstAlpha, BlendFactor::DstAlpha),
     alpha: (BlendFactor::OneMinusDstAlpha, BlendFactor::One),
@@ -535,6 +536,8 @@ pub const UNDER: UnderBlend = UnderBlend {
 /// What a draw call writes to the surface, as the draw site declares it (see [`Ledger`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Extent {
+    /// An exact black fill adds no pixels requiring conversion and retains all earlier coverage.
+    BlackFill,
     /// The authored-pixel quad `(x, y, w, h)` the vertex shader places the unit quad over: the very
     /// numbers the draw's `*_RECT` uniform holds.
     Quad([f32; 4]),
@@ -897,6 +900,30 @@ mod tests {
         assert!(!super::super::video_plane_refuses("test door"), "and is open again on the next frame");
     }
 
+    #[test]
+    fn black_scrims_preserve_only_the_coverage_of_coloured_content() {
+        let _g = plx_base::testlock::serial();
+        let full = Extent::quad(0.0, 0.0, 1920.0, 1080.0);
+        let black = [0.0, 0.0, 0.0, 0.58];
+        let clear = [0.0; 4];
+        let tint = [0.0, 1.0 / 255.0, 0.0, 0.58];
+        let fill = |a: &[f32; 4], b: &[f32; 4]| unsafe {
+            super::super::black_fill_extent(full, a.as_ptr(), b.as_ptr())
+        };
+
+        frame_begin();
+        note_draw(fill(&clear, &black));
+        assert!(!frame_drew());
+        note_draw(Extent::quad(10.0, 20.0, 30.0, 40.0));
+        let subtitle = booked();
+        assert!(!subtitle.is_empty());
+        note_draw(fill(&black, &black));
+        assert_eq!(booked(), subtitle);
+        assert_eq!(fill(&black, &tint), full);
+        assert_eq!(fill(&tint, &black), full);
+        frame_begin();
+    }
+
     /// **Only a draw onto the presented surface is booked.** A blur pass, a field reduction or a region
     /// fill draws into a target of gfx's own, between a bind of it and the bind back to
     /// `default_fb` (every pass ends that way, and `note_bind` reads it), and none of its pixels is the
@@ -1034,7 +1061,31 @@ mod tests {
         assert!(fs.contains("#define PLX_BEHIND gl_LastFragData[0]"));
         assert!(fs.contains("#extension GL_ARM_shader_framebuffer_fetch : require"));
         assert!(fs.contains("#extension GL_EXT_shader_framebuffer_fetch : require"));
-        assert!(fs.contains("texture2D(u_tex, v_uv)"), "the copy variant samples its copy");
+        assert!(!fs.contains("texture2D"), "the fetch file has no copy branch; that program is its own file");
+        let copy = include_str!("../shaders/fs_straighten_copy.frag");
+        assert!(copy.contains("texture2D(u_tex, v_uv)"), "the copy variant samples its copy");
+    }
+
+    /// **The copy program has no preprocessor directive, and its arithmetic is the fetch file's.**
+    /// YaGL (the Tizen emulator's GLES2) rejected the one shared source's copy variant at its `precision`
+    /// statement ("0:37(1) syntax error, unexpected NEW_IDENTIFIER"), the suspect being the `#extension`
+    /// lines of the branches that variant does not take, so the copy variant is a file with none. The
+    /// two files must not drift: the lines from `void main` on are equal but for the one line that
+    /// reads the pixel.
+    #[test]
+    fn the_copy_program_has_no_directive_and_the_fetch_files_arithmetic() {
+        let fetch = include_str!("../shaders/fs_straighten.frag");
+        let copy = include_str!("../shaders/fs_straighten_copy.frag");
+        for (n, line) in copy.lines().enumerate() {
+            assert!(!line.trim_start().starts_with('#'), "fs_straighten_copy.frag:{}: a directive: {line}", n + 1);
+        }
+        let arithmetic = |src: &str| -> Vec<String> {
+            let body = &src[src.find("void main(){").expect("main")..];
+            body.lines().filter(|l| !l.contains("highp vec4 c =")).map(str::to_string).collect()
+        };
+        assert_eq!(arithmetic(fetch), arithmetic(copy), "the two sources compute the same thing");
+        let code = copy.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        assert!(code.contains("precision mediump float;\nvarying highp vec2 v_uv;\nuniform sampler2D u_tex;\n"));
     }
 
     // ---- the extent ledger ---------------------------------------------------------------------------

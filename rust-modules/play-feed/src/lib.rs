@@ -10,8 +10,14 @@ pub mod feed_driver;
 pub mod feed_resources;
 pub mod feed_pump;
 pub mod feed_state;
-/// The simulator's stand-in for the Starfish/ACB seam (`hostsim` builds only; see its module doc).
-#[cfg(feature = "hostsim")]
+/// The host's stand-in for the Starfish/ACB seam (see its module doc): the simulator's `sim` build, and
+/// the tests, this crate's own and the ones that enable `test-support`. Two declarations of one file, never
+/// both active, so that no single `cfg` mixes the simulator with `test` (that would be a production-visible
+/// test/production fork in `ci/allow/forks/`).
+#[cfg(feature = "sim")]
+pub mod ffi_host;
+#[cfg(all(any(test, feature = "test-support"), not(feature = "sim")))]
+#[path = "ffi_host.rs"]
 pub mod ffi_host;
 pub mod ff_pcm;
 mod ff;
@@ -51,7 +57,7 @@ pub mod ff_test_support {
         // The counters the diag sample reads outside the mailboxes: a fresh session's are zero.
         store_diag_counters(0, 0, false);
     }
-    pub use crate::ff::subs::SubTracks;
+    pub use crate::ff::subs::{live_stream, SubTracks};
     pub use crate::ff::{annexb_start, arm_active_stall_guard, candidate_reserve_deadline,
         classify_curl_open_err, classify_hls_avio_facts, classify_hls_deadline,
         classify_plaintext_open_failure, drain_keep_polling,
@@ -168,12 +174,12 @@ pub const ENVELOPE_FHD60: SinkEnvelope = SinkEnvelope {
     fps: 60,
 };
 
-// The codec one Load declares lives with the device's codec table (`plx_platform::devcaps`), where
+// The codec one Load declares lives with the device's codec table (`plx_os::devcaps`), where
 // the player names it without naming this crate; the old path stays for this crate's own code.
-pub use plx_platform::devcaps::LoadVideo;
+pub use plx_os::devcaps::LoadVideo;
 
 /// True when the Load must be refused: see [`LoadVideo::refused_by`].
-pub fn load_video_refused(lv: LoadVideo, caps: &plx_platform::devcaps::Caps) -> bool {
+pub fn load_video_refused(lv: LoadVideo, caps: &plx_os::devcaps::Caps) -> bool {
     lv.refused_by(caps)
 }
 
@@ -212,7 +218,7 @@ pub fn sink_envelope(
     video: LoadVideo,
     max_raster: (u16, u16),
     stream_fps: f64,
-    caps: &plx_platform::devcaps::Caps,
+    caps: &plx_os::devcaps::Caps,
     measured: bool,
 ) -> SinkEnvelope {
     let fits_fhd = |w: u32, h: u32| w > 0 && h > 0 && w <= 1920 && h <= 1088;
@@ -256,7 +262,7 @@ pub fn sink_envelope(
 
 /// The device's measured decoder row (`(w, h, fps)`, 0 = no bound) for the codec a Load declares:
 /// what [`sink_envelope`] clamps to and [`speed_fps_ceiling`] reads.
-pub fn decoder_row(video: LoadVideo, caps: &plx_platform::devcaps::Caps) -> (u32, u32, u32) {
+pub fn decoder_row(video: LoadVideo, caps: &plx_os::devcaps::Caps) -> (u32, u32, u32) {
     video.decoder_row(caps)
 }
 
@@ -332,7 +338,7 @@ pub fn parse_sinkmax(spec: &str) -> Option<SinkEnvelope> {
 /// Unsupported formats must never be mislabeled as AC3: that can stall the audio master clock.
 pub fn audio_payload_codec(codec: &str) -> Option<(&'static str, u8)> {
     // PMS names DTS `dca`; the shared canonicaliser maps every spelling onto the pipeline's.
-    match plx_platform::devcaps::audio_codec_id(codec).as_ref() {
+    match plx_os::devcaps::audio_codec_id(codec).as_ref() {
         "ac3" => Some(("AC3", 1)),
         "eac3" => Some(("AC3 PLUS", 2)),
         "aac" => Some(("AAC", 3)),
@@ -341,7 +347,7 @@ pub fn audio_payload_codec(codec: &str) -> Option<(&'static str, u8)> {
         "opus" => Some(("OPUS", 6)),
         // decoded in the app (`ff::PcmDecoder`) and fed as PCM: libpf has no FLAC or ALAC input,
         // and LPCM arrives in containers it does not take. `PCM_AUDIO_CODECS` is the set.
-        c if plx_platform::devcaps::PCM_AUDIO_CODECS.split(',').any(|p| p == c) => Some(("PCM", 5)),
+        c if plx_os::devcaps::PCM_AUDIO_CODECS.split(',').any(|p| p == c) => Some(("PCM", 5)),
         _ => None,
     }
 }
@@ -352,7 +358,7 @@ pub fn audio_payload_codec(codec: &str) -> Option<(&'static str, u8)> {
 /// available here; a 5.1 Opus track of a real library carries exactly this header (see the test).
 pub fn opus_head(channels: i64) -> Option<Vec<u8>> {
     // (streams, coupled streams, channel mapping) for 3..=8 channels — libopus `vorbis_mappings`.
-    const FAMILY1: [(u8, u8, &[u8]); plx_platform::devcaps::OPUS_LOAD_CHANNELS as usize - 2] = [
+    const FAMILY1: [(u8, u8, &[u8]); plx_os::devcaps::OPUS_LOAD_CHANNELS as usize - 2] = [
         (2, 1, &[0, 2, 1]),
         (2, 2, &[0, 1, 2, 3]),
         (3, 2, &[0, 4, 1, 2, 3]),
@@ -361,7 +367,7 @@ pub fn opus_head(channels: i64) -> Option<Vec<u8>> {
         (5, 3, &[0, 6, 1, 2, 3, 4, 5, 7]),
     ];
     let ch = u8::try_from(channels).ok().filter(|c| {
-        (1..=plx_platform::devcaps::OPUS_LOAD_CHANNELS).contains(&u32::from(*c))
+        (1..=plx_os::devcaps::OPUS_LOAD_CHANNELS).contains(&u32::from(*c))
     })?;
     let mut head = b"OpusHead".to_vec();
     head.extend_from_slice(&[1, ch]);

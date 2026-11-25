@@ -6,7 +6,7 @@ THE GAP, MEASURED. `rust-modules/Cargo.toml` declares `default = ["devtools", "d
 `make RELEASE=1` drops both (`RUST_FEATFLAGS = $(if $(RELEASE),--no-default-features,)`, Makefile
 line 304). Everything that routinely compiles this crate builds the DEFAULT set: `make check`
 (`cargo +$(RUST_TOOLCHAIN) test --lib`, line 666), `make lint` (line 699), the plain cross-build
-(line 438), and `make sim` (line 875 — `--features hostsim` ON TOP of the defaults, not instead of
+(line 438), and `make sim` (line 875 — `--features sim` ON TOP of the defaults, not instead of
 them). So does CI's pull-request gate — `.github/workflows/ci.yml` runs `make check` (line 50),
 then the plain cross-build (line 98), then `make ipk FLAVOR=debug` (line 108), and never drops a
 feature. The release job is the only CI job that does, and it turns the flag on through an **`env:`
@@ -14,9 +14,9 @@ block** — `RELEASE: "1"`, `release.yml` line 236 — so a grep for the literal
 find the build at all: `grep -rnE 'no-default-features|RELEASE=1' .github/` returns exactly two
 hits, `release.yml` lines 252-253, and both are the ASSERTION that the flag took effect, fired
 after `make ipk` has already run. Exactly one other command in the tree drops both features —
-`make macapp` (`ci/mkmacapp.py` line 84: `--release --no-default-features --features hostsim`) —
+`make macapp` (`ci/mkmacapp.py` line 84: `--release --no-default-features --features sim`) —
 and it is neither routine nor the same configuration: it is run to mail somebody a Mac bundle, and
-it puts `hostsim` back on top, which swaps `player::ffi`'s whole seam.
+it puts `sim` back on top, which swaps `player::ffi`'s whole seam.
 
 Measured on this tree, 2026-08-23: **27** `cfg(feature = "devtriggers")` sites and **7**
 `cfg(feature = "devtools")` sites in `rust-modules/src` — every one of them a place where the
@@ -94,14 +94,15 @@ WHAT IT DELIBERATELY DOES NOT CHECK.
     hook is for the configuration with no other reader. (A break in the default set usually shows
     up here anyway, since almost all of the crate is shared text — so when it does, the message
     says so rather than blaming the release configuration for a plain compile error.)
-  * **`hostsim`.** A third configuration, off by default, built only by `make sim`, and it ships to
+  * **`sim`.** A third configuration, off by default, built only by `make sim`, and it ships to
     nobody. It has the same structural exposure and a much smaller blast radius.
-  * **`rust-modules/src/bin/sim.rs`** and anything else under `src/bin/`: `--lib` does not compile
-    them, and `required-features = ["hostsim"]` means the release configuration never does either.
+  * **`rust-modules/platform-desktop/src/bin/sim.rs`** (the simulator, the desktop platform crate's binary; that crate is
+    not in the checked set at all) and anything else under a `src/bin/`: `--lib` does not compile
+    them, and `required-features = ["sim"]` means the release configuration never does either.
     Firing there would spend the 0.55 s and grade nothing.
   * **`rust-modules/build.rs`.** Cargo compiles the script in every configuration, so a break in
     it is a break `make check` already sees. Note what that does and does not cover now: since it
-    started publishing `PLX_VERSION` it no longer emits nothing outside `hostsim` — `emit_version`
+    started publishing `PLX_VERSION` it no longer emits nothing outside `sim` — `emit_version`
     runs first, in every configuration, and BRANCHES on `PLX_RELEASE`. Both arms compile whatever
     is being checked (it is a runtime branch in a host binary, not a `cfg`), which is why this
     still skips; what nothing here executes is the release arm's VALUE, and nothing should try to
@@ -273,10 +274,13 @@ def rust_src_target(payload, root, cwd=None):
     src = os.path.realpath(os.path.join(root, "rust-modules", "src"))
     # The layer crates split out of `src` (docs/module-layers.md) are compiled by the same
     # `cargo check --lib` as a dependency, so an edit there is a release-configuration risk too.
-    layer_srcs = [os.path.realpath(os.path.join(root, "rust-modules", layer, "src")) for layer in ("base", "machine", "net", "platform", "gfx", "ui", "plex", "telemetry", "data", "session", "media", "appkit", "screens")]
+    layer_srcs = [os.path.realpath(os.path.join(root, "rust-modules", layer, "src")) for layer in ("base", "machine", "net", "os", "gfx", "ui", "plex", "telemetry", "data", "session", "media", "appkit", "screens", "shell-sdl", "platform-webos")]
+    # `platform-desktop` is deliberately NOT here: the crate is `#![cfg(feature = "sim")]` (its `lib.rs`) and its
+    # one binary needs `sim`, so under the release configuration it compiles to nothing and an edit there grades nothing.
+    # Neither is `platform-tizen`: its library is `#![cfg(feature = "tizen")]`, which the release set never has.
     if not any(path.startswith(s + os.sep) for s in [src] + layer_srcs):
         return None
-    # `--lib` compiles no bin target, and `sim.rs` needs `hostsim`, which the release set never has.
+    # `--lib` compiles no bin target, and `sim.rs` needs `sim`, which the release set never has.
     if path.startswith(os.path.join(src, "bin") + os.sep):
         return None
     return path
@@ -390,6 +394,12 @@ def repo_root(cwd):
     return os.path.abspath(cwd)
 
 
+# The packages one check covers: the application AND the crate the ARM staticlib is built from. The platform
+# crate (`plx_platform_webos`) depends on the application, so a bare `cargo check --lib` at the application's
+# directory compiles none of its source, and an edit under `rust-modules/platform-webos/src` would grade nothing.
+PACKAGES = ["-p", "plxnative-modules", "-p", "plx_platform_webos"]
+
+
 def run_check(root, flags, toolchain, secs):
     """(returncode, combined output), or None if it hit the timeout (a lock wait, most likely)."""
     env = dict(os.environ)
@@ -421,7 +431,7 @@ def run_check(root, flags, toolchain, secs):
         env[TARGET_DIR_ENV] = tdir
     except OSError:
         pass
-    cmd = ["cargo", f"+{toolchain}", "check", "--lib"] + list(flags)
+    cmd = ["cargo", f"+{toolchain}", "check", "--lib"] + PACKAGES + list(flags)
     try:
         # `encoding`/`errors` EXPLICIT, not `text=True`'s locale default — see the note at the top
         # of the module. rustc echoes the offending SOURCE LINE into every diagnostic, so this is
@@ -453,7 +463,7 @@ def report(root, edited, diags, default_also_broken, toolchain):
         + seen_by +
         "\n" + (diags or "(cargo reported a failure but produced no diagnostics)") + "\n"
         "\nReproduce, verbatim:\n"
-        f"  cd rust-modules && cargo +{toolchain} check --lib --no-default-features\n")
+        f"  cd rust-modules && cargo +{toolchain} check --lib {' '.join(PACKAGES)} --no-default-features\n")
     if not default_also_broken and has_latched_flag(root):
         msg += (
             "\nIf this is a hand-written #[cfg(feature = \"devtriggers\")] / #[cfg(not(...))] PAIR:\n"

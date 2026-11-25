@@ -361,7 +361,7 @@ pub fn refusal_recovered(recovered: &super::recovery::Recovered) {
 /// source failure is the demuxer's, never the television's refusal).
 fn refusal_recovered_context(recovered: &super::recovery::Recovered) -> Option<RefusalRecoveredContext> {
     use super::recovery::{LoadRefusal, Rung};
-    use plx_platform::devcaps::Facet;
+    use plx_os::devcaps::Facet;
     let error = match recovered.refusal {
         LoadRefusal::Refused { num } => RefusalError::Number(num),
         LoadRefusal::TimedOut => RefusalError::Timeout,
@@ -677,6 +677,7 @@ fn error_context_with_source(ps: &crate::route::PlaybackSession,
         http_status: HttpClass::exact_status(http_status),
         pipeline_error: facts.pipeline_error.unwrap_or(0),
         refusal,
+        preview_refusal: crate::route::preview_refusal(ps),
     };
     if crate::route::preview_request(ps) {
         as_preview(context)
@@ -1323,6 +1324,7 @@ pub fn watched_class(position_ns: i64, duration_ns: i64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plx_telemetry::telemetry::classes::PreviewRefusal;
     use plx_play_feed::shared::FEED_SHARED;
 
     #[test]
@@ -1562,7 +1564,7 @@ mod tests {
             crate::route::PlayVerdict::Server(String::new(), Default::default()),
             crate::route::PlayVerdict::DirectPlayDisabled,
             crate::route::PlayVerdict::Forced(crate::route::ForcedFailure::Video),
-            crate::route::PlayVerdict::PreviewNeedsDirectPlay,
+            crate::route::PlayVerdict::PreviewNeedsDirectPlay { reason: PreviewRefusal::NotDirect },
         ] {
             let mut ps = crate::route::PlaybackSession::default();
             crate::route::refuse_for_test(&mut ps, verdict.clone());
@@ -1692,7 +1694,7 @@ mod tests {
         for verdict in [
             crate::route::PlayVerdict::DirectPlayDisabled,
             crate::route::PlayVerdict::Forced(crate::route::ForcedFailure::Video),
-            crate::route::PlayVerdict::PreviewNeedsDirectPlay,
+            crate::route::PlayVerdict::PreviewNeedsDirectPlay { reason: PreviewRefusal::NotDirect },
         ] {
             let mut ps = crate::route::PlaybackSession::default();
             crate::route::refuse_for_test(&mut ps, verdict.clone());
@@ -1932,7 +1934,34 @@ mod tests {
             assert_eq!(v["tags"]["playback.kind"], "preview_not_direct");
             assert_eq!(v["tags"]["playback.attempt_origin"], "preview");
             assert_eq!(v["fingerprint"], serde_json::json!(["playback-error", "preview", "preview_not_direct"]));
+            // The rig's item has no Part, so the first failing condition is `no_part`.
+            assert_eq!(v["tags"]["playback.preview_refusal"], "no_part");
         });
+    }
+
+    /// **Sentry PLX-NATIVE-23.** The refused preview's reason rides its report as one tag, whatever
+    /// the reason, and no other verdict carries one. The grouping is the kind's, as before.
+    #[test]
+    fn a_refused_previews_reason_rides_the_report_and_no_other_verdict_carries_one() {
+        let _g = plx_base::testlock::serial();
+        for reason in PreviewRefusal::ALL {
+            let mut ps = crate::route::PlaybackSession::default();
+            crate::route::refuse_for_test(&mut ps, crate::route::PlayVerdict::PreviewNeedsDirectPlay { reason });
+            assert_eq!(error_context(&ps).preview_refusal, Some(reason));
+            let v = event_for(&ps);
+            assert_eq!(v["tags"]["playback.kind"], "preview_not_direct", "{reason:?}");
+            assert_eq!(v["tags"]["playback.preview_refusal"], reason.code(), "{reason:?}");
+        }
+        for verdict in [
+            crate::route::PlayVerdict::DirectPlayDisabled,
+            crate::route::PlayVerdict::Forced(crate::route::ForcedFailure::Video),
+            crate::route::PlayVerdict::Server("Cannot convert this item.".into(), Default::default()),
+        ] {
+            let mut ps = crate::route::PlaybackSession::default();
+            crate::route::refuse_for_test(&mut ps, verdict.clone());
+            assert_eq!(error_context(&ps).preview_refusal, None, "{verdict:?}");
+            assert!(event_for(&ps)["tags"].get("playback.preview_refusal").is_none(), "{verdict:?}");
+        }
     }
 
     /// **Sentry PLX-NATIVE-15.** A detail-page preview never passes [`requested`], so its failure
@@ -2122,7 +2151,7 @@ mod tests {
                 24.0,
                 Default::default(),
                 false,
-                plx_platform::devcaps::dv::DvCapability::Supported,
+                plx_os::devcaps::dv::DvCapability::Supported,
             ));
             requested(&ps, plx_plex::plex::ServerId::UNSET, AttemptOrigin::Fresh);
             crate::player::reset_session_for_test();
@@ -2163,7 +2192,7 @@ mod tests {
                 24.0,
                 Default::default(),
                 false,
-                plx_platform::devcaps::dv::DvCapability::Supported,
+                plx_os::devcaps::dv::DvCapability::Supported,
             ));
             requested(&ps, plx_plex::plex::ServerId::UNSET, AttemptOrigin::Fresh);
             crate::player::reset_session_for_test();
@@ -2266,7 +2295,7 @@ mod tests {
         Lane, Lanes, LoadRefusal, OpenFacts, OpenRecovery, Recovered, RecoveryEffect, RecoveryEvent, Rung,
         StreamAudio,
     };
-    use plx_platform::devcaps::{Caps, Facet};
+    use plx_os::devcaps::{Caps, Facet};
 
     /// A set whose table lists DTS at six channels, so refusing it narrows the attempt.
     fn dts_set() -> std::sync::Arc<Caps> {
@@ -3099,17 +3128,25 @@ mod tests {
     #[test]
     fn no_atomic_read_modify_write_uses_the_deprecated_fetch_update() {
         let needle = concat!(".", "fetch_update", "(");
-        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offences: Vec<String> = Vec::new();
         let mut files = 0usize;
-        // Every crate of the workspace: this crate (`src`), the application (`../src`) and each
-        // layer crate split out of it. The list read `src` and `ui/src` of the application crate
-        // until the media split moved this test, and the layers that had left before then were
-        // not in it, so moving a directory had already moved it out of this scan.
-        let layers = ["base", "machine", "platform", "gfx", "net", "ui", "plex", "telemetry", "data", "session", "appkit", "screens"];
-        let roots = [manifest.join("src"), manifest.join("../src")]
-            .into_iter()
-            .chain(layers.iter().map(|layer| manifest.join("..").join(layer).join("src")));
+        // Every crate of the workspace: the application (`rust-modules/src`) and each
+        // `rust-modules/<crate>/src` beside it, found by listing the workspace directory. The list
+        // this replaced named the crates one by one, so each crate split out of the application had
+        // to be added to it by hand: the layers that had left before the media split were not in it,
+        // and neither were the platform crates (`platform-webos`, `platform-desktop`), which took
+        // `port.rs`, `system.rs` and the `webos/` port with them.
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut crates: Vec<std::path::PathBuf> = std::fs::read_dir(&workspace)
+            .expect("the rust-modules directory")
+            .map(|entry| entry.expect("a directory entry").path())
+            .filter(|dir| {
+                let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                !name.starts_with("target") && dir.join("src").is_dir()
+            })
+            .collect();
+        crates.sort();
+        let roots = std::iter::once(workspace.join("src")).chain(crates.into_iter().map(|dir| dir.join("src")));
         for src in roots {
             walk(&src, &mut |path: &std::path::Path, text: &str| {
                 files += 1;

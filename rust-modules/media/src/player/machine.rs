@@ -90,8 +90,8 @@ impl Player {
     /// formula term feeding it — exactly the risk the spec names, where the gate and the machine
     /// come to disagree about which frame the plane went away on and the false edge lands on a
     /// frame that was never presented.
-    /// `Some(bound)` when this was an EDGE — the loop forwards that, and only that, to the two
-    /// `plx_machine::present::Present` machines it owns beside the live gate.
+    /// `Some(bound)` when this was an EDGE — the loop forwards that, and only that, to the one runtime-owned
+    /// `plx_machine::present::Present` gate.
     pub fn set_video_plane_bound(&mut self, bound: bool) -> Option<bool> {
         if self.video_plane_bound == bound {
             return None;
@@ -105,14 +105,10 @@ impl Player {
         } else {
             "videoplane: unbound — ordinary idle rules from here"
         });
-        plx_machine::idle::note(plx_machine::present::PresentEvent::VideoPlane(bound));
-        // The FALSE edge has to reach the panel, and the frame it lands on is very often one the
-        // gate would otherwise skip — the picture is gone and nothing is animating (spec §3.3
-        // step 9). `invalidate` is what makes that frame present, so the opaque region is really
-        // cleared and the UI surface really goes back to being blended.
-        if !bound {
-            plx_machine::idle::invalidate();
-        }
+
+        // The runner forwards this explicit edge as PresentEvent::VideoPlane. Both edges owe
+        // a surface frame (including clearing the opaque region on false); no global damage.
+
         Some(bound)
     }
 
@@ -134,21 +130,21 @@ impl Default for Player {
 
 /// Logical repair authority; resource handles live in PlayerAdapter. No reset-on-playback API.
 pub struct RepairAttempt {
-    state: plx_platform::tv::sandbox::State,
+    state: plx_os::tv::native_video::State,
 }
 impl RepairAttempt {
-    pub const fn new() -> Self { Self { state: plx_platform::tv::sandbox::State::Idle } }
-    pub fn state(&self) -> plx_platform::tv::sandbox::State { self.state }
+    pub const fn new() -> Self { Self { state: plx_os::tv::native_video::State::Idle } }
+    pub fn state(&self) -> plx_os::tv::native_video::State { self.state }
     pub fn begin(&mut self, supported: bool) -> Option<u64> {
-        use plx_platform::tv::sandbox::{State, Failure};
+        use plx_os::tv::native_video::{State, Failure};
         if self.state != State::Idle { return None; }
         if !supported { self.state = State::Failed(Failure::Unsupported); return None; }
         self.state = State::Running;
         Some(1)
     }
     /// The single issued token can land only once. Wrong/duplicate completions cannot rewrite it.
-    pub fn complete(&mut self, token: u64, result: Result<(), plx_platform::tv::sandbox::Failure>) -> bool {
-        use plx_platform::tv::sandbox::State;
+    pub fn complete(&mut self, token: u64, result: Result<(), plx_os::tv::native_video::Failure>) -> bool {
+        use plx_os::tv::native_video::State;
         if token != 1 || self.state != State::Running { return false; }
         self.state = match result { Ok(()) => State::Repaired, Err(e) => State::Failed(e) };
         true
@@ -158,7 +154,7 @@ impl RepairAttempt {
 #[cfg(test)]
 mod repair_tests {
     use super::*;
-    use plx_platform::tv::sandbox::Failure;
+    use plx_os::tv::native_video::Failure;
     // `repair_survives_screen_and_session_recreation_and_rejects_stale_completions` builds a
     // `PlayerScreen`, which `player` may not name: it lives in `screens::player`'s
     // `repair_confirmation_tests`, beside the screen it recreates.

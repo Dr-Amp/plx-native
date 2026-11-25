@@ -12,7 +12,7 @@ use std::{
     cell::Cell,
     marker::PhantomData,
     rc::Rc,
-    sync::{atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering}, OnceLock},
+    sync::{atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize, Ordering}, Mutex, OnceLock, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -76,6 +76,14 @@ impl FreezeBucket {
 /// number the tracer's `*** FREEZE seq=<n>` record carries (the n-th probe this process sent).
 pub fn freeze_end_record(seq: u32, bucket: FreezeBucket) -> String {
     format!("freeze-end: seq={seq} bucket={}", bucket.word())
+}
+
+/// The crash-log line that says where the loop was when probe `seq` was sent:
+/// `freeze-at: seq=<n> leg=<word>`. Written by the observer thread at probe time, so it is on disk
+/// even if the freeze is never recovered; the importer joins it to the `*** FREEZE seq=<n>` record
+/// of the same process. `leg` is one of [`LoopPhase::word`]'s fixed words.
+pub fn freeze_at_record(seq: u32, leg: LoopPhase) -> String {
+    format!("freeze-at: seq={seq} leg={}", leg.word())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -178,6 +186,49 @@ struct Signals {
     foreground: AtomicBool,
     progress: AtomicUsize,
     label: AtomicPtr<BlockingLabel>,
+    /// The thread a freeze probe (and the developer build's fatal abort) signals.
+    loop_thread: LoopThread,
+}
+
+/// **The loop owner's thread id, and whether anything may signal it.** Captured on the loop thread
+/// itself ([`LoopThread::arm`]) because it is the target of `pthread_kill`; cleared
+/// ([`LoopThread::disarm`]) whenever that id must not be used: a hosted loop thread that has
+/// returned leaves a dead id the system may hand to an unrelated thread, and a paused host has no
+/// loop to probe. The id sits behind a lock held for the length of a send, so once `disarm`
+/// returns no signal is in flight and none will start.
+struct LoopThread(Mutex<Option<usize>>);
+
+impl LoopThread {
+    const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<usize>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Capture the CALLING thread as the loop owner. Called on the loop thread, never on the
+    /// observer. A second call replaces the first: this is the re-capture.
+    fn arm(&self) {
+        // SAFETY: `pthread_self` takes no argument and cannot fail. libc supplies the native
+        // `pthread_t` ABI (pointer on Darwin, unsigned long on ARM Linux), widened to the word
+        // the slot stores.
+        *self.slot() = Some(unsafe { libc::pthread_self() } as usize);
+    }
+
+    fn disarm(&self) {
+        *self.slot() = None;
+    }
+
+    fn armed(&self) -> bool {
+        self.slot().is_some()
+    }
+
+    /// Run `send` against the armed loop thread while the slot is held; `None` (and `send` never
+    /// runs) when disarmed.
+    fn with<R>(&self, send: impl FnOnce(usize) -> R) -> Option<R> {
+        self.slot().map(send)
+    }
 }
 
 impl Signals {
@@ -188,6 +239,7 @@ impl Signals {
             foreground: AtomicBool::new(true),
             progress: AtomicUsize::new(0),
             label: AtomicPtr::new(&UNLABELED as *const BlockingLabel as *mut BlockingLabel),
+            loop_thread: LoopThread::new(),
         }
     }
 
@@ -213,6 +265,24 @@ static SIGNALS: Signals = Signals::new();
 /// The app's foreground state, written by the loop at its `LIFECYCLE` edges. Starts true.
 pub fn set_foreground(foreground: bool) {
     SIGNALS.foreground.store(foreground, Ordering::Release);
+}
+
+/// Stop the observer signalling the loop thread, for good or until [`arm`]. Returns once no signal
+/// is in flight. A hosted entry calls it before it reports its stop (the loop thread is about to
+/// end, and its id with it) and while the host is paused; `LoopWatch::start` arms again.
+pub fn disarm() {
+    SIGNALS.loop_thread.disarm();
+}
+
+/// Make the CALLING thread the one the observer signals: call it on the loop thread after a
+/// [`disarm`]. [`LoopWatch::start`] does the same at every loop start.
+pub fn arm() {
+    SIGNALS.loop_thread.arm();
+}
+
+/// Whether the observer may signal a loop thread right now.
+pub fn is_armed() -> bool {
+    SIGNALS.loop_thread.armed()
 }
 
 thread_local! {
@@ -266,9 +336,11 @@ pub fn present_scope() -> LabelScope {
 /// (`main-thread hang: 303ms in land results`) instead of reading `unlabeled`. They are not a
 /// third naming of the loop: each text is published by a mark or span the loop already has —
 /// a heartbeat leg (`heartbeat::Instruments::mark` opens the leg that follows its `Phase`) or a
-/// named FRAMEDROP span (`diag::spans::span`, via [`span_scope`]). Label-only, like `draw_scope`:
-/// no assertion, no permission to block, and none is a GPU phase, so the fatal policy sees each
-/// exactly as it sees `unlabeled`.
+/// named FRAMEDROP span (`diag::spans::span`, via [`span_scope`]). The label is label-only, like
+/// `draw_scope`: no assertion, no permission to block, and none is a GPU phase, so the fatal
+/// policy sees each exactly as it sees `unlabeled`. The leg itself is also recorded in every
+/// build for the freeze probe ([`current_leg`]): by the same marks, and by [`span_leg`] for the
+/// four spans.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoopPhase {
     EventIngest,
@@ -291,6 +363,33 @@ impl LoopPhase {
         Self::PresentAndSwap, Self::FrameReport,
     ];
 
+    /// The word the crash log and the report carry for this leg of the frame loop. **The one
+    /// table**, read by the writer here ([`freeze_at_record`]) and the importer
+    /// (`telemetry::crashreport`), so a leg on the wire is always one of these eleven fixed words
+    /// of the app's own loop and never free text. Single tokens (the log line is split on
+    /// whitespace); not the `threadcheck` descriptor texts, which have spaces and exist only in a
+    /// developer build.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::EventIngest => "event-ingest",
+            Self::Results => "results",
+            Self::DevScenarios => "dev-scenarios",
+            Self::PlaybackPump => "playback-pump",
+            Self::LandResults => "land-results",
+            Self::Navcommit => "navcommit",
+            Self::DispatcherFrame => "dispatcher-frame",
+            Self::Update => "update",
+            Self::PrepareWindow => "prepare-window",
+            Self::PresentAndSwap => "present-and-swap",
+            Self::FrameReport => "frame-report",
+        }
+    }
+
+    /// The inverse of [`word`](Self::word); anything that is not exactly one of the words is `None`.
+    pub fn from_word(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|leg| leg.word() == word)
+    }
+
     #[cfg(feature = "threadcheck")]
     const fn descriptor(self) -> &'static BlockingLabel {
         match self {
@@ -308,8 +407,7 @@ impl LoopPhase {
         }
     }
 
-    /// The phase a FRAMEDROP span of this name stands for, if the loop labels it.
-    #[cfg(feature = "threadcheck")]
+    /// The phase a FRAMEDROP span of this name stands for, if the loop names it.
     fn of_span(name: &str) -> Option<Self> {
         Some(match name {
             "scen" => Self::DevScenarios,
@@ -328,19 +426,95 @@ pub fn span_scope(name: &str) -> Option<LabelScope> {
     LoopPhase::of_span(name).map(|phase| enter_label(phase.descriptor()))
 }
 
+/// What the leg cell holds before the first leg is entered.
+const NO_LEG: u8 = 0;
+
+/// **The leg the main loop is in, in EVERY build.** [`LoopPhases::enter`] (the seven heartbeat
+/// legs) and [`span_leg`] (the four a FRAMEDROP span names, for the span's duration) store the
+/// leg's code here (relaxed stores: no string, no thread-local, no allocation) and the observer
+/// reads it when it probes a freeze, because the label the `threadcheck` build publishes does not
+/// exist in a shipping one. A code is the leg's position in [`LoopPhase::ALL`] plus one, so
+/// [`NO_LEG`] is "none yet".
+static CURRENT_LEG: AtomicU8 = AtomicU8::new(NO_LEG);
+
+fn leg_code(phase: LoopPhase) -> u8 {
+    phase as u8 + 1
+}
+
+fn leg_of(code: u8) -> Option<LoopPhase> {
+    usize::from(code).checked_sub(1).and_then(|i| LoopPhase::ALL.get(i).copied())
+}
+
+/// The leg the main loop is in now: `None` before it has entered its first.
+pub fn current_leg() -> Option<LoopPhase> {
+    leg_of(CURRENT_LEG.load(Ordering::Relaxed))
+}
+
+/// A leg a FRAMEDROP span names, held for the span's duration: the previous leg comes back when
+/// the guard drops, on a normal return and on an unwind alike. Four of the loop's eleven legs
+/// (`scen`, `pump`, `land`, `dframe`) have no heartbeat mark, so this is the only thing that ever
+/// publishes them; without it a freeze inside the playback pump reads as the leg around it.
+#[must_use = "the leg is the span's: dropping the guard at once ends it"]
+pub struct LegScope {
+    cell: &'static AtomicU8,
+    previous: u8,
+}
+
+impl Drop for LegScope {
+    #[inline]
+    fn drop(&mut self) {
+        self.cell.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// `diag::spans::span`'s leg, in EVERY build and armed or not: for the named spans the loop
+/// marks, the span's leg in [`CURRENT_LEG`] until the guard drops (a load and two relaxed stores,
+/// no string, no thread-local, no allocation); any other span name leaves the cell untouched. The
+/// span names are mapped here, beside the leg table, so `base` still names no app layer.
+#[inline]
+pub fn span_leg(name: &str) -> Option<LegScope> {
+    span_leg_on(&CURRENT_LEG, name)
+}
+
+#[inline]
+fn span_leg_on(cell: &'static AtomicU8, name: &str) -> Option<LegScope> {
+    let phase = LoopPhase::of_span(name)?;
+    // One writer at a time (the main loop; the four spans run on it), so load-then-store needs
+    // no read-modify-write.
+    let previous = cell.load(Ordering::Relaxed);
+    cell.store(leg_code(phase), Ordering::Relaxed);
+    Some(LegScope { cell, previous })
+}
+
 /// The heartbeat leg currently open. `enter` closes the previous leg and opens the next; the last
 /// stays open until the next `enter`. Owned by `heartbeat::Instruments`, whose `mark` is the only
-/// caller. Without `threadcheck` this is a zero-sized no-op.
-#[derive(Default)]
+/// caller, and which enters seven of the eleven legs; the other four are [`span_leg`]'s. In every
+/// build `enter` records the leg in [`CURRENT_LEG`] for the freeze probe; with `threadcheck` it
+/// also publishes the leg's label for the hang line.
 pub struct LoopPhases {
+    cell: &'static AtomicU8,
     #[cfg(feature = "threadcheck")]
     open: Option<LabelScope>,
 }
 
+impl Default for LoopPhases {
+    fn default() -> Self {
+        Self::on(&CURRENT_LEG)
+    }
+}
+
 impl LoopPhases {
+    fn on(cell: &'static AtomicU8) -> Self {
+        Self {
+            cell,
+            #[cfg(feature = "threadcheck")]
+            open: None,
+        }
+    }
+
     #[inline]
-    #[cfg_attr(not(feature = "threadcheck"), allow(unused_variables))]
     pub fn enter(&mut self, phase: LoopPhase) {
+        self.cell.store(leg_code(phase), Ordering::Relaxed);
         #[cfg(feature = "threadcheck")]
         {
             self.open = None; // restores the label that was current before the first leg
@@ -382,24 +556,27 @@ impl LoopWatch {
             // task::spawn uses std::thread::Builder::spawn and logs EAGAIN as an error return.
             // Exactly one observer lives for this process; a failed start stays disabled.
             //
-            // The loop owner's thread is captured HERE, on the loop owner, never inside the
-            // observer: it is the target of the freeze probe (and of the developer build's fatal
-            // abort). libc supplies the native pthread_t ABI (pointer on Darwin, unsigned long on
-            // ARM Linux); fwcompat inventories export `pthread_self` and `pthread_kill` at
-            // GLIBC_2.4 across all releases: libpthread on older firmware, libc after the glibc
-            // pthread merge.
-            let main_thread = unsafe { libc::pthread_self() } as usize;
+            // The observer never captures the loop owner's thread: that id lives in
+            // `SIGNALS.loop_thread`, written on the loop owner below, because it is the target of
+            // the freeze probe (and of the developer build's fatal abort) and a hosted loop can
+            // end and start again on another thread. fwcompat inventories export `pthread_self`
+            // and `pthread_kill` at GLIBC_2.4 across all releases: libpthread on older firmware,
+            // libc after the glibc pthread merge.
             #[cfg(feature = "threadcheck")]
             let log_only = crate::devtrig::guard_log_only();
             #[cfg(feature = "threadcheck")]
-            let started = super::spawn("main-thread watchdog", move || observe_loop(main_thread, log_only)).is_some();
+            let started = super::spawn("main-thread watchdog", move || observe_loop(log_only)).is_some();
             #[cfg(not(feature = "threadcheck"))]
-            let started = super::spawn("main-thread watchdog", move || observe_loop(main_thread)).is_some();
+            let started = super::spawn("main-thread watchdog", observe_loop).is_some();
             if !started { crate::eventlog::log("main-thread watchdog: unavailable; hang detection disabled"); }
             started
         });
         if !started { return Self::disabled(); }
-        Self::attach(&SIGNALS)
+        let watch = Self::attach(&SIGNALS);
+        // Only the loop that attached becomes the signal target: a refused second loop must not
+        // retarget the first.
+        if watch.signals.is_some() { arm(); }
+        watch
     }
 
     fn attach(signals: &'static Signals) -> Self {
@@ -573,8 +750,9 @@ pub fn set_crash_phase(phase: CrashPhase) {
 /// at playback) is never signalled. Returns whether the signal was sent.
 fn probe_main_thread(main_thread: usize, seq: u32) -> bool {
     // SAFETY: `sigaction` with a null new action only reads the current disposition into `old`,
-    // a zeroed plain-data struct; `pthread_kill` on a thread id captured from the loop owner,
-    // which lives for the whole process, is the call the developer build's abort already makes.
+    // a zeroed plain-data struct; `pthread_kill` on a thread id captured from the loop owner
+    // ([`LoopThread`]; its caller holds the slot, so the id is the live loop's or this is not
+    // reached) is the call the developer build's abort already makes.
     unsafe {
         let mut old: libc::sigaction = std::mem::zeroed();
         if libc::sigaction(libc::SIGUSR2, std::ptr::null(), &mut old) != 0 {
@@ -595,6 +773,12 @@ fn probe_main_thread(main_thread: usize, seq: u32) -> bool {
     }
 }
 
+/// [`probe_main_thread`] against the loop thread, if one is armed. The slot stays held for the send,
+/// so a [`disarm`] that returns has no probe still on its way to a thread that is gone.
+fn probe_loop(loop_thread: &LoopThread, seq: u32) -> bool {
+    loop_thread.with(|thread| probe_main_thread(thread, seq)).unwrap_or(false)
+}
+
 /// Whether `handler` lives in the same loaded object as this code, i.e. is the crash tracer's own
 /// `freeze_handler` and not a library's that took `SIGUSR2` after the tracer was installed
 /// (ACB is `dlopen`ed at playback). A stranger's handler fired at a random moment is not a probe.
@@ -612,7 +796,33 @@ fn handler_is_ours(handler: libc::sighandler_t) -> bool {
     }
 }
 
-fn observe_loop(main_thread: usize, #[cfg(feature = "threadcheck")] log_only: bool) {
+/// The observer's answer to a freeze probe: send it, and when it went out write
+/// `freeze-at: seq=<n> leg=<word>` to the crash log. Returns whether the probe was sent and the
+/// event-log line to write (which names the leg whether or not the probe was sent).
+///
+/// The record is written on the OBSERVER thread (never in the signal handler) and at probe time,
+/// not at recovery, so a freeze the platform ends by killing the app still carries its leg. It
+/// follows the send, so it can land before, between or after the lines the handler writes on the
+/// stuck thread; the importer joins it to its `*** FREEZE` by number whichever order they came in.
+/// An unsent probe writes nothing: no `*** FREEZE` exists for a leg to belong to, and the number is
+/// reused by the next probe. Without a leg (the loop has not entered one) nothing is written
+/// either: there is no word to write.
+fn answer_probe(
+    crash_log: &std::path::Path,
+    seq: u32,
+    ms: u64,
+    leg: Option<LoopPhase>,
+    send: impl FnOnce(u32) -> bool,
+) -> (bool, String) {
+    let sent = send(seq);
+    if let (true, Some(leg)) = (sent, leg) {
+        let _ = crate::eventlog::append_record(crash_log, &freeze_at_record(seq, leg));
+    }
+    let at = leg.map(|leg| format!(" in {}", leg.word())).unwrap_or_default();
+    (sent, format!("main-thread freeze: {ms}ms without loop progress{at} (probe {seq}, recorded={sent})"))
+}
+
+fn observe_loop(#[cfg(feature = "threadcheck")] log_only: bool) {
     let origin = Instant::now();
     let mut freezes = Freezes::default();
     // The probe whose recovery this thread must write down: set only when the probe was really
@@ -639,11 +849,13 @@ fn observe_loop(main_thread: usize, #[cfg(feature = "threadcheck")] log_only: bo
         let event = detector.observe(now, progress, label);
         match freezes.observe(now, progress, SIGNALS.foreground.load(Ordering::Acquire)) {
             Some(FreezeEvent::Probe { seq, ms }) => {
-                let sent = probe_main_thread(main_thread, seq);
+                let crash_log = crate::paths::in_runtime_dir(crate::paths::runtime_file::CRASH);
+                let (sent, line) =
+                    answer_probe(&crash_log, seq, ms, current_leg(), |seq| probe_loop(&SIGNALS.loop_thread, seq));
                 if !sent {
                     freezes.unsent();
                 }
-                crate::eventlog::log(&format!("main-thread freeze: {ms}ms without loop progress (probe {seq}, recorded={sent})"));
+                crate::eventlog::log(&line);
                 probed = sent.then_some(seq);
             }
             Some(FreezeEvent::Recovered { seq, ms }) => {
@@ -676,8 +888,9 @@ fn observe_loop(main_thread: usize, #[cfg(feature = "threadcheck")] log_only: bo
                 // stale sample; the next poll will rebase and discard its warning as well.
                 let sample_age = origin.elapsed().as_millis().saturating_sub(now as u128);
                 if sample_age <= MAX_POLL_GAP_MS as u128 && SIGNALS.progress() == progress {
-                    let rc = unsafe { libc::pthread_kill(main_thread as libc::pthread_t, libc::SIGABRT) };
-                    if rc != 0 { crate::eventlog::log(&format!("main-thread hang: pthread_kill failed: {rc}")); }
+                    // A disarmed loop has nobody to abort: `with` runs nothing.
+                    let rc = SIGNALS.loop_thread.with(|thread| unsafe { libc::pthread_kill(thread as libc::pthread_t, libc::SIGABRT) });
+                    if let Some(rc) = rc.filter(|rc| *rc != 0) { crate::eventlog::log(&format!("main-thread hang: pthread_kill failed: {rc}")); }
                 }
             }
         }
@@ -1227,6 +1440,164 @@ mod tests {
     }
 
     #[test]
+    fn every_loop_leg_has_one_single_token_word_and_round_trips() {
+        let mut seen = std::collections::HashSet::new();
+        for (i, leg) in LoopPhase::ALL.into_iter().enumerate() {
+            let word = leg.word();
+            assert!(!word.is_empty() && word.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'), "{word:?}");
+            assert!(seen.insert(word), "{word:?} names two legs");
+            assert_eq!(LoopPhase::from_word(word), Some(leg));
+            assert_eq!(leg as usize, i, "the leg cell's code is the position in ALL");
+        }
+        for not_a_leg in ["", "unlabeled", "event ingest", "Update", "update ", "7"] {
+            assert_eq!(LoopPhase::from_word(not_a_leg), None, "{not_a_leg:?}");
+        }
+    }
+
+    #[test]
+    fn the_leg_record_names_the_probe_and_a_fixed_word() {
+        assert_eq!(freeze_at_record(3, LoopPhase::Update), "freeze-at: seq=3 leg=update");
+        assert_eq!(freeze_at_record(1, LoopPhase::PresentAndSwap), "freeze-at: seq=1 leg=present-and-swap");
+    }
+
+    #[test]
+    fn entering_a_leg_publishes_it_to_the_cell_in_every_build() {
+        let cell: &'static AtomicU8 = Box::leak(Box::new(AtomicU8::new(NO_LEG)));
+        let mut legs = LoopPhases::on(cell);
+        assert_eq!(leg_of(cell.load(Ordering::Relaxed)), None, "no leg before the first mark");
+        legs.enter(LoopPhase::Update);
+        assert_eq!(leg_of(cell.load(Ordering::Relaxed)), Some(LoopPhase::Update));
+        legs.enter(LoopPhase::PresentAndSwap);
+        assert_eq!(leg_of(cell.load(Ordering::Relaxed)), Some(LoopPhase::PresentAndSwap));
+        for leg in LoopPhase::ALL {
+            legs.enter(leg);
+            assert_eq!(leg_of(cell.load(Ordering::Relaxed)), Some(leg));
+        }
+        assert_eq!(leg_of(200), None, "a code outside the table names no leg");
+    }
+
+    fn private_cell() -> &'static AtomicU8 {
+        Box::leak(Box::new(AtomicU8::new(NO_LEG)))
+    }
+
+    #[test]
+    fn each_named_loop_span_publishes_its_leg_for_its_duration_and_restores_the_enclosing_one() {
+        let cell = private_cell();
+        let mut legs = LoopPhases::on(cell);
+        legs.enter(LoopPhase::Results);
+        for (name, leg) in [
+            ("scen", LoopPhase::DevScenarios),
+            ("pump", LoopPhase::PlaybackPump),
+            ("land", LoopPhase::LandResults),
+            ("dframe", LoopPhase::DispatcherFrame),
+        ] {
+            let scope = span_leg_on(cell, name);
+            assert!(scope.is_some(), "{name} names a leg");
+            assert_eq!(leg_of(cell.load(Ordering::Relaxed)), Some(leg), "inside {name}");
+            drop(scope);
+            assert_eq!(leg_of(cell.load(Ordering::Relaxed)), Some(LoopPhase::Results), "after {name}");
+        }
+    }
+
+    #[test]
+    fn a_span_before_the_first_leg_restores_none_yet() {
+        let cell = private_cell();
+        let scope = span_leg_on(cell, "pump");
+        assert_eq!(leg_of(cell.load(Ordering::Relaxed)), Some(LoopPhase::PlaybackPump));
+        drop(scope);
+        assert_eq!(leg_of(cell.load(Ordering::Relaxed)), None);
+    }
+
+    #[test]
+    fn a_span_that_names_no_leg_leaves_the_cell_alone_even_nested_inside_one_that_does() {
+        let cell = private_cell();
+        LoopPhases::on(cell).enter(LoopPhase::Update);
+        for name in ["", "text", "dpre", "feed", "results", "update", "sfv"] {
+            assert!(span_leg_on(cell, name).is_none(), "{name:?}");
+            assert_eq!(leg_of(cell.load(Ordering::Relaxed)), Some(LoopPhase::Update), "{name:?}");
+        }
+        let outer = span_leg_on(cell, "dframe");
+        assert!(span_leg_on(cell, "dstep").is_none());
+        assert_eq!(leg_of(cell.load(Ordering::Relaxed)), Some(LoopPhase::DispatcherFrame));
+        {
+            let inner = span_leg_on(cell, "land");
+            assert_eq!(leg_of(cell.load(Ordering::Relaxed)), Some(LoopPhase::LandResults));
+            drop(inner);
+        }
+        assert_eq!(leg_of(cell.load(Ordering::Relaxed)), Some(LoopPhase::DispatcherFrame), "the inner span restores the outer's leg");
+        drop(outer);
+        assert_eq!(leg_of(cell.load(Ordering::Relaxed)), Some(LoopPhase::Update));
+    }
+
+    #[test]
+    fn a_panic_unwinding_out_of_a_span_restores_the_enclosing_leg() {
+        let cell = private_cell();
+        LoopPhases::on(cell).enter(LoopPhase::Results);
+        let inside = std::cell::Cell::new(None);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _scope = span_leg_on(cell, "pump");
+            inside.set(leg_of(cell.load(Ordering::Relaxed)));
+            panic!("a leg that panics");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(inside.get(), Some(LoopPhase::PlaybackPump), "the span named its leg before it unwound");
+        assert_eq!(leg_of(cell.load(Ordering::Relaxed)), Some(LoopPhase::Results));
+    }
+
+    #[test]
+    fn the_default_legs_publish_to_the_process_cell_the_observer_reads() {
+        // `diag::spans`' process-cell test restores the cell it found, which can be "none yet":
+        // under the same lock that cannot land between this store and the read.
+        let _lock = crate::testlock::serial();
+        LoopPhases::default().enter(LoopPhase::Navcommit);
+        // Other tests may enter a leg too, so only "a leg is published" is stable here; which
+        // one is the private-cell test's business.
+        assert!(current_leg().is_some());
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        // `process_dir` replaces the directory on every call: made once, or a parallel test's
+        // call would remove another's file between its write and its read.
+        static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+        let path = DIR.get_or_init(|| crate::testscratch::process_dir("freeze-at")).join(name);
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn a_probe_that_was_sent_writes_the_leg_record_and_names_the_leg_in_the_log_line() {
+        let log = scratch("sent");
+        let (sent, line) = answer_probe(&log, 2, 5_000, Some(LoopPhase::PresentAndSwap), |seq| {
+            assert_eq!(seq, 2);
+            true
+        });
+        assert!(sent);
+        assert_eq!(
+            line,
+            "main-thread freeze: 5000ms without loop progress in present-and-swap (probe 2, recorded=true)"
+        );
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "freeze-at: seq=2 leg=present-and-swap\n");
+    }
+
+    #[test]
+    fn a_probe_that_was_not_sent_writes_no_record_but_the_line_still_names_the_leg() {
+        let log = scratch("unsent");
+        let (sent, line) = answer_probe(&log, 1, 6_100, Some(LoopPhase::Update), |_| false);
+        assert!(!sent);
+        assert_eq!(line, "main-thread freeze: 6100ms without loop progress in update (probe 1, recorded=false)");
+        assert!(!log.exists(), "an unsent probe has no `*** FREEZE` for a leg to belong to");
+    }
+
+    #[test]
+    fn a_probe_before_any_leg_was_entered_names_none() {
+        let log = scratch("noleg");
+        let (sent, line) = answer_probe(&log, 1, 5_000, None, |_| true);
+        assert!(sent);
+        assert_eq!(line, "main-thread freeze: 5000ms without loop progress (probe 1, recorded=true)");
+        assert!(!log.exists(), "no leg, no record: nothing is written that names nothing");
+    }
+
+    #[test]
     fn the_probe_is_not_sent_where_no_handler_is_installed() {
         // The test harness installs no tracer, so SIGUSR2 has its default (fatal) disposition and
         // sending it would kill this test process. Sending nothing is the behaviour under test.
@@ -1235,4 +1606,60 @@ mod tests {
         assert_eq!(plx_freeze_seq.load(Ordering::Acquire), 0, "an unsent probe arms nothing");
     }
 
+    fn this_thread() -> usize {
+        unsafe { libc::pthread_self() as usize }
+    }
+
+    #[test]
+    fn a_disarmed_loop_thread_is_never_signalled() {
+        let loop_thread = LoopThread::new();
+        assert!(!loop_thread.armed());
+        let mut sent = false;
+        assert_eq!(loop_thread.with(|_| sent = true), None);
+        assert!(!sent, "nothing runs against a loop that was never armed");
+        assert!(!probe_loop(&loop_thread, 1), "and a probe is reported unsent");
+        loop_thread.arm();
+        assert!(loop_thread.armed());
+        loop_thread.disarm();
+        assert!(!loop_thread.armed());
+        assert_eq!(loop_thread.with(|_| sent = true), None);
+        assert!(!sent, "a disarmed loop is not signalled either");
+    }
+
+    #[test]
+    fn arming_captures_the_calling_thread_and_a_second_arm_recaptures() {
+        let loop_thread = std::sync::Arc::new(LoopThread::new());
+        loop_thread.arm();
+        assert_eq!(loop_thread.with(|thread| thread), Some(this_thread()));
+        let later = std::sync::Arc::clone(&loop_thread);
+        let theirs = std::thread::Builder::new().spawn(move || {
+            later.arm();
+            this_thread()
+        }).unwrap().join().unwrap();
+        assert_ne!(theirs, this_thread(), "the two threads are two ids");
+        assert_eq!(loop_thread.with(|thread| thread), Some(theirs),
+            "an arm from a new loop thread replaces the id of the one that ended");
+    }
+
+    #[test]
+    fn disarm_cannot_return_while_a_signal_is_in_flight() {
+        let loop_thread = LoopThread::new();
+        loop_thread.arm();
+        let held = loop_thread.with(|_| loop_thread.0.try_lock().is_err());
+        assert_eq!(held, Some(true),
+            "the slot is held for the whole send, so `disarm` waits for it and none follows it");
+        assert!(loop_thread.0.try_lock().is_ok(), "and is free again once the send ends");
+    }
+
+    #[test]
+    fn the_process_watchdog_arms_disarms_and_rearms() {
+        let _serial = crate::testlock::serial();
+        disarm();
+        assert!(!is_armed());
+        arm();
+        assert!(is_armed());
+        assert_eq!(SIGNALS.loop_thread.with(|thread| thread), Some(this_thread()));
+        disarm();
+        assert!(!is_armed(), "disarmed before a hosted stop is reported");
+    }
 }

@@ -1,4 +1,4 @@
-//! The `hostsim` stand-in for `src/starfish.c` — the television's media seam, absent.
+//! The `sim` stand-in for `src/starfish.c` — the television's media seam, absent.
 //!
 //! This file has two behaviours and the default is still the honest failure.
 //!
@@ -54,17 +54,18 @@
 //! callback ([`Clock::tick`]), so a film whose audio outlasts its video ends here as on the
 //! television instead of hanging at the video tail. Cleared wherever the fed timeline restarts.
 //!
-//! It reports [`VP_EXPORTED`](plx_platform::tv::sink::VP_EXPORTED), the webOS 5+ path, because that
+//! It reports [`VP_EXPORTED`](plx_os::tv::sink::VP_EXPORTED), the webOS 5+ path, because that
 //! one binds video through an exported window id and never touches ACB — so the whole ACB stage
 //! sequence stays skipped rather than faked.
 //!
 //! # How it is reached
 //!
 //! The verbs below are private; [`HostSink`] is the simulator's own `tv::sink::VideoSink`, one
-//! method per verb, installed by `port.rs` for the `hostsim` build (the application builds it in
+//! method per verb, held by the desktop platform crate's `SERVICES` (`platform-desktop/src/lib.rs`) for the `sim` build (the application builds it in
 //! `app::adapters::hostsim`, with the simulator's picture) and returned directly by the media
 //! tests' composition (`player::test_physical`) and the application's (`app::adapters::backends`)
-//! in the hostsim tests. The `*_for_test` hooks stay here, next to the statics
+//! in the hostsim tests. It is compiled for the simulator (`sim`) and for every test build (`cfg(test)`, or a
+//! dependent that enables `test-support`), so the tests that need it run in the default pass. The `*_for_test` hooks stay here, next to the statics
 //! they touch, and the tests reach them as `plx_play_feed::ffi_host::<hook>` (media does not re-export
 //! this module).
 //!
@@ -80,8 +81,8 @@
 //! sets, so no event can precede them.
 
 use plx_base::task::MainThread;
-use plx_platform::tv::plane::{CompletionQueue, PlaneCompletion};
-use plx_platform::tv::sink::{DisplaySink, PlaneFinish, PlaneUnload, VideoSink};
+use plx_os::tv::plane::{CompletionQueue, PlaneCompletion};
+use plx_os::tv::sink::{DisplaySink, PlaneFinish, PlaneUnload, VideoSink};
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_long, c_uint};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering::Relaxed};
@@ -165,6 +166,10 @@ fn frames() -> Option<&'static dyn FrameSink> {
 const FEED_ERROR: c_char = b'e' as c_char;
 /// `sf_feed`'s acceptance code.
 const FEED_OK: c_char = b'O' as c_char;
+/// `sf_feed`'s backpressure code. Only a test makes the sink answer it, for one lane
+/// ([`refuse_feed_lane_for_test`]); the pump keeps the AU and retries on its next pass.
+#[cfg(any(test, feature = "test-support"))]
+const FEED_BUFFER_FULL: c_char = b'B' as c_char;
 
 /// How often the sink reports a position, milliseconds.
 ///
@@ -193,9 +198,15 @@ static FORCE_PLAY_RESULT: AtomicI32 = AtomicI32::new(i32::MIN);
 static PLAY_CALLS: AtomicU64 = AtomicU64::new(0);
 #[cfg(any(test, feature = "test-support"))]
 static FORCE_PAUSE_RESULT: AtomicI32 = AtomicI32::new(i32::MIN);
+/// The `clocksink` thread skips its ticks ([`hush_ticker_for_test`]).
+#[cfg(any(test, feature = "test-support"))]
+static TICKER_HUSHED: AtomicBool = AtomicBool::new(false);
+/// The lane `sf_feed` answers `BufferFull` for ([`refuse_feed_lane_for_test`]); `i32::MIN` is none.
+#[cfg(any(test, feature = "test-support"))]
+static FEED_REFUSED_LANE: AtomicI32 = AtomicI32::new(i32::MIN);
 /// The host pipeline's volume (`setVolume`); a fresh pipeline starts at `PIPELINE_DEFAULT_VOLUME`.
 #[cfg(any(test, feature = "test-support"))]
-static HOST_VOLUME: AtomicI32 = AtomicI32::new(plx_platform::tv::sink::PIPELINE_DEFAULT_VOLUME);
+static HOST_VOLUME: AtomicI32 = AtomicI32::new(plx_os::tv::sink::PIPELINE_DEFAULT_VOLUME);
 /// Every Play / Pause / `set_volume(n)` the sink saw, in order, as `"play"`, `"pause"`,
 /// `"volume:n"`: what a test reads to prove the paused preroll mutes BEFORE its Play and restores
 /// AFTER its re-pause. Cleared by [`reset_volume_probe_for_test`].
@@ -734,6 +745,8 @@ pub fn reset_native_lifecycle_for_test() {
     OBJECT_READY.store(false, Relaxed);
     LOADED.store(false, Relaxed);
     LOAD_IN_FLIGHT.store(false, Relaxed);
+    TICKER_HUSHED.store(false, Relaxed);
+    FEED_REFUSED_LANE.store(i32::MIN, Relaxed);
     IN_FLIGHT_CALLS.store(0, Relaxed);
     *IN_FLIGHT_VERB.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *HOLD_LOAD.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
@@ -753,6 +766,22 @@ pub fn clock_run_for_test(base_ns: i64) {
     FED_MAX_NS.store(i64::MAX / 2, Relaxed);
     RESUMED_AT_MS.store(now_ms(), Relaxed);
     PLAYING.store(true, Relaxed);
+}
+/// Silence the host's own `clocksink` position thread (it reports at the device's cadence whenever
+/// the clock plays, on real time, whatever a test does): from here only [`tick_for_test`] makes a
+/// position callback, so a test owns every callback and its stamp. With it hushed and no
+/// `tick_for_test`, the pipeline reports nothing while the application still believes it plays,
+/// as when a link dies under it. Cleared by [`reset_native_lifecycle_for_test`]. Test-only.
+#[cfg(any(test, feature = "test-support"))]
+pub fn hush_ticker_for_test(on: bool) {
+    TICKER_HUSHED.store(on, Relaxed);
+}
+/// Make the host sink answer `BufferFull` to every AU of one lane (`es_data`: 1 video, 2 audio), as
+/// a pipeline that has stopped taking that lane does, so its AU queue is not drained. `None`
+/// restores the sink. Cleared by [`reset_native_lifecycle_for_test`]. Test-only.
+#[cfg(any(test, feature = "test-support"))]
+pub fn refuse_feed_lane_for_test(es_data: Option<c_int>) {
+    FEED_REFUSED_LANE.store(es_data.unwrap_or(i32::MIN), Relaxed);
 }
 /// The sink clock's position and whether it is running. Test-only.
 #[cfg(any(test, feature = "test-support"))]
@@ -881,6 +910,10 @@ impl Clock {
             .name("clocksink".into())
             .spawn(|| loop {
                 std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
+                #[cfg(any(test, feature = "test-support"))]
+                if TICKER_HUSHED.load(Relaxed) {
+                    continue;
+                }
                 Clock::tick();
             });
         if spawned.is_err() {
@@ -1140,6 +1173,9 @@ unsafe fn sf_feed(p: *const u8, size: c_uint, pts: i64, es_data: c_int) -> c_cha
         if feeds.len() < FEED_LOG_ROOM {
             feeds.push((es_data, pts));
         }
+        if FEED_REFUSED_LANE.load(Relaxed) == es_data {
+            return FEED_BUFFER_FULL;
+        }
     }
     if es_data == 1 {
         FED_MAX_NS.fetch_max(pts, Relaxed);
@@ -1239,9 +1275,9 @@ unsafe fn sf_quarantine() {
 /// rather than faked. Faking ACB would mean modelling a bind order this file cannot verify.
 unsafe fn vp_mode() -> c_int {
     if enabled() {
-        plx_platform::tv::sink::VP_EXPORTED
+        plx_os::tv::sink::VP_EXPORTED
     } else {
-        plx_platform::tv::sink::VP_NONE
+        plx_os::tv::sink::VP_NONE
     }
 }
 unsafe fn vp_create_window() -> *const c_char {
@@ -1373,6 +1409,10 @@ impl HostSink {
 }
 
 impl VideoSink for HostSink {
+    /// The host decodes nothing unless the clock sink is armed (`plxnative-clocksink`), so a refused
+    /// `Load` is the seam being absent. Read fresh, like the trigger itself: the test arming
+    /// (`force_clocksink_for_test`) is a separate, in-process switch that does not change it.
+    fn lacks_video_path(&self) -> bool { !plx_base::devtrig::flag("clocksink") }
     fn no_object_proof(&self, _: &MainThread) -> bool {
         // NativeStop joins the Load worker before asking. A refused host Load never wrote an
         // object, callback epoch or loaded state. A prior quarantine clears OBJECT_READY too,
@@ -1432,7 +1472,7 @@ impl VideoSink for HostSink {
     ) -> c_char {
         sf_feed(p, size, pts, es_data)
     }
-    unsafe fn unload(&self, _: &plx_platform::tv::sink::UnloadTicket) {
+    unsafe fn unload(&self, _: &plx_os::tv::sink::UnloadTicket) {
         sf_unload()
     }
     unsafe fn callback_gate_retire(&self, _: &MainThread) -> c_int {
@@ -1556,7 +1596,7 @@ pub(crate) mod test_sink {
 mod tests {
     use super::*;
 
-    /// The seam state is process-global and the engine's hostsim tests drive the same atomics.
+    /// The seam state is process-global and the engine's tests drive the same atomics.
     /// Use the crate-wide lock rather than a module-local mutex: two different locks made both
     /// suites individually serial while still allowing them to overwrite `FED_MAX_NS` together.
     fn lock() -> plx_base::testlock::Serial {

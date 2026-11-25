@@ -46,6 +46,7 @@ use plx_machine::machine::{
     Canon, Cx, Delivery, Edge, Effects, EntryId, FocusKey, Fx, GroupId, Handled, InputEvent, InputKind, InputOwner, InstanceId, Key, LogicalState,
     Machine, MachineId, TextEdit, NavOp,
 };
+use plx_ui::a11y::{A11y, A11yPath, Role, Seg};
 use plx_ui::decision_prompt::{DecisionPrompt, PromptStep};
 use plx_ui::follow_copy::{FollowCopy, LandscapePicture};
 use plx_ui::text_buffer::TextBuffer;
@@ -55,10 +56,14 @@ use plx_ui::route_screen::RouteLayout;
 use plx_ui::screen::{At, Dir, DrawFrame, Enter, Focusable, FocusSource, FocusTarget, GroupSpec, HitSource, Placed, RenderStrategy, Screen, ScreenEvent, Step};
 use plx_ui::table::Row;
 use plx_ui::table_screen::{Header, TableScreen};
-use plx_ui::{consts, theme, Rect};
+use plx_ui::{consts, Rect};
 
 use super::family::{form_activate, form_focus, form_right_target, InnerHost, SettingsPage, ALERT_GROUP};
+use plx_ui::decision_alert::AlertAnswers;
 use super::registry::{word, AppFx, HudCmd, ALERT, BAND};
+
+/// The install prompt's two answers as an accessibility id names them: `alert.cancel` and `alert.install`.
+const INSTALL_ANSWERS: AlertAnswers = AlertAnswers::new(ALERT_GROUP, ALERT, ALERT + 1, "cancel", "install");
 
 /// What the Bridge publishes to the page: the store's listing at one moment.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -126,7 +131,8 @@ enum HudAction {
 /// Row keys: a package's position, then the removals and the drop files in their own ranges.
 const REMOVE_KEY: u32 = 0x1000;
 const DROP_KEY: u32 = 0x2000;
-const ADDRESS_KEY: u32 = 0x3000;
+/// The *Install from address* row's focus key (`FocusKey::elem`).
+pub const ADDRESS_KEY: u32 = 0x3000;
 const END_TIME_KEY: u32 = 0x5000;
 
 /// What the open prompt asks about.
@@ -209,7 +215,7 @@ pub struct HudPage {
 /// The crumb over the title: the page this one is pushed from, Video & playback (the Playback page's Player HUD row
 /// opens it), as `PickerKind::parent_title` names it for a picker on that page.
 fn parent_title() -> &'static str {
-    plx_platform::i18n::msg::settings_playback_title()
+    plx_os::i18n::msg::settings_playback_title()
 }
 
 /// The package row's name: the built-in is "Built-in" (the app's own word for itself, and the one string its row says),
@@ -217,17 +223,17 @@ fn parent_title() -> &'static str {
 fn name_of(entry: &Entry) -> String {
     match &entry.meta {
         Some(meta) => meta.name.clone(),
-        None => plx_platform::i18n::msg::settings_hud_builtin().to_owned(),
+        None => plx_os::i18n::msg::settings_hud_builtin().to_owned(),
     }
 }
 
 /// Why `unloadable` says this package cannot run, in the viewer's words.
 fn unloadable_text(why: Unloadable) -> &'static str {
     match why {
-        Unloadable::NewerFormat => plx_platform::i18n::msg::settings_hud_newer_format(),
-        Unloadable::OlderFormat => plx_platform::i18n::msg::settings_hud_older_format(),
-        Unloadable::Revoked => plx_platform::i18n::msg::settings_hud_revoked(),
-        Unloadable::AppRange => plx_platform::i18n::msg::settings_hud_app_range(),
+        Unloadable::NewerFormat => plx_os::i18n::msg::settings_hud_newer_format(),
+        Unloadable::OlderFormat => plx_os::i18n::msg::settings_hud_older_format(),
+        Unloadable::Revoked => plx_os::i18n::msg::settings_hud_revoked(),
+        Unloadable::AppRange => plx_os::i18n::msg::settings_hud_app_range(),
     }
 }
 
@@ -235,28 +241,28 @@ fn unloadable_text(why: Unloadable) -> &'static str {
 fn refusal_text(why: Refusal) -> &'static str {
     match why {
         Refusal::Unloadable(why) => unloadable_text(why),
-        Refusal::AlreadyInstalled | Refusal::NotNewer => plx_platform::i18n::msg::settings_hud_already(),
-        Refusal::Invalid => plx_platform::i18n::msg::settings_hud_not_a_hud(),
-        Refusal::TooLarge => plx_platform::i18n::msg::settings_hud_too_large(),
-        Refusal::BuiltinId | Refusal::Changed => plx_platform::i18n::msg::settings_hud_cant_install(),
+        Refusal::AlreadyInstalled | Refusal::NotNewer => plx_os::i18n::msg::settings_hud_already(),
+        Refusal::Invalid => plx_os::i18n::msg::settings_hud_not_a_hud(),
+        Refusal::TooLarge => plx_os::i18n::msg::settings_hud_too_large(),
+        Refusal::BuiltinId | Refusal::Changed => plx_os::i18n::msg::settings_hud_cant_install(),
     }
 }
 
 /// Why a fetch from an address brought nothing, in the viewer's words.
 fn fetch_text(why: FetchError) -> &'static str {
     match why {
-        FetchError::NotFound => plx_platform::i18n::msg::settings_hud_fetch_not_found(),
-        FetchError::TooLarge => plx_platform::i18n::msg::settings_hud_too_large(),
-        FetchError::Unreachable => plx_platform::i18n::msg::settings_hud_fetch_unreachable(),
-        FetchError::Certificate => plx_platform::i18n::msg::settings_hud_fetch_certificate(),
+        FetchError::NotFound => plx_os::i18n::msg::settings_hud_fetch_not_found(),
+        FetchError::TooLarge => plx_os::i18n::msg::settings_hud_too_large(),
+        FetchError::Unreachable => plx_os::i18n::msg::settings_hud_fetch_unreachable(),
+        FetchError::Certificate => plx_os::i18n::msg::settings_hud_fetch_certificate(),
     }
 }
 
 /// Why the typed address was refused: the accepted forms, or the one rule a plain `http://` address broke.
 fn address_text(why: AddressError) -> &'static str {
     match why {
-        AddressError::HttpNotPrivate => plx_platform::i18n::msg::settings_hud_address_lan(),
-        _ => plx_platform::i18n::msg::settings_hud_address_form(),
+        AddressError::HttpNotPrivate => plx_os::i18n::msg::settings_hud_address_lan(),
+        _ => plx_os::i18n::msg::settings_hud_address_form(),
     }
 }
 
@@ -287,14 +293,14 @@ fn why_of(entry: &Entry, list: &HudList) -> Option<Why> {
 fn why_value(why: Why, list: &HudList) -> String {
     match why {
         Why::Format(why) => unloadable_text(why).to_owned(),
-        Why::Language => plx_platform::i18n::msg::settings_hud_unfit_language(&list.language),
+        Why::Language => plx_os::i18n::msg::settings_hud_unfit_language(&list.language),
     }
 }
 
 /// What the line under the title says while the row of a HUD that cannot be used has focus: why, and what to do. A
 /// withdrawn HUD adds the catalog's own reason when it gave one.
 fn why_sentence(why: Why, list: &HudList, sha: Option<Sha>) -> String {
-    use plx_platform::i18n::msg;
+    use plx_os::i18n::msg;
     match why {
         Why::Format(Unloadable::Revoked) => {
             let said = msg::settings_hud_withdrawn_detail();
@@ -327,12 +333,12 @@ fn facts_of(entry: &Entry, list: &HudList) -> Vec<String> {
     let mut facts = Vec::new();
     match entry.trust {
         Trust::BuiltIn | Trust::Registry => {}
-        Trust::Unreviewed => facts.push(plx_platform::i18n::msg::settings_hud_unreviewed().to_owned()),
+        Trust::Unreviewed => facts.push(plx_os::i18n::msg::settings_hud_unreviewed().to_owned()),
     }
     // The reason a package cannot be used outranks "installed until restart": the value column and a second fact do
     // not both fit a row in every language.
     if entry.until_restart && why_of(entry, list).is_none() {
-        facts.push(plx_platform::i18n::msg::settings_hud_until_restart().to_owned());
+        facts.push(plx_os::i18n::msg::settings_hud_until_restart().to_owned());
     }
     facts
 }
@@ -344,7 +350,7 @@ type Says = Vec<(HudId, String)>;
 /// one, and the drop files under their own header when there are any. Beside them, the sentence each row that has
 /// one of its own says while it has focus.
 fn hud_form(list: &HudList, draft: Option<&TextBuffer>, saving_end_time: bool) -> (Form<HudId, HudAction, SettingsPage>, Says) {
-    use plx_platform::i18n::msg;
+    use plx_os::i18n::msg;
     let mut says = Says::new();
     let mut packs = FormSection::new("");
     let mut removals = FormSection::new("");
@@ -399,7 +405,10 @@ fn hud_form(list: &HudList, draft: Option<&TextBuffer>, saving_end_time: bool) -
                 }));
             }
         }
-        folder = folder.item_keyed(id, RowKey(DROP_KEY + i as u32), RowKind::Button, action, row).disabled(file.status.is_err());
+        // The store installs a drop file only when it is idle, and refuses in silence: while a fetch, a held offer or
+        // any other package work runs, the row takes no OK, as the removal rows and the address row do not.
+        folder = folder.item_keyed(id, RowKey(DROP_KEY + i as u32), RowKind::Button, action, row)
+            .disabled(file.status.is_err() || list.fetching || list.package_busy);
     }
     let gallery = FormSection::new("").item_keyed(HudId::Browse, RowKey(0x4000), RowKind::Nav(SettingsPage::HudGallery), HudAction::Inert,
         Row::new(msg::settings_hud_browse()));
@@ -421,14 +430,14 @@ fn notice_text(list: &HudList, refused: Option<AddressError>) -> Option<String> 
     match &list.notice {
         Some(Notice::Refused { reason, .. }) => Some(refusal_text(*reason).to_owned()),
         Some(Notice::FetchFailed { reason }) => Some(fetch_text(*reason).to_owned()),
-        Some(Notice::NotWritten { .. }) => Some(plx_platform::i18n::msg::settings_hud_not_saved().to_owned()),
+        Some(Notice::NotWritten { .. }) => Some(plx_os::i18n::msg::settings_hud_not_saved().to_owned()),
         _ => None,
     }
 }
 
 /// What the line under the title says: the last notice, else what the page is.
 fn copy_of(list: &HudList, refused: Option<AddressError>) -> String {
-    notice_text(list, refused).unwrap_or_else(|| plx_platform::i18n::msg::settings_hud_copy().to_owned())
+    notice_text(list, refused).unwrap_or_else(|| plx_os::i18n::msg::settings_hud_copy().to_owned())
 }
 
 /// What a page builds from the listing.
@@ -449,7 +458,7 @@ impl HudPage {
             page: SettingsPage::PlayerHud,
             title: String::new(),
             parent: String::new(),
-            form: { let mut form = FormTable::new(BAND); form.table.set_empty_text(Some("")); form },
+            form: { let mut form = FormTable::page(BAND); form.table.set_empty_text(Some("")); form },
             state: State { end_time: None, saving_end_time: false, selected: 0, rows: 0, notice: 0, confirming: false, affirmative: false, alert_scroll: 0, editing: false, fetching: false, kind: 0, scene: 0, visible: false, suspended: false, pending_select_focus: false, registry_request: false, provisional: true },
             list: HudList::default(),
             copy: String::new(),
@@ -469,8 +478,8 @@ impl HudPage {
                 ALERT_GROUP,
                 ALERT,
                 ALERT + 1,
-                plx_platform::i18n::msg::settings_cancel_c(),
-                plx_platform::i18n::msg::settings_hud_install_c(),
+                plx_os::i18n::msg::settings_cancel_c(),
+                plx_os::i18n::msg::settings_hud_install_c(),
             ),
         };
         page.rebuild(None);
@@ -500,7 +509,7 @@ impl HudPage {
     /// The page's rows and words from the listing alone.
     fn gallery_form(&self) -> Built {
         // placeholder-exempt: Selects copy only; Header::with_pending_copy counts and sentinel-paints its loading read-out.
-        use plx_platform::i18n::msg;
+        use plx_os::i18n::msg;
         let mut rows = FormSection::new("");
         let mut says = Says::new();
         // the page's STATE (a delisted or withdrawn package, a catalog that could not refresh) is the
@@ -587,7 +596,7 @@ impl HudPage {
                 };
                 for (i, (label, value)) in [(msg::settings_hud_author(), package.author.clone()),
                     (msg::settings_hud_version(), package.version.clone()), (msg::settings_hud_license(), package.license.clone()),
-                    (msg::settings_hud_download(), format!("{} B", plx_platform::i18n::current().number(package.bytes as i64)))].into_iter().enumerate() {
+                    (msg::settings_hud_download(), format!("{} B", plx_os::i18n::current().number(package.bytes as i64)))].into_iter().enumerate() {
                     rows = rows.item_keyed(HudId::Fact(i as u32), RowKey(i as u32), RowKind::Button, HudAction::Inert,
                         Row::new(label).value(&value));
                 }
@@ -644,6 +653,21 @@ impl HudPage {
 
     fn is_preview(&self) -> bool { matches!(self.page, SettingsPage::HudPreview(..)) }
 
+    /// A full-screen preview control as an id names it: key 0 is Back (`back`), key `i + 1` the scene
+    /// `i` (`scene.<i>`, labelled with the scene's own word).
+    fn preview_a11y(&self, key: u32) -> A11y<'static> {
+        match key.checked_sub(1) {
+            None => A11y::new(A11yPath::new().name("back"), Role::Button),
+            Some(i) => {
+                let tab = A11y::new(A11yPath::new().name("scene").index(i as usize), Role::Tab);
+                match self.scenes().get(i as usize) {
+                    Some((label, _)) => tab.with_label(*label),
+                    None => tab,
+                }
+            }
+        }
+    }
+
     fn activate_preview(&mut self, key: u32, fx: &mut Effects<'_, InnerHost>) -> Handled {
         if key == 0 {
             fx.push(Fx::Nav(NavOp::Pop));
@@ -658,7 +682,7 @@ impl HudPage {
     }
 
     fn scenes(&self) -> Vec<(&'static str, &plx_data::hudpacks::catalog::Preview)> {
-        use plx_platform::i18n::msg;
+        use plx_os::i18n::msg;
         let Some(package) = self.package() else { return Vec::new() };
         let mut scenes = Vec::new();
         if let Some(art) = package.preview(&self.list.language_tag) { scenes.push((msg::settings_hud_compact(), art)); }
@@ -689,7 +713,7 @@ impl HudPage {
     }
 
     fn view(&self) -> TableScreen<'_> {
-        let header = Header::new(RouteLayout::settings_page(), Some(&self.parent), &self.title, &self.copy);
+        let header = Header::new(RouteLayout::screen(), Some(&self.parent), &self.title, &self.copy);
         // The gallery's loading read-out is the page's own copy, counted and sentinel-painted as one; any other
         // sentence follows focus.
         let header = if matches!(self.page, SettingsPage::HudGallery) && self.list.catalog.fetching && self.form.table.n_rows() == 0 {
@@ -732,9 +756,6 @@ impl HudPage {
         self.says = says;
         self.title = title;
         self.parent = parent;
-        self.form.table.compact = false;
-        self.form.table.board_metrics(true);
-        self.form.table.header_ink = theme::TEXT_READING;
         self.form.table.list_focused = true;
         self.form.set(form, keep.as_ref());
         self.state.fetching = self.list.fetching;
@@ -761,18 +782,36 @@ impl HudPage {
         }
     }
 
-    /// Open the two-answer prompt about `asking`: `paragraphs` under `question`, Cancel focused.
-    fn ask(&mut self, asking: Asking, question: &'static std::ffi::CStr, paragraphs: Vec<Cow<'static, str>>, fx: &mut Effects<'_, InnerHost>) {
+    /// The viewer opened the question on screen themselves (OK on a drop file), so it is theirs to answer.
+    fn holds_own_question(&self) -> bool {
+        matches!(self.asking, Some(Asking::Drop(_)))
+    }
+
+    /// Open the two-answer prompt about `asking`: `paragraphs` under `question`, Cancel focused. False when it did
+    /// not open.
+    ///
+    /// **Every question opens here, so what happens to one already open is decided here**: the viewer's own is never
+    /// replaced, and an offer's is (the store holds one offer, so the newer one is the only one an answer can name).
+    /// It used to assign `asking` whatever was open: an offer landing on a later tick took over a drop-file question
+    /// under the same title, and the viewer's answer installed or declined a package they had not been asked about.
+    /// A drop row is inert while the store is busy (`hud_form`), so that needs a listing a tick behind the store now.
+    fn ask(&mut self, asking: Asking, question: &'static std::ffi::CStr, paragraphs: Vec<Cow<'static, str>>, fx: &mut Effects<'_, InnerHost>) -> bool {
+        if self.holds_own_question() {
+            return false;
+        }
         self.asking = Some(asking);
         self.prompt.open_paragraphs(question, paragraphs);
         self.state.confirming = true;
         self.state.affirmative = false;
         self.state.alert_scroll = self.prompt.scroll_target_bits();
         self.focus(fx, ALERT_GROUP);
+        true
     }
 
     /// Ask about the package the store holds from an address when the listing brings a new one: its name and version,
     /// where it came from (and that a plain `http://` source is a development one), *Unreviewed*, and what installing does.
+    /// An offer that arrives behind the viewer's own question waits for its answer: it is not latched as asked until
+    /// its prompt has opened, so the first tick after the answer asks it.
     fn sync_offer(&mut self, fx: &mut Effects<'_, InnerHost>) {
         if !self.state.visible { return }
         let Some(offer) = self.list.offer.clone() else {
@@ -783,29 +822,32 @@ impl HudPage {
             matches!(self.page, SettingsPage::HudDetail(sha) if sha == offer.sha)
         } else { self.page == SettingsPage::PlayerHud };
         if !owns { return }
-        if self.offered == Some(offer.sha) {
+        if self.offered == Some(offer.sha) || self.holds_own_question() {
             return;
         }
-        self.offered = Some(offer.sha);
         if offer.source == plx_data::hudpacks::Source::Registry {
-            self.ask(Asking::Offer(offer.sha), plx_platform::i18n::msg::settings_hud_gallery_install_question_c(),
-                vec![Cow::Borrowed(plx_platform::i18n::msg::settings_hud_gallery_install_body())], fx);
+            if self.ask(Asking::Offer(offer.sha), plx_os::i18n::msg::settings_hud_gallery_install_question_c(),
+                vec![Cow::Borrowed(plx_os::i18n::msg::settings_hud_gallery_install_body())], fx) {
+                self.offered = Some(offer.sha);
+            }
             return;
         }
         let mut facts = Vec::new();
         if let Some(from) = &offer.from {
-            facts.push(plx_platform::i18n::msg::settings_hud_offer_from(from.host()));
+            facts.push(plx_os::i18n::msg::settings_hud_offer_from(from.host()));
             if from.dev_source() {
-                facts.push(plx_platform::i18n::msg::settings_hud_offer_dev().to_owned());
+                facts.push(plx_os::i18n::msg::settings_hud_offer_dev().to_owned());
             }
         }
-        facts.push(plx_platform::i18n::msg::settings_hud_unreviewed().to_owned());
+        facts.push(plx_os::i18n::msg::settings_hud_unreviewed().to_owned());
         let paragraphs = vec![
             Cow::Owned(format!("{} {}", offer.meta.name, offer.meta.version)),
             Cow::Owned(join(&facts)),
-            Cow::Borrowed(plx_platform::i18n::msg::settings_hud_offer_body()),
+            Cow::Borrowed(plx_os::i18n::msg::settings_hud_offer_body()),
         ];
-        self.ask(Asking::Offer(offer.sha), plx_platform::i18n::msg::settings_hud_install_question_c(), paragraphs, fx);
+        if self.ask(Asking::Offer(offer.sha), plx_os::i18n::msg::settings_hud_install_question_c(), paragraphs, fx) {
+            self.offered = Some(offer.sha);
+        }
     }
 
     /// Put the keyboard down (its text stays in the draft) and show the row as it is without it.
@@ -928,8 +970,8 @@ impl HudPage {
             Some(HudAction::Install(sha)) => {
                 self.ask(
                     Asking::Drop(sha),
-                    plx_platform::i18n::msg::settings_hud_install_question_c(),
-                    vec![Cow::Borrowed(plx_platform::i18n::msg::settings_hud_install_body())],
+                    plx_os::i18n::msg::settings_hud_install_question_c(),
+                    vec![Cow::Borrowed(plx_os::i18n::msg::settings_hud_install_body())],
                     fx,
                 );
             }
@@ -1052,10 +1094,12 @@ impl Machine<InnerHost> for HudPage {
                     }
                 }
                 let mut cycle = std::mem::take(&mut self.preview_cycle);
-                cycle.set_frames(&self.preview_frames());
+                if cycle.set_frames(&self.preview_frames()) {
+                    fx.invalidate(plx_machine::present::Provenance::Resource(plx_machine::present::ResourceKind::Texture));
+                }
                 cycle.tick(*t, self.preview_active(), &mut fx.present());
                 self.preview_cycle = cycle;
-                self.form.table.update(t.dt(), RouteLayout::settings_page().sectioned_table().h);
+                self.form.table.update(t.dt(), RouteLayout::screen().sectioned_table().h);
                 self.follow.update(t.dt());
                 Handled::Yes
             }
@@ -1080,7 +1124,7 @@ impl Machine<InnerHost> for HudPage {
                 Handled::No
             }
             ScreenEvent::FocusMoved { to, by, .. } => {
-                if matches!(by, plx_machine::machine::By::Dir | plx_machine::machine::By::Pointer) { self.state.provisional = false; }
+                if matches!(by, plx_machine::machine::By::Dir | plx_machine::machine::By::Pointer | plx_machine::machine::By::Script) { self.state.provisional = false; }
                 form_focus(&mut self.form, to.elem);
                 self.state.selected = self.form.key_at(self.form.table.sel.max(0) as usize).map_or(0, |k| k.0);
                 self.follow.follow(&self.sentence());
@@ -1151,6 +1195,46 @@ impl Focusable<InnerHost> for HudPage {
             None => Focusable::<InnerHost>::seat(&self.view(), g, from, cx),
         }
     }
+    // The full-screen preview answers its controls (`back`, `scene.<i>`); a prompt that is open answers
+    // its two answers ALONE (`alert.cancel`, `alert.install`), as `groups` lists them; any other page
+    // answers its table's rows.
+    fn a11y(&self, key: &u32, cx: &Cx<'_, InnerHost>) -> Option<A11y<'_>> {
+        if self.is_preview() {
+            return self.controls.as_ref().filter(|c| c.contains(*key)).map(|_| self.preview_a11y(*key));
+        }
+        if self.prompt.is_open() {
+            return INSTALL_ANSWERS.a11y(*key);
+        }
+        Focusable::<InnerHost>::a11y(&self.view(), key, cx).map(A11y::into_owned)
+    }
+    fn a11y_elems(&self, g: GroupId, cx: &Cx<'_, InnerHost>, out: &mut Vec<u32>) {
+        if self.is_preview() {
+            if let Some(controls) = self.controls.as_ref().filter(|_| g == GroupId(0)) {
+                out.extend(0..controls.len() as u32);
+            }
+            return;
+        }
+        if self.prompt.is_open() {
+            INSTALL_ANSWERS.elems(g, out);
+            return;
+        }
+        Focusable::<InnerHost>::a11y_elems(&self.view(), g, cx, out)
+    }
+    fn a11y_find(&self, path: &A11yPath, cx: &Cx<'_, InnerHost>) -> Option<u32> {
+        if self.is_preview() {
+            let controls = self.controls.as_ref()?;
+            let mut segs = path.segs();
+            return match (segs.next(), segs.next(), segs.next()) {
+                (Some(Seg::Name("back")), None, _) => Some(0),
+                (Some(Seg::Name("scene")), Some(Seg::Index(i)), None) if i + 1 < controls.len() => Some(i as u32 + 1),
+                _ => None,
+            };
+        }
+        if self.prompt.is_open() {
+            return INSTALL_ANSWERS.find(path);
+        }
+        Focusable::<InnerHost>::a11y_find(&self.view(), path, cx)
+    }
 }
 
 impl Screen<InnerHost> for HudPage {
@@ -1214,11 +1298,11 @@ impl Screen<InnerHost> for HudPage {
 /// The `(focus key, id)` of every row `list` shows, for a test: the page's own builder.
 #[cfg(test)]
 fn rows_for_test(list: &HudList) -> Vec<(u32, HudId)> {
-    let mut form: FormTable<HudId, HudAction, SettingsPage> = FormTable::new(BAND);
+    let mut form: FormTable<HudId, HudAction, SettingsPage> = FormTable::page(BAND);
     form.set(hud_form(list, None, false).0, None);
     (0..form.table.n_rows() as usize).filter_map(|i| Some((form.key_at(i)?.0, form.binding_at(i)?.id.clone()))).collect()
 }
 
 #[cfg(test)]
 #[path = "hud_settings_tests.rs"]
-mod tests;
+pub(crate) mod tests;

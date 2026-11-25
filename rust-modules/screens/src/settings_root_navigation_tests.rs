@@ -86,7 +86,8 @@ fn a_multi_user_root_toggles_automatically_sign_in_in_place() {
         },
         Some(row),
     );
-    step(&mut s, ScreenEvent::Activate(row.elem), Some(row));
+    let out = step(&mut s, ScreenEvent::Activate(row.elem), Some(row));
+    execute_storage_effects(&out);
     plx_base::storage_worker::drain_for_test();
     assert_eq!(
         name(&s),
@@ -98,7 +99,8 @@ fn a_multi_user_root_toggles_automatically_sign_in_in_place() {
         plx_plex::plex::session::peek().auto_sign_in(),
         "the queued switch is durable after the worker completes"
     );
-    step(&mut s, ScreenEvent::Activate(row.elem), Some(row));
+    let out = step(&mut s, ScreenEvent::Activate(row.elem), Some(row));
+    execute_storage_effects(&out);
     plx_base::storage_worker::drain_for_test();
     assert!(!plx_plex::plex::session::peek().auto_sign_in());
     assert_eq!(s.inner.depth(), 1);
@@ -541,7 +543,7 @@ fn session_refresh_rebuilds_root_without_navigation() {
     let _sess = multi_user_session("root-session-refresh");
     let saved = plx_plex::plex::session::peek();
     plx_plex::plex::session::install_transient_for_test(true);
-    let mut root = RootPage::new(EntryId(0), cx(None).views.directory);
+    let mut root = RootPage::new(EntryId(0), cx(None).views.directory, &crate::registry::capture_fixture());
     assert!(!root.form.index_of(&RootId::AutoSignIn).is_some());
     plx_plex::plex::session::save(&saved.with_auto_sign_in(true));
     let mut out = Vec::new();
@@ -558,8 +560,9 @@ fn session_refresh_keeps_optimistic_setting_through_transient_completion() {
     let _g = plx_base::testlock::serial();
     let _sess = multi_user_session("root-pending-refresh");
     let saved = plx_plex::plex::session::peek();
-    let mut root = RootPage::new(EntryId(0), cx(None).views.directory);
-    let ticket = plx_base::storage_worker::submit_retained(|| false);
+    let mut root = RootPage::new(EntryId(0), cx(None).views.directory, &crate::registry::capture_fixture());
+    let (reply, ticket) = std::sync::mpsc::channel();
+    reply.send(false).unwrap();
     plx_base::storage_worker::drain_for_test();
     root.pending_auto = Some((true, ticket));
     root.rebuild(cx(None).views.directory);
@@ -601,7 +604,7 @@ fn the_unencrypted_connection_switch_shows_the_grant_and_revokes_it_at_once() {
     plx_plex::plex::grant::mint(plx_plex::plex::grant::scope(), "lan-machine", &lan,
         &plx_plex::plex::grant::eligible_evidence_for_test()).unwrap();
 
-    let mut root = RootPage::new(EntryId(0), cx(None).views.directory);
+    let mut root = RootPage::new(EntryId(0), cx(None).views.directory, &crate::registry::capture_fixture());
     let row = root.form.index_of(&RootId::Plaintext(ServerMachineId("lan-machine".into())))
         .expect("an allowed server has its switch");
     let drawn = root.form.table.sections.iter().flat_map(|s| &s.rows).nth(row).unwrap();
@@ -613,7 +616,12 @@ fn the_unencrypted_connection_switch_shows_the_grant_and_revokes_it_at_once() {
     let mut out = Vec::new();
     let mut present = Present::new();
     let mut fx = Effects::new(&mut out, MachineId::Session, &mut present);
-    root.activate(root.form.key_at(row).unwrap().0, cx(None).views.directory, &mut fx);
+    let captured = cx(None);
+    {
+        let _step = plx_base::step::StepScope::enter();
+        root.activate(root.form.key_at(row).unwrap().0, captured.views.directory, &mut fx);
+    }
+    execute_storage_effects(&out);
     assert_eq!(plx_plex::plex::grant::granted_origin("lan-machine"), None, "revoked before the write lands");
     assert!(!plx_plex::plex::grant::allowed_under(plx_plex::plex::CredentialPolicy::HttpsOnly, &lan));
     assert_eq!(root.state.plaintext, vec![false], "the switch shows the answer optimistically");
@@ -631,7 +639,7 @@ fn the_unencrypted_connection_switch_shows_the_grant_and_revokes_it_at_once() {
 fn no_unencrypted_connection_section_without_an_answer() {
     let _g = plx_base::testlock::serial();
     let _sess = multi_user_session("root-plaintext-none");
-    let root = RootPage::new(EntryId(0), cx(None).views.directory);
+    let root = RootPage::new(EntryId(0), cx(None).views.directory, &crate::registry::capture_fixture());
     assert!(root.form.index_of_key(RowKey(PLAINTEXT_KEY_BASE)).is_none());
     assert!(root.state.plaintext.is_empty());
 }
@@ -652,7 +660,7 @@ fn turning_an_unencrypted_connection_on_asks_the_shared_question_first() {
         machine_id: "lan-machine".into(), name: "Basement".into(), shared_by: String::new(),
         eligibility: plx_plex::plex::probe::PlaintextEligibility::Eligible, choice: PlaintextChoice::Undecided,
     });
-    let mut root = RootPage::new(EntryId(0), cx(None).views.directory);
+    let mut root = RootPage::new(EntryId(0), cx(None).views.directory, &crate::registry::capture_fixture());
     let row = root.form.index_of(&RootId::Plaintext(ServerMachineId("lan-machine".into())))
         .expect("an offered, never-asked server has its switch");
     let drawn = root.form.table.sections.iter().flat_map(|s| &s.rows).nth(row).unwrap();
@@ -694,9 +702,9 @@ fn turning_an_unencrypted_connection_on_asks_the_shared_question_first() {
 
 fn inputs_for(signed_in: bool) -> RootInputs {
     RootInputs {
-        trace: plx_platform::playback_trace::Status::Off,
+        trace: plx_os::playback_trace::Status::Off,
         signed_in, multi_user: true, library_count: 3, auto_sign_in: false, trailer_autoplay: true, resolution: UiResolution::Auto, resolution_offered: true,
-        language: plx_platform::i18n::Preference::System,
+        language: plx_os::i18n::Preference::System,
         under_posters: plx_plex::plex::session::UnderPosters::DEFAULT, plaintext: Vec::new(),
     }
 }
@@ -712,7 +720,7 @@ fn the_interface_resolution_row_is_signed_in_only_and_reads_each_option() {
         real.table.sections.iter().flat_map(|s| s.rows.iter()).nth(i).expect("the row exists").value.clone()
     };
     assert_eq!(row_value(false, UiResolution::Auto), None, "the signed-out root is the sign-in path's short list");
-    assert_eq!(row_value(true, UiResolution::Auto).as_deref(), Some(plx_platform::i18n::msg::settings_resolution_auto()));
+    assert_eq!(row_value(true, UiResolution::Auto).as_deref(), Some(plx_os::i18n::msg::settings_resolution_auto()));
     assert_eq!(row_value(true, UiResolution::Hd900).as_deref(), Some("1600x900"));
     assert_eq!(row_value(true, UiResolution::Hd720).as_deref(), Some("1280x720"));
     assert_eq!(row_value(true, UiResolution::Sd540).as_deref(), Some("960x540"));
@@ -752,12 +760,12 @@ fn the_interface_resolution_row_is_offered_on_webos_1_to_3_only() {
     }
     // the rule the flag is fed from
     for (major, offered) in [(0, false), (1, true), (2, true), (3, true), (4, false), (5, false), (6, false), (22, false)] {
-        assert_eq!(plx_platform::tv::device::offers_ui_resolution(major), offered, "webOS major {major}");
+        assert_eq!(plx_os::tv::device::offers_ui_resolution(major), offered, "webOS major {major}");
     }
     // a host test has no television: the real page is the webOS 4+ shape and has no such row
     let _g = plx_base::testlock::serial();
     let _sess = multi_user_session("root-resolution-gate");
-    let page = RootPage::new(EntryId(0), cx(None).views.directory);
+    let page = RootPage::new(EntryId(0), cx(None).views.directory, &crate::registry::capture_fixture());
     assert_eq!(page.form.index_of(&RootId::Resolution), None);
 }
 
@@ -862,7 +870,7 @@ fn back_from_each_root_door_reseats_focus_on_the_same_root_id() {
 fn a_rebuild_keeps_the_row_by_id_and_a_vanished_row_falls_to_its_neighbour() {
     let _g = plx_base::testlock::serial();
     let _sess = multi_user_session("root-rebuild-identity");
-    let mut page = RootPage::new(EntryId(0), cx(None).views.directory);
+    let mut page = RootPage::new(EntryId(0), cx(None).views.directory, &crate::registry::capture_fixture());
     select_root(&mut page, RootId::Language);
     page.rebuild(cx(None).views.directory);
     assert_eq!(page.form.selected_id(), Some(&RootId::Language), "a rebuild keeps the row it is on");
@@ -888,18 +896,18 @@ fn a_rebuild_keeps_the_row_by_id_and_a_vanished_row_falls_to_its_neighbour() {
 /// (`settings_diagnostics.rs`, `settings_v2_tests.rs`).
 #[test]
 fn the_root_diagnostics_row_reads_the_status_the_runner_answers() {
-    use plx_platform::playback_trace::Status;
+    use plx_os::playback_trace::Status;
     let _serial = plx_base::testlock::serial();
-    let mut root = RootPage::new(EntryId(0), cx(None).views.directory);
+    let mut root = RootPage::new(EntryId(0), cx(None).views.directory, &crate::registry::capture_fixture());
     let mut present = plx_machine::present::Present::new();
     let mut out = Vec::new();
     let mut fx = Effects::new(&mut out, MachineId::Instance(InstanceId(0)), &mut present);
     assert_eq!(root.state.trace, Status::Off);
     root.step(&ScreenEvent::App(super::super::registry::AppMsg::PlaybackTrace(Status::Recording)), &cx(None), &mut fx);
     assert_eq!(root.state.trace, Status::Recording);
-    assert_eq!(diagnostics::root_value(Status::Recording), plx_platform::i18n::msg::widgets_toggle_on());
+    assert_eq!(diagnostics::root_value(Status::Recording), plx_os::i18n::msg::widgets_toggle_on());
     for not_recording in [Status::Off, Status::Saved, Status::Saving, Status::Exported, Status::Unavailable, Status::Failed] {
-        assert_eq!(diagnostics::root_value(not_recording), plx_platform::i18n::msg::widgets_toggle_off(),
+        assert_eq!(diagnostics::root_value(not_recording), plx_os::i18n::msg::widgets_toggle_off(),
             "{not_recording:?} is not a recording, and Off is the toggle's own word");
     }
     // opening it is a Nav row's own job, and no root row dispatches a trace command any more
@@ -940,3 +948,170 @@ fn hud_return_to_player_hud(remove: bool) {
 fn use_hud_returns_to_player_hud_with_an_unrelated_surface_id() {hud_return_to_player_hud(false);}
 #[test]
 fn remove_hud_returns_to_player_hud_with_an_unrelated_surface_id() {hud_return_to_player_hud(true);}
+
+#[test]
+fn retained_offer_expiry_rebuilds_the_switches_without_a_roster_change() {
+    use plx_plex::plex::{grant::PlaintextVerdict, probe::PlaintextEligibility, session::PlaintextChoice};
+    let _serial = plx_base::testlock::serial();
+    let mut inputs = crate::registry::ScreenInputs::default();
+    std::sync::Arc::make_mut(&mut inputs.session).account_token = "retained-account".into();
+    inputs.settled = true;
+    std::sync::Arc::make_mut(&mut inputs.grants).offers.push(PlaintextVerdict {
+        machine_id: "server".into(), name: "Server".into(), shared_by: String::new(),
+        eligibility: PlaintextEligibility::Eligible, choice: PlaintextChoice::Undecided });
+    let mut cx = cx(None);
+    cx.views.inputs = &inputs;
+    let mut page = RootPage::new(EntryId(0), cx.views.directory, &cx.views.inputs);
+    assert_eq!(page.plaintext_rows, vec![("server".into(), false)]);
+    let mut expired = inputs.clone();
+    expired.grants = Default::default();
+    expired.grant_generation += 1;
+    cx.views.inputs = &expired;
+    let mut out = Vec::new();
+    let mut present = Present::new();
+    page.step(&ScreenEvent::Tick(Default::default()), &cx,
+        &mut Effects::new(&mut out, MachineId::Instance(InstanceId(0)), &mut present));
+    assert!(page.plaintext_rows.is_empty());
+}
+
+#[test]
+fn a_success_receipt_waits_for_the_next_captured_authority() {
+    let _serial = plx_base::testlock::serial();
+    let mut inputs = crate::registry::ScreenInputs::default();
+    inputs.session = std::sync::Arc::new(inputs.session.with_auto_sign_in(false));
+    inputs.settled = true;
+    let mut cx = cx(None);
+    cx.views.inputs = &inputs;
+    let mut page = RootPage::new(EntryId(0), cx.views.directory, cx.views.inputs);
+    let (reply, ticket) = std::sync::mpsc::channel();
+    reply.send(true).unwrap();
+    plx_base::storage_worker::drain_for_test();
+    page.pending_auto = Some((true, ticket));
+    page.rebuild(cx.views.directory);
+    let mut out = Vec::new();
+    let mut present = Present::new();
+    page.step(&ScreenEvent::Tick(Default::default()), &cx,
+        &mut Effects::new(&mut out, MachineId::Instance(InstanceId(0)), &mut present));
+    assert!(page.state.auto_sign_in, "an old captured snapshot cannot undo a successful write");
+    assert!(page.pending_auto.is_some());
+    let mut confirmed = inputs.clone();
+    confirmed.session = std::sync::Arc::new(confirmed.session.with_auto_sign_in(true));
+    confirmed.visible_generation += 1;
+    cx.views.inputs = &confirmed;
+    page.step(&ScreenEvent::Tick(Default::default()), &cx,
+        &mut Effects::new(&mut out, MachineId::Instance(InstanceId(0)), &mut present));
+    assert!(page.pending_auto.is_none());
+    assert!(page.state.auto_sign_in);
+}
+
+#[test]
+fn adjacent_root_rows_use_independent_retained_profile_and_install_facts() {
+    use plx_plex::plex::session::{ProfilePrefs, UnderPosters};
+    use plx_os::i18n::Preference;
+    let _serial = plx_base::testlock::serial();
+    let before = plx_os::i18n::saved_preference_for_test(Preference::En);
+    let off = UnderPosters { title: false, ..UnderPosters::DEFAULT };
+    let a = crate::registry::ScreenInputs { install_language: Preference::Be,
+        preferences: Some(ProfilePrefs { under_posters: Some(off), ..Default::default() }), ..Default::default() };
+    let b = crate::registry::ScreenInputs { install_language: Preference::Es,
+        preferences: Some(ProfilePrefs { under_posters: Some(UnderPosters::DEFAULT), ..Default::default() }), ..a.clone() };
+    let directory = plx_data::stores::browse::DirectoryView::empty_for_test();
+    let (first, second) = {
+        let _step = plx_base::step::StepScope::enter();
+        (RootPage::new(EntryId(1), directory, &a), RootPage::new(EntryId(2), directory, &b))
+    };
+    plx_os::i18n::saved_preference_for_test(before);
+    assert_eq!(first.state.language, Preference::Be);
+    assert_eq!(second.state.language, Preference::Es);
+    assert_eq!(first.state.under_posters, off);
+    assert_eq!(second.state.under_posters, UnderPosters::DEFAULT);
+}
+
+#[test]
+fn adjacent_root_pending_install_pick_refreshes_with_unchanged_cache_and_profile() {
+    use plx_os::i18n::Preference;
+    let _serial = plx_base::testlock::serial();
+    let mut inputs = crate::registry::ScreenInputs::default();
+    inputs.install_language = plx_os::i18n::saved_preference();
+    let mut context = cx(None);
+    context.views.inputs = &inputs;
+    let mut page = RootPage::new(EntryId(0), context.views.directory, &inputs);
+    let mut initial_out = Vec::new();
+    let mut initial_present = Present::new();
+    {
+        let _step = plx_base::step::StepScope::enter();
+        page.step(&ScreenEvent::Tick(Default::default()), &context,
+            &mut Effects::new(&mut initial_out, MachineId::Instance(InstanceId(0)), &mut initial_present));
+    }
+    let mut pending = inputs.clone();
+    pending.install_language = if inputs.install_language == Preference::Be { Preference::Es } else { Preference::Be };
+    assert!(std::sync::Arc::ptr_eq(&pending.session, &inputs.session));
+    assert_eq!(pending.session_key(), inputs.session_key());
+    context.views.inputs = &pending;
+    let mut out = Vec::new();
+    let mut present = Present::new();
+    {
+        let _step = plx_base::step::StepScope::enter();
+        page.step(&ScreenEvent::Tick(Default::default()), &context,
+            &mut Effects::new(&mut out, MachineId::Instance(InstanceId(0)), &mut present));
+    }
+    assert_eq!(page.state.language, pending.install_language, "a retained next-launch pick must not wait for the stored Session Arc");
+}
+
+// ---- accessibility ids -----------------------------------------------------------------------
+
+/// **Every page of the family the surface mounts answers ids that conform** (`a11y::conformance`: every
+/// element projects, ids are unique, `a11y_find` inverts `a11y`, `a11y_elems` lists no more keys than each
+/// group declares, and some when it declares any), and **no two pages answer one namespace**: the surface
+/// answers its top page's, so an id says which page it was read on, though a Legal document, the Legal
+/// index and About share one heartbeat word.
+#[test]
+fn every_page_the_surface_mounts_conforms_and_answers_a_namespace_of_its_own() {
+    // `settings_page_conforms` takes the serial lock and the scratch session for each mount itself
+    let pages = [
+        SettingsPage::Root,
+        SettingsPage::Language,
+        SettingsPage::UnderPosters,
+        SettingsPage::UnderPostersDetails(PosterKind::Movie),
+        SettingsPage::UnderPostersDetails(PosterKind::Show),
+        SettingsPage::Contribute,
+        SettingsPage::Playback,
+        SettingsPage::AudioSubtitles,
+        SettingsPage::Picker(PickerKind::Quality),
+        SettingsPage::Privacy,
+        SettingsPage::Preview(0),
+        SettingsPage::Legal,
+        SettingsPage::About,
+        SettingsPage::Document(0),
+        SettingsPage::Diagnostics,
+        SettingsPage::PlayerHud,
+        SettingsPage::HudGallery,
+    ];
+    let mut seen: Vec<&'static str> = Vec::new();
+    for page in pages {
+        let [ns] = settings_page_conforms(page)[..] else { panic!("{page:?}: one mounting, one namespace") };
+        assert!(!seen.contains(&ns), "{page:?}: the namespace {ns:?} is another page's already");
+        seen.push(ns);
+    }
+}
+
+/// The first-run consent question mounted as `AppArg::FirstRunConsent` mounts it: the same
+/// `RouteSurface` in the first-run family, over the stage-0 page (the coverage table calls this).
+pub(crate) fn first_run_consent_conforms() -> plx_ui::a11y::Namespaces {
+    let _g = plx_base::testlock::serial();
+    let _sess = scratch_session("a11y-first-run-consent");
+    let mut s = RouteSurface::new(EntryId(0), InstanceId(0), Family::FirstRunConsent, SettingsPage::ConsentStage(0));
+    step(&mut s, ScreenEvent::Mount, None);
+    vec![plx_ui::a11y::conform::<InnerHost, _>(&s, &cx(None))]
+}
+
+/// One page of the Settings family mounted as its surface mounts it (`RouteSurface` rooted at `page`,
+/// the Mount event delivered) and run through the id conformance; the namespace is the page's own.
+/// The coverage table calls this for every `SettingsPage` arm.
+pub(crate) fn settings_page_conforms(page: SettingsPage) -> plx_ui::a11y::Namespaces {
+    let _g = plx_base::testlock::serial();
+    let _sess = scratch_session("a11y-pages");
+    let mut s = RouteSurface::new(EntryId(0), InstanceId(0), Family::Settings, page);
+    step(&mut s, ScreenEvent::Mount, None);
+    vec![plx_ui::a11y::conform::<InnerHost, _>(&s, &cx(None))]
+}

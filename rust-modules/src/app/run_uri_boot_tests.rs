@@ -3,13 +3,14 @@
 #[cfg(feature = "play-uri")]
 mod uri_boot_tests {
     use super::*;
+    use crate::app::adapters::backends::{ProductQualifier, UriProduct};
     use plx_media::route::uri_preflight::{KnownSource, OriginalQualifier, OriginalRequest,
-        ProductEvidence, ResolvePort, Verdict};
+        ProductEvidence, Verdict};
     use plx_play_uri::backend::{Binding, NativeTrackIndex, UriSource};
     use plx_playback_contract::{BackendKind, Capabilities, Fidelity, Requirements,
         SourceKind, TrackChoice, TrackKind, TrackSelection};
-    use plx_platform::tv::sink::{DisplaySink, NoSink, VP_EXPORTED};
-    use plx_platform::tv::uri::{CloseStatus, RequestId, SessionId, Shape, UriMedia,
+    use plx_os::tv::sink::{DisplaySink, NoSink, VP_EXPORTED};
+    use plx_os::tv::uri::{CloseStatus, RequestId, SessionId, Shape, UriMedia,
         UriPoll, UriReply};
     use std::ffi::{c_char, c_int, c_long, CStr};
 
@@ -172,7 +173,7 @@ mod uri_boot_tests {
             NoSink.plane_probe_connect_dass(mt)
         }
         unsafe fn plane_finish(&self, mt: &plx_base::task::MainThread)
-            -> plx_platform::tv::sink::PlaneFinish {
+            -> plx_os::tv::sink::PlaneFinish {
             NoSink.plane_finish(mt)
         }
         unsafe fn plane_bind(&self, mt: &plx_base::task::MainThread, id: *const c_char) {
@@ -187,9 +188,9 @@ mod uri_boot_tests {
             NoSink.plane_start(mt, x, y, w, h)
         }
         unsafe fn plane_unload(&self, mt: &plx_base::task::MainThread)
-            -> plx_platform::tv::sink::PlaneUnload { NoSink.plane_unload(mt) }
+            -> plx_os::tv::sink::PlaneUnload { NoSink.plane_unload(mt) }
         fn plane_completions(&self, mt: &plx_base::task::MainThread)
-            -> Vec<plx_platform::tv::sink::PlaneCompletion> { NoSink.plane_completions(mt) }
+            -> Vec<plx_os::tv::sink::PlaneCompletion> { NoSink.plane_completions(mt) }
         unsafe fn plane_pause(&self, mt: &plx_base::task::MainThread) {
             NoSink.plane_pause(mt)
         }
@@ -209,19 +210,17 @@ mod uri_boot_tests {
         let caps = Capabilities { progressive_uri: true, hls_uri: false,
             packet_feed: false, pause: true, seek: true, audio_track: true,
             subtitle_track: true, audio_off: false, subtitle_off: false };
-        let port = ResolvePort::new(ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: caps, certified: caps, preview_rectangle: false },
-            Arc::new(QualifiedOriginal));
-        assert!(crate::app::adapters::backends::install_uri_product_with_ports(
-            &mut rig.app.adapters.player, &mut rig.app.player.session, port, bus, display));
+        let product = UriProduct { binding: Binding::Exported { canvas: (1920, 1080) },
+            callable: caps, certified: caps, qualifier: Arc::new(QualifiedOriginal) };
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
+            &mut rig.app.adapters.player, &mut rig.app.player.session, product, bus, display));
         rig.request();
         let metric_request = rig.app.player.session.metric_request().expect("accepted URI request");
         rig.release.send(()).unwrap();
         let mut resolved = None;
         poll_until("qualified URI resolve did not land", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         let offer = resolved.unwrap().uri_offer.expect("the worker kept its owned URI source");
@@ -251,17 +250,218 @@ mod uri_boot_tests {
             request.contains("/decision?")), "qualified original bypassed Feed MDE");
     }
 
-    /// The port the product composition builds for a viewer who opted in to the URI engine, over the
-    /// exported-window `Display`: production's binding for it (`Unbound`: the host has no handle, and
-    /// the product's exported-window table, `EXPORTED_STRATA`, is empty) handed through the debug-only override's
-    /// `compose` (`dev::uri_exported`) as `install_uri_product` does, and the production evidence
-    /// (`unqualified_on` the display's mode, which an opted-in request certifies).
+    // ---- W6c: the compositions a platform can supply, through the real boot publisher ----
+
+    /// A bare adapter in the rig, the way a platform that composes no Feed starts: nothing installed.
+    fn bare_adapter(rig: &mut Rig) {
+        rig.app.adapters.player = plx_media::player::adapter::PlayerAdapter::new(unsafe { plx_base::task::MainThread::assume() });
+    }
+
+    /// The URI product composed over the rig's fake bus and display, as `compose` returns it, and
+    /// published with the adapter's set by `publish_composition`. Certified for everyone, so no
+    /// viewer opt-in is part of the play.
+    fn compose_self_certified(rig: &mut Rig) -> &'static Bus {
+        plx_plex::plex::client_for(rig.sid).unwrap()
+            .set_link(plx_plex::plex::probe::Location::Local);
+        let bus: &'static Bus = Box::leak(Box::new(Bus::new()));
+        let display: &'static Display = Box::leak(Box::new(Display));
+        let caps = Capabilities { progressive_uri: true, hls_uri: false,
+            packet_feed: false, pause: true, seek: true, audio_track: true,
+            subtitle_track: true, audio_off: false, subtitle_off: false };
+        let product = UriProduct { binding: Binding::Exported { canvas: (1920, 1080) },
+            callable: caps, certified: caps, qualifier: Arc::new(QualifiedOriginal) };
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
+            &mut rig.app.adapters.player, &mut rig.app.player.session, product, bus, display));
+        bus
+    }
+
+    /// URI only, no Feed driver anywhere: the set the session was told is URI alone, an ordinary
+    /// title resolves to a URI offer with the viewer's setting Off, and its Start is the driver's
+    /// native Load. No Feed decision is asked of the server.
+    #[test]
+    fn a_uri_only_boot_plays_an_ordinary_title_with_no_feed_driver() {
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving(false) else { return };
+        bare_adapter(&mut rig);
+        let bus = compose_self_certified(&mut rig);
+        assert_eq!(rig.app.player.session.backends(), plx_playback_contract::BackendSet::URI);
+        assert_eq!(rig.app.adapters.player.composed_backends(), plx_playback_contract::BackendSet::URI);
+        assert_eq!(plx_media::route::uri_engine(), plx_plex::plex::session::UriEngine::Off);
+        rig.request();
+        let offer = resolve_pending(&mut rig).uri_offer.expect("the ordinary title is a URI offer");
+        assert!(rig.app.adapters.player.offer_qualified_uri(&mut rig.app.player.session, offer).is_ok());
+        let started = plx_media::player::start_playback_tracked(
+            &mut rig.app.player.session, &mut rig.app.adapters.player);
+        assert!(matches!(started, plx_media::player::BufferfeedStartOutcome::Launched(_)));
+        let at = rig.app.adapters.player.backend_tick();
+        let _ = rig.app.adapters.player.backend_poll_session_at(&mut rig.app.player.session, at);
+        assert!(bus.load_payload().is_some(), "the Start became the driver's native Load");
+        assert!(!rig.requests.lock().unwrap().iter().any(|request| request.contains("/decision?")),
+            "no Feed decision for a platform with no Feed");
+    }
+
+    /// Zero drivers (`Composition::default()` over a bare adapter): the boot publishes `NONE` and
+    /// no resolver, and an ordinary title is refused with the typed verdict instead of falling to
+    /// a Feed nothing installed.
+    #[test]
+    fn a_boot_that_composed_no_driver_refuses_an_ordinary_title() {
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving(false) else { return };
+        bare_adapter(&mut rig);
+        crate::app::platform::publish_composition(&mut rig.app.player.session,
+            &rig.app.adapters.player, crate::app::platform::Composition::default());
+        assert_eq!(rig.app.player.session.backends(), plx_playback_contract::BackendSet::NONE);
+        assert!(rig.app.player.session.uri_preflight_port().is_none());
+        rig.request();
+        rig.release.send(()).unwrap();
+        poll_until("the refusal did not land", || {
+            let _ = plx_media::route::pump_play(&mut rig.app.player.session,
+                rig.app.runtime.metadata_mut());
+            plx_media::route::play_verdict(&rig.app.player.session).is_some()
+        });
+        assert_eq!(plx_media::route::play_verdict(&rig.app.player.session).as_deref(),
+            Some(plx_os::i18n::msg::widgets_reason_open()),
+            "the typed NoQualifiedBackend verdict, worded by the catalog");
+        assert!(!rig.requests.lock().unwrap().iter().any(|request| request.contains("/decision?")));
+    }
+
+    /// **A platform that composed no Feed has no hero trailer, and says so once, quietly.** The
+    /// Detail hero's dwell asks for a preview whenever focus rests on it and the item is not known
+    /// to refuse (`player::preview::blocked`). With no Feed composed the request is refused by
+    /// `start_hero_preview` through the preview machine's own fact (`Fact::RefusedDirect`), BEFORE
+    /// any server work: no PlayQueue request, no resolve, so no standing verdict for `player::state()`
+    /// to read as an Error (and for the failure report to tell as a failed preview), and the dwell
+    /// gate stops asking, so there is no retry every `DWELL_S`. Nothing reaches the route.
+    #[cfg(feature = "play-feed")]
+    #[test]
+    fn a_boot_that_composed_no_feed_refuses_the_hero_preview_once_and_quietly() {
+        use crate::app::content::{start_hero_preview, HeroPreview, HeroPreviewAsk};
+        use plx_media::player::preview;
+        let _serial = plx_base::testlock::serial();
+        let _preview = crate::app::bridge::test_support::PreviewReset;
+        let Some(mut rig) = Rig::serving(false) else { return };
+        let mut t = product_transition(&mut rig.app);
+        settle(&mut rig.app, &mut t);
+        bare_adapter(&mut rig);
+        crate::app::platform::publish_composition(&mut rig.app.player.session,
+            &rig.app.adapters.player, crate::app::platform::Composition::default());
+        assert_eq!(rig.app.player.session.backends(), plx_playback_contract::BackendSet::NONE);
+        preview::reset_for_test();
+        preview::restore_trailer_autoplay(true);
+        let route = rig.app.route();
+        // No driver at all, and a boot with only the URI driver: neither has a Feed to open a
+        // preview on, and no display places a preview rectangle for the URI one.
+        for (rk, set) in [("1", plx_playback_contract::BackendSet::NONE),
+            ("2", plx_playback_contract::BackendSet::URI)]
+        {
+            rig.app.player.session.install_backends(set);
+            let served = rig.requests.lock().unwrap().len();
+            let ask = HeroPreviewAsk { sid: rig.sid, rk, part: "/library/parts/1/file.mkv",
+                vcodec: "h264", acodec: "aac", title: "First" };
+            assert!(!preview::blocked(rig.sid, rk), "{set:?}: nothing is known about the item yet");
+            assert_eq!(start_hero_preview(&mut rig.app.player.session, rig.app.runtime.metadata_mut(),
+                &ask, 0), HeroPreview::Refused, "{set:?}");
+            assert!(preview::blocked(rig.sid, rk),
+                "{set:?}: the refusal is remembered, so the page's dwell gate stops asking: no retry loop");
+            assert_eq!(preview::request_start(rig.sid, rk, 1),
+                preview::Start::Cached(preview::Fact::RefusedDirect), "{set:?}");
+            assert_eq!(start_hero_preview(&mut rig.app.player.session, rig.app.runtime.metadata_mut(),
+                &ask, 2_000), HeroPreview::Refused, "{set:?}: a dwell that asks anyway is refused the same way");
+            for _ in 0..5 {
+                let mut fr = Frame::begin(&rig.app.player.session, rig.app.runtime.metadata_view());
+                fr.now = t;
+                unsafe {
+                    playback_tick(&mut rig.app, &mut fr);
+                    update(&mut rig.app, &mut fr);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // The rig's own background traffic (a `GET /` reachability probe) may reach the server
+            // meanwhile; the item's resolve (its metadata, a decision) is what must not. That no
+            // resolve was dispatched at all is `play_pending` below.
+            let asked: Vec<String> = rig.requests.lock().unwrap()[served..].to_vec();
+            assert!(!asked.iter().any(|request| request.contains("/library/metadata/")
+                    || request.contains("playQueues") || request.contains("decision")),
+                "{set:?}: refused before any server work, yet the server was asked {asked:?}");
+            assert!(!preview::occupies(), "{set:?}: the machine stays Idle");
+            assert!(!plx_media::route::play_pending(), "{set:?}: no resolve was started");
+            assert!(!plx_media::route::play_refused(&rig.app.player.session),
+                "{set:?}: no standing verdict, so no Error read-out and no failure report");
+            assert!(!plx_media::route::is_preview(&rig.app.player.session), "{set:?}");
+            assert_ne!(plx_media::player::state(&rig.app.player.session),
+                plx_media::player::PlaybackState::Error,
+                "{set:?}: a refused hero trailer is not a playback error");
+            assert!(crate::app::bridge::player(&rig.app.pages).is_none(), "{set:?}: no player page");
+            assert!(rig.app.route() == route, "{set:?}: the route did not move");
+        }
+    }
+
+    /// The control for the test above: the same request on a boot that composed a Feed starts the
+    /// resolve, which is what the gate must leave alone.
+    #[cfg(feature = "play-feed")]
+    #[test]
+    fn a_boot_that_composed_a_feed_starts_the_hero_preview() {
+        use crate::app::content::{start_hero_preview, HeroPreview, HeroPreviewAsk};
+        use plx_media::player::preview;
+        let _serial = plx_base::testlock::serial();
+        let _preview = crate::app::bridge::test_support::PreviewReset;
+        let Some(mut rig) = Rig::serving(false) else { return };
+        let mut t = product_transition(&mut rig.app);
+        settle(&mut rig.app, &mut t);
+        assert!(rig.app.player.session.backends().feed, "premise: the rig composes the Feed");
+        preview::reset_for_test();
+        preview::restore_trailer_autoplay(true);
+        let ask = HeroPreviewAsk { sid: rig.sid, rk: "1", part: "/library/parts/1/file.mkv",
+            vcodec: "h264", acodec: "aac", title: "First" };
+        assert_eq!(start_hero_preview(&mut rig.app.player.session, rig.app.runtime.metadata_mut(),
+            &ask, 0), HeroPreview::Started);
+        assert!(rig.entered.recv_timeout(Duration::from_secs(1)).is_ok(), "the resolve reached the server");
+        assert!(preview::occupies(), "the preview machine holds the request");
+        // The page's focus leaves the hero while the resolve is parked on the server (the halted
+        // preview's own test): the landing is discarded, so no Engine is left behind to tear down.
+        preview::halt(&mut rig.app.player.session, &mut rig.app.adapters.player);
+        rig.release.send(()).unwrap();
+        poll_until("the halted preview's resolve never settled", || {
+            let mut fr = Frame::begin(&rig.app.player.session, rig.app.runtime.metadata_view());
+            fr.now = t;
+            unsafe {
+                playback_tick(&mut rig.app, &mut fr);
+                update(&mut rig.app, &mut fr);
+            }
+            !plx_media::route::play_pending()
+        });
+    }
+
+    /// Two drivers (the rig's Feed and the product URI driver): the session holds both, and the
+    /// planner's choice for a title the URI driver qualifies is the URI original.
+    #[test]
+    fn a_boot_with_both_drivers_offers_the_qualified_uri_original_first() {
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving(false) else { return };
+        let _bus = compose_self_certified(&mut rig);
+        assert_eq!(rig.app.player.session.backends(), plx_playback_contract::BackendSet::BOTH);
+        rig.request();
+        let offer = resolve_pending(&mut rig).uri_offer.expect("the URI original is offered");
+        assert!(rig.app.adapters.player.offer_qualified_uri(&mut rig.app.player.session, offer).is_ok());
+        assert!(matches!(rig.app.player.session.backend_offer(),
+            plx_media::route::backend_policy::Selection::Open(choice)
+                if choice.backend == BackendKind::Uri));
+    }
+
+    /// The product the composition builds for a viewer who opted in to the URI engine, over the
+    /// exported-window `Display`: the binding of a major the product's exported-window table,
+    /// `EXPORTED_STRATA`, has not admitted (`Unbound`: the host has no handle and the major is not
+    /// listed) handed through the debug-only override's
+    /// `compose` (`dev::uri_exported`) as `install_uri_product` does, and what an opted-in request
+    /// certifies.
     #[cfg(feature = "devtriggers")]
-    fn composed_port(exported_override: bool, display: &Display) -> ResolvePort {
+    fn composed_product(exported_override: bool, display: &Display) -> UriProduct {
         let binding = crate::dev::uri_exported::compose(Binding::Unbound, display.window_mode(),
             exported_override);
-        ResolvePort::new(ProductEvidence::unqualified_on(display.window_mode(), binding).opted_in(),
-            Arc::new(QualifiedOriginal))
+        UriProduct { binding, callable: ProductEvidence::CALLABLE,
+            certified: ProductEvidence::opt_in_certifies(ProductEvidence::CALLABLE,
+                ProductEvidence::UNCERTIFIED),
+            qualifier: Arc::new(QualifiedOriginal) }
     }
 
     /// With the exported-window override the composition binds the exported window on a `VP_EXPORTED`
@@ -276,15 +476,15 @@ mod uri_boot_tests {
             .set_link(plx_plex::plex::probe::Location::Local);
         let bus: &'static Bus = Box::leak(Box::new(Bus::new()));
         let display: &'static Display = Box::leak(Box::new(Display));
-        assert!(crate::app::adapters::backends::install_uri_product_with_ports(
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
             &mut rig.app.adapters.player, &mut rig.app.player.session,
-            composed_port(true, display), bus, display));
+            composed_product(true, display), bus, display));
         rig.request();
         rig.release.send(()).unwrap();
         let mut resolved = None;
         poll_until("the override's URI resolve did not land", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         let offer = resolved.unwrap().uri_offer.expect("an exported display bound by the override offers the original");
@@ -313,15 +513,15 @@ mod uri_boot_tests {
             .set_link(plx_plex::plex::probe::Location::Local);
         let bus: &'static Bus = Box::leak(Box::new(Bus::new()));
         let display: &'static Display = Box::leak(Box::new(Display));
-        assert!(crate::app::adapters::backends::install_uri_product_with_ports(
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
             &mut rig.app.adapters.player, &mut rig.app.player.session,
-            composed_port(false, display), bus, display));
+            composed_product(false, display), bus, display));
         rig.request();
         rig.release.send(()).unwrap();
         let mut resolved = None;
         poll_until("the unarmed URI resolve did not land", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         assert!(resolved.unwrap().uri_offer.is_none(), "an unbound display offers nothing");
@@ -339,16 +539,16 @@ mod uri_boot_tests {
             .set_link(plx_plex::plex::probe::Location::Local);
         let bus: &'static Bus = Box::leak(Box::new(Bus::new()));
         let display: &'static Display = Box::leak(Box::new(Display));
-        let port = ResolvePort::new(ProductEvidence::unqualified(display.window_mode()),
-            Arc::new(QualifiedOriginal));
-        assert!(crate::app::adapters::backends::install_uri_product_with_ports(
-            &mut rig.app.adapters.player, &mut rig.app.player.session, port, bus, display));
+        let product = UriProduct { binding: Binding::Unbound, callable: ProductEvidence::CALLABLE,
+            certified: ProductEvidence::UNCERTIFIED, qualifier: Arc::new(QualifiedOriginal) };
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
+            &mut rig.app.adapters.player, &mut rig.app.player.session, product, bus, display));
         rig.request();
         rig.release.send(()).unwrap();
         let mut resolved = None;
         poll_until("unqualified URI resolve did not land", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         assert!(resolved.unwrap().uri_offer.is_none());
@@ -376,18 +576,16 @@ mod uri_boot_tests {
         let caps = Capabilities { progressive_uri: true, hls_uri: false,
             packet_feed: false, pause: true, seek: true, audio_track: true,
             subtitle_track: false, audio_off: false, subtitle_off: false };
-        let port = ResolvePort::new(ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: caps, certified: caps, preview_rectangle: false },
-            Arc::new(QualifiedOriginal));
-        assert!(crate::app::adapters::backends::install_uri_product_with_ports(
-            &mut rig.app.adapters.player, &mut rig.app.player.session, port, bus, display));
+        let product = UriProduct { binding: Binding::Exported { canvas: (1920, 1080) },
+            callable: caps, certified: caps, qualifier: Arc::new(QualifiedOriginal) };
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
+            &mut rig.app.adapters.player, &mut rig.app.player.session, product, bus, display));
         rig.request();
         rig.release.send(()).unwrap();
         let mut resolved = None;
         poll_until("qualified URI source did not resolve", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         assert!(rig.app.adapters.player.offer_qualified_uri(&mut rig.app.player.session,
@@ -396,7 +594,7 @@ mod uri_boot_tests {
             &mut rig.app.player.session, &mut rig.app.adapters.player),
             plx_media::player::BufferfeedStartOutcome::Launched(_)));
         let frame = |rig: &mut Rig| {
-            let mut fr = Frame::begin(&rig.app.player.session, rig.app.bridge.metadata_view());
+            let mut fr = Frame::begin(&rig.app.player.session, rig.app.runtime.metadata_view());
             unsafe { playback_tick(&mut rig.app, &mut fr); }
         };
         frame(&mut rig);
@@ -433,12 +631,10 @@ mod uri_boot_tests {
         let caps = Capabilities { progressive_uri: true, hls_uri: false,
             packet_feed: false, pause: true, seek: true, audio_track: true,
             subtitle_track: false, audio_off: false, subtitle_off: false };
-        let port = ResolvePort::new(ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: caps, certified: caps, preview_rectangle: false },
-            Arc::new(QualifiedOriginal));
-        assert!(crate::app::adapters::backends::install_uri_product_with_ports(
-            &mut rig.app.adapters.player, &mut rig.app.player.session, port, bus, display));
+        let product = UriProduct { binding: Binding::Exported { canvas: (1920, 1080) },
+            callable: caps, certified: caps, qualifier: Arc::new(QualifiedOriginal) };
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
+            &mut rig.app.adapters.player, &mut rig.app.player.session, product, bus, display));
         rig.request();
         assert!(plx_media::route::arm_play_resume(&mut rig.app.player.session, 12_000_000_000),
             "the viewer's resume point rides the resolve in flight");
@@ -446,7 +642,7 @@ mod uri_boot_tests {
         let mut resolved = None;
         poll_until("qualified URI source did not resolve", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         assert!(rig.app.adapters.player.offer_qualified_uri(&mut rig.app.player.session,
@@ -455,7 +651,7 @@ mod uri_boot_tests {
             &mut rig.app.player.session, &mut rig.app.adapters.player),
             plx_media::player::BufferfeedStartOutcome::Launched(_)));
         let frame = |rig: &mut Rig| {
-            let mut fr = Frame::begin(&rig.app.player.session, rig.app.bridge.metadata_view());
+            let mut fr = Frame::begin(&rig.app.player.session, rig.app.runtime.metadata_view());
             unsafe { playback_tick(&mut rig.app, &mut fr); }
         };
         frame(&mut rig);
@@ -482,22 +678,17 @@ mod uri_boot_tests {
 
     // ---- the URI dev route (`plxnative-uridev`): the production composition, ACB-bound ----
 
-    /// The pair `install_uri_product` builds on an ACB-bound set (evidence nothing certifies, the
+    /// The product `install_uri_product` builds on an ACB-bound set (nothing certified, the
     /// production qualifier), handed through the dev route's `compose` with `trigger`. The host has
-    /// no ACB plane, so the evidence is built the way `product_binding` yields it for one rather
-    /// than read from the process; the OFFER is what the host proves, the bind is TV-only.
+    /// no ACB plane, so the binding is the one `product_binding` yields for one rather than read
+    /// from the process; the OFFER is what the host proves, the bind is TV-only.
     #[cfg(feature = "devtriggers")]
-    fn acb_port(trigger: Option<&str>) -> ResolvePort {
+    fn acb_product(trigger: Option<&str>) -> UriProduct {
         use crate::dev::uri_product as dev_route;
-        let evidence = ProductEvidence::unqualified_on(plx_platform::tv::sink::VP_ACB,
-            Binding::Acb);
-        let (evidence, qualifier) = dev_route::compose(evidence,
-            Arc::new(plx_media::route::uri_preflight::ProductQualifier),
-            trigger.map(str::to_owned));
-        ResolvePort::new(evidence, qualifier)
+        dev_route::compose(UriProduct::production(Binding::Acb), trigger.map(str::to_owned))
     }
 
-    /// A rig whose boot composed the ACB port for `trigger`, and the play of its one Part (id 1, on
+    /// A rig whose boot composed the ACB product for `trigger`, and the play of its one Part (id 1, on
     /// the server it registered as `lifecycle-fixture`) landed: the bus, and what the plan resolved.
     #[cfg(feature = "devtriggers")]
     fn land_acb_play(rig: &mut Rig, trigger: Option<&str>)
@@ -506,15 +697,15 @@ mod uri_boot_tests {
             .set_link(plx_plex::plex::probe::Location::Local);
         let bus: &'static Bus = Box::leak(Box::new(Bus::new()));
         let display: &'static Display = Box::leak(Box::new(Display));
-        assert!(crate::app::adapters::backends::install_uri_product_with_ports(
-            &mut rig.app.adapters.player, &mut rig.app.player.session, acb_port(trigger), bus,
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
+            &mut rig.app.adapters.player, &mut rig.app.player.session, acb_product(trigger), bus,
             display));
         rig.request();
         rig.release.send(()).unwrap();
         let mut resolved = None;
         poll_until("ACB URI resolve did not land", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         (bus, resolved.unwrap())
@@ -642,19 +833,17 @@ mod uri_boot_tests {
         let caps = Capabilities { progressive_uri: true, hls_uri: false,
             packet_feed: false, pause: true, seek: true, audio_track: true,
             subtitle_track: true, audio_off: false, subtitle_off: false };
-        let port = ResolvePort::new(ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: caps, certified: caps, preview_rectangle: false },
-            Arc::new(QualifiedOriginal));
-        assert!(crate::app::adapters::backends::install_uri_product_with_ports(
-            &mut rig.app.adapters.player, &mut rig.app.player.session, port, bus, display));
+        let product = UriProduct { binding: Binding::Exported { canvas: (1920, 1080) },
+            callable: caps, certified: caps, qualifier: Arc::new(QualifiedOriginal) };
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
+            &mut rig.app.adapters.player, &mut rig.app.player.session, product, bus, display));
         rig.request();
         let request = rig.app.player.session.metric_request().expect("logical request");
         rig.release.send(()).unwrap();
         let mut resolved = None;
         poll_until("qualified URI source did not resolve", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         let offer = resolved.unwrap().uri_offer.expect("qualified original source");
@@ -664,7 +853,7 @@ mod uri_boot_tests {
             &mut rig.app.player.session, &mut rig.app.adapters.player),
             plx_media::player::BufferfeedStartOutcome::Launched(_)));
         let frame = |rig: &mut Rig| {
-            let mut fr = Frame::begin(&rig.app.player.session, rig.app.bridge.metadata_view());
+            let mut fr = Frame::begin(&rig.app.player.session, rig.app.runtime.metadata_view());
             unsafe { playback_tick(&mut rig.app, &mut fr); }
         };
         frame(&mut rig); // register opens the actual native Load
@@ -725,19 +914,17 @@ mod uri_boot_tests {
         let caps = Capabilities { progressive_uri: true, hls_uri: false,
             packet_feed: false, pause: true, seek: true, audio_track: true,
             subtitle_track: true, audio_off: false, subtitle_off: false };
-        let port = ResolvePort::new(ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: caps, certified: caps, preview_rectangle: false },
-            Arc::new(QualifiedOriginal));
-        assert!(crate::app::adapters::backends::install_uri_product_with_ports(
-            &mut rig.app.adapters.player, &mut rig.app.player.session, port, bus, display));
+        let product = UriProduct { binding: Binding::Exported { canvas: (1920, 1080) },
+            callable: caps, certified: caps, qualifier: Arc::new(QualifiedOriginal) };
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
+            &mut rig.app.adapters.player, &mut rig.app.player.session, product, bus, display));
         rig.request();
         let request = rig.app.player.session.metric_request().expect("logical request");
         rig.release.send(()).unwrap();
         let mut resolved = None;
         poll_until("qualified URI source did not resolve", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         let offer = resolved.unwrap().uri_offer.expect("qualified original source");
@@ -747,7 +934,7 @@ mod uri_boot_tests {
             &mut rig.app.player.session, &mut rig.app.adapters.player),
             plx_media::player::BufferfeedStartOutcome::Launched(_)));
         let frame = |rig: &mut Rig| {
-            let mut fr = Frame::begin(&rig.app.player.session, rig.app.bridge.metadata_view());
+            let mut fr = Frame::begin(&rig.app.player.session, rig.app.runtime.metadata_view());
             unsafe { playback_tick(&mut rig.app, &mut fr); }
         };
         frame(&mut rig); // the named client's registration is refused: released quietly, no Load
@@ -792,19 +979,17 @@ mod uri_boot_tests {
         let caps = Capabilities { progressive_uri: true, hls_uri: false,
             packet_feed: false, pause: true, seek: true, audio_track: true,
             subtitle_track: true, audio_off: false, subtitle_off: false };
-        let port = ResolvePort::new(ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: caps, certified: caps, preview_rectangle: false },
-            Arc::new(QualifiedOriginal));
-        assert!(crate::app::adapters::backends::install_uri_product_with_ports(
-            &mut rig.app.adapters.player, &mut rig.app.player.session, port, bus, display));
+        let product = UriProduct { binding: Binding::Exported { canvas: (1920, 1080) },
+            callable: caps, certified: caps, qualifier: Arc::new(QualifiedOriginal) };
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
+            &mut rig.app.adapters.player, &mut rig.app.player.session, product, bus, display));
         rig.request();
         let request = rig.app.player.session.metric_request().expect("logical request");
         rig.release.send(()).unwrap();
         let mut resolved = None;
         poll_until("qualified URI source did not resolve", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         assert!(rig.app.adapters.player.offer_qualified_uri(&mut rig.app.player.session,
@@ -813,7 +998,7 @@ mod uri_boot_tests {
             &mut rig.app.player.session, &mut rig.app.adapters.player),
             plx_media::player::BufferfeedStartOutcome::Launched(_)));
         let frame = |rig: &mut Rig| {
-            let mut fr = Frame::begin(&rig.app.player.session, rig.app.bridge.metadata_view());
+            let mut fr = Frame::begin(&rig.app.player.session, rig.app.runtime.metadata_view());
             unsafe { playback_tick(&mut rig.app, &mut fr); }
         };
         frame(&mut rig);
@@ -856,7 +1041,7 @@ mod uri_boot_tests {
         let mut replacement = None;
         poll_until("automatic Feed rescue did not resolve", || {
             replacement = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             replacement.is_some()
         });
         let replacement = replacement.unwrap();
@@ -903,18 +1088,16 @@ mod uri_boot_tests {
         let caps = Capabilities { progressive_uri: true, hls_uri: false,
             packet_feed: false, pause: true, seek: true, audio_track: true,
             subtitle_track: true, audio_off: false, subtitle_off: false };
-        let port = ResolvePort::new(ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: caps, certified: caps, preview_rectangle: false },
-            Arc::new(QualifiedOriginal));
-        assert!(crate::app::adapters::backends::install_uri_product_with_ports(
-            &mut rig.app.adapters.player, &mut rig.app.player.session, port, bus, display));
+        let product = UriProduct { binding: Binding::Exported { canvas: (1920, 1080) },
+            callable: caps, certified: caps, qualifier: Arc::new(QualifiedOriginal) };
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
+            &mut rig.app.adapters.player, &mut rig.app.player.session, product, bus, display));
         rig.request();
         rig.release.send(()).unwrap();
         let mut resolved = None;
         poll_until("qualified URI source did not resolve", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         let offer = resolved.unwrap().uri_offer.expect("the original source was certified");
@@ -952,8 +1135,8 @@ mod uri_boot_tests {
         assert!(plx_media::route::source_decodable(&rig.app.player.session));
         assert!(plx_media::player::speed_offer(&rig.app.player.session).contains(&1500));
         crate::app::playback::apply_more_action(&mut rig.app.player.session,
-            &mut rig.app.adapters.player, &mut rig.app.bridge,
-            plx_appkit::more_menu::Action::SetSpeed(1500));
+            &mut rig.app.adapters.player, &mut rig.app.runtime.bridge(&mut rig.app.bridge),
+            plx_appkit::more_menu::Action::SetSpeed(1500), &mut rig.app.pages.present);
         assert_eq!(rig.app.player.session.requested_rate_permille(), 1500);
         assert_eq!(rig.app.player.session.reconfigure_pause_goal(), Some(true));
         assert_eq!(rig.app.player.session.attempt_origin(),
@@ -962,13 +1145,13 @@ mod uri_boot_tests {
             .expect("accepted viewer edit has its own request identity");
         assert_ne!(revised_request, uri_request);
         assert!(!plx_media::route::request_viewer_reconfigure(&mut rig.app.player.session,
-            rig.app.bridge.metadata_mut(), plx_media::route::ViewerReconfigure::Speed(1500),
+            rig.app.runtime.metadata_mut(), plx_media::route::ViewerReconfigure::Speed(1500),
             Some(12_000_000_000), Some(true)), "the same viewer choice is a no-op");
 
         let mut revised = None;
         poll_until("viewer speed edit did not re-resolve", || {
             revised = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             revised.is_some()
         });
         let revised = revised.unwrap();
@@ -1030,18 +1213,16 @@ mod uri_boot_tests {
         let caps = Capabilities { progressive_uri: true, hls_uri: false,
             packet_feed: false, pause: true, seek: true, audio_track: true,
             subtitle_track: true, audio_off: false, subtitle_off: false };
-        let port = ResolvePort::new(ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: caps, certified: caps, preview_rectangle: false },
-            Arc::new(QualifiedTwoAudio));
-        assert!(crate::app::adapters::backends::install_uri_product_with_ports(
-            &mut rig.app.adapters.player, &mut rig.app.player.session, port, bus, display));
+        let product = UriProduct { binding: Binding::Exported { canvas: (1920, 1080) },
+            callable: caps, certified: caps, qualifier: Arc::new(QualifiedTwoAudio) };
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
+            &mut rig.app.adapters.player, &mut rig.app.player.session, product, bus, display));
         rig.request();
         rig.release.send(()).unwrap();
         let mut resolved = None;
         poll_until("qualified URI source did not resolve", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         assert!(rig.app.adapters.player.offer_qualified_uri(&mut rig.app.player.session,
@@ -1113,18 +1294,16 @@ mod uri_boot_tests {
         let caps = Capabilities { progressive_uri: true, hls_uri: false,
             packet_feed: false, pause: true, seek: true, audio_track: true,
             subtitle_track: true, audio_off: false, subtitle_off: false };
-        let port = ResolvePort::new(ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: caps, certified: caps, preview_rectangle: false },
-            Arc::new(QualifiedOriginal));
-        assert!(crate::app::adapters::backends::install_uri_product_with_ports(
-            &mut rig.app.adapters.player, &mut rig.app.player.session, port, bus, display));
+        let product = UriProduct { binding: Binding::Exported { canvas: (1920, 1080) },
+            callable: caps, certified: caps, qualifier: Arc::new(QualifiedOriginal) };
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
+            &mut rig.app.adapters.player, &mut rig.app.player.session, product, bus, display));
         rig.request();
         rig.release.send(()).unwrap();
         let mut resolved = None;
         poll_until("qualified URI source did not resolve", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         assert!(rig.app.adapters.player.offer_qualified_uri(&mut rig.app.player.session,
@@ -1171,18 +1350,16 @@ mod uri_boot_tests {
         let caps = Capabilities { progressive_uri: true, hls_uri: false,
             packet_feed: false, pause: true, seek: true, audio_track: true,
             subtitle_track: true, audio_off: false, subtitle_off: false };
-        let port = ResolvePort::new(ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: caps, certified: caps, preview_rectangle: false },
-            Arc::new(QualifiedTwoAudio));
-        assert!(crate::app::adapters::backends::install_uri_product_with_ports(
-            &mut rig.app.adapters.player, &mut rig.app.player.session, port, bus, display));
+        let product = UriProduct { binding: Binding::Exported { canvas: (1920, 1080) },
+            callable: caps, certified: caps, qualifier: Arc::new(QualifiedTwoAudio) };
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
+            &mut rig.app.adapters.player, &mut rig.app.player.session, product, bus, display));
         rig.request();
         rig.release.send(()).unwrap();
         let mut resolved = None;
         poll_until("qualified URI source did not resolve", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         assert!(rig.app.adapters.player.offer_qualified_uri(&mut rig.app.player.session,
@@ -1232,18 +1409,16 @@ mod uri_boot_tests {
         let caps = Capabilities { progressive_uri: true, hls_uri: false,
             packet_feed: false, pause: true, seek: true, audio_track: true,
             subtitle_track: true, audio_off: false, subtitle_off: false };
-        let port = ResolvePort::new(ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: caps, certified: caps, preview_rectangle: false },
-            Arc::new(QualifiedOriginal));
-        assert!(crate::app::adapters::backends::install_uri_product_with_ports(
-            &mut rig.app.adapters.player, &mut rig.app.player.session, port, bus, display));
+        let product = UriProduct { binding: Binding::Exported { canvas: (1920, 1080) },
+            callable: caps, certified: caps, qualifier: Arc::new(QualifiedOriginal) };
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
+            &mut rig.app.adapters.player, &mut rig.app.player.session, product, bus, display));
         rig.request();
         rig.release.send(()).unwrap();
         let mut resolved = None;
         poll_until("qualified URI source did not resolve", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         assert!(rig.app.adapters.player.offer_qualified_uri(&mut rig.app.player.session,
@@ -1270,7 +1445,7 @@ mod uri_boot_tests {
         let (refreshed, _) = plx_data::metadata::fetch_playing_item(client, rig.sid, "1", None)
             .expect("the refreshed item lists the newly available sidecar");
         assert_eq!(refreshed.subs.first().map(|sub| sub.id), Some(3));
-        rig.app.bridge.metadata_mut().run(
+        rig.app.runtime.metadata_mut().run(
             plx_data::stores::metadata::MetadataCmd::InstallPlaying(Some(refreshed)));
         let before = rig.app.player.session.metric_request();
         rig.pick_subtitle(3);
@@ -1282,7 +1457,7 @@ mod uri_boot_tests {
         let mut replacement = None;
         poll_until("external subtitle resolve did not land", || {
             replacement = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             replacement.is_some()
         });
         assert!(replacement.unwrap().uri_offer.is_none(),
@@ -1307,18 +1482,16 @@ mod uri_boot_tests {
         let caps = Capabilities { progressive_uri: true, hls_uri: false,
             packet_feed: false, pause: true, seek: true, audio_track: true,
             subtitle_track: true, audio_off: false, subtitle_off: false };
-        let port = ResolvePort::new(ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: caps, certified: caps, preview_rectangle: false },
-            Arc::new(QualifiedOriginal));
-        assert!(crate::app::adapters::backends::install_uri_product_with_ports(
-            &mut rig.app.adapters.player, &mut rig.app.player.session, port, bus, display));
+        let product = UriProduct { binding: Binding::Exported { canvas: (1920, 1080) },
+            callable: caps, certified: caps, qualifier: Arc::new(QualifiedOriginal) };
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
+            &mut rig.app.adapters.player, &mut rig.app.player.session, product, bus, display));
         rig.request();
         rig.release.send(()).unwrap();
         let mut resolved = None;
         poll_until("qualified URI source did not resolve", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         assert!(rig.app.adapters.player.offer_qualified_uri(&mut rig.app.player.session,
@@ -1345,7 +1518,7 @@ mod uri_boot_tests {
         let mut replacement = None;
         poll_until("Force selected source did not resolve", || {
             replacement = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             replacement.is_some()
         });
         let replacement = replacement.unwrap();
@@ -1372,18 +1545,16 @@ mod uri_boot_tests {
         let caps = Capabilities { progressive_uri: true, hls_uri: false,
             packet_feed: false, pause: true, seek: true, audio_track: true,
             subtitle_track: true, audio_off: false, subtitle_off: false };
-        let port = ResolvePort::new(ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: caps, certified: caps, preview_rectangle: false },
-            Arc::new(QualifiedOriginal));
-        assert!(crate::app::adapters::backends::install_uri_product_with_ports(
-            &mut rig.app.adapters.player, &mut rig.app.player.session, port, bus, display));
+        let product = UriProduct { binding: Binding::Exported { canvas: (1920, 1080) },
+            callable: caps, certified: caps, qualifier: Arc::new(QualifiedOriginal) };
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
+            &mut rig.app.adapters.player, &mut rig.app.player.session, product, bus, display));
         rig.request();
         rig.release.send(()).unwrap();
         let mut resolved = None;
         poll_until("qualified URI source did not resolve", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         assert!(rig.app.adapters.player.offer_qualified_uri(&mut rig.app.player.session,
@@ -1447,7 +1618,7 @@ mod uri_boot_tests {
             NoSink.plane_probe_connect_dass(mt)
         }
         unsafe fn plane_finish(&self, mt: &plx_base::task::MainThread)
-            -> plx_platform::tv::sink::PlaneFinish { NoSink.plane_finish(mt) }
+            -> plx_os::tv::sink::PlaneFinish { NoSink.plane_finish(mt) }
         unsafe fn plane_bind(&self, mt: &plx_base::task::MainThread, id: *const c_char) {
             NoSink.plane_bind(mt, id)
         }
@@ -1460,9 +1631,9 @@ mod uri_boot_tests {
             NoSink.plane_start(mt, x, y, w, h)
         }
         unsafe fn plane_unload(&self, mt: &plx_base::task::MainThread)
-            -> plx_platform::tv::sink::PlaneUnload { NoSink.plane_unload(mt) }
+            -> plx_os::tv::sink::PlaneUnload { NoSink.plane_unload(mt) }
         fn plane_completions(&self, mt: &plx_base::task::MainThread)
-            -> Vec<plx_platform::tv::sink::PlaneCompletion> { NoSink.plane_completions(mt) }
+            -> Vec<plx_os::tv::sink::PlaneCompletion> { NoSink.plane_completions(mt) }
         unsafe fn plane_pause(&self, mt: &plx_base::task::MainThread) { NoSink.plane_pause(mt) }
         unsafe fn plane_resume(&self, mt: &plx_base::task::MainThread) { NoSink.plane_resume(mt) }
     }
@@ -1495,36 +1666,39 @@ mod uri_boot_tests {
     const WINDOW_STARTUP_MS: u64 = 1_000;
     const WINDOW_RELEASE_MS: u64 = 500;
 
-    /// Compose the URI driver as the boot does (`install_uri_product_with_ports`: the opted-in
-    /// viewer's capabilities over an exported canvas), but on `clock` with short allowances, over
-    /// `display`, so a startup timeout and an unreleased close are reachable by moving the clock.
+    /// Compose the URI driver as the boot does (the opted-in viewer's capabilities over an exported
+    /// canvas, published through `platform::publish_composition`), but on `clock` with short
+    /// allowances, over `display`, so a startup timeout and an unreleased close are reachable by
+    /// moving the clock.
     fn install_exported_uri(rig: &mut Rig, bus: &'static Bus, display: &'static CountingDisplay,
         clock: Arc<std::sync::atomic::AtomicU64>) {
         let caps = Capabilities { progressive_uri: true, hls_uri: false,
             packet_feed: false, pause: true, seek: true, audio_track: true,
             subtitle_track: true, audio_off: false, subtitle_off: false };
-        let port = ResolvePort::new(ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: caps, certified: caps, preview_rectangle: false },
-            Arc::new(QualifiedOriginal));
-        let evidence = port.evidence();
+        let product = UriProduct { binding: Binding::Exported { canvas: (1920, 1080) },
+            callable: caps, certified: caps, qualifier: Arc::new(QualifiedOriginal) };
         let settings = crate::app::adapters::backends::UriDriverSettings {
             clock: Box::new(StepClock(clock)),
             app_id: plx_base::paths::app_id().to_owned(),
-            binding: evidence.binding,
-            capabilities: evidence.opted_in().certified,
+            binding: product.binding,
+            capabilities: ProductEvidence::opt_in_certifies(product.callable, product.certified),
             startup_timeout_ms: WINDOW_STARTUP_MS,
             release_allowance_ms: WINDOW_RELEASE_MS,
             source_ttl_ms: 30_000,
         };
-        assert!(crate::app::adapters::backends::install_uri_backend_with_ports(
-            &mut rig.app.adapters.player, settings, bus, display));
-        rig.app.player.session.install_uri_preflight_port(port);
+        let path = crate::app::adapters::backends::install_uri_backend_with_ports(
+            &mut rig.app.adapters.player, settings, bus, display)
+            .expect("the URI driver installs");
+        let resolver = plx_media::route::uri_preflight::ResolvePort::new(
+            ProductEvidence { display: path, callable: product.callable,
+                certified: product.certified }, product.qualifier);
+        crate::app::platform::publish_composition(&mut rig.app.player.session,
+            &rig.app.adapters.player, crate::app::platform::Composition { resolver: Some(resolver) });
     }
 
     /// One frame of the app loop's playback half, as the other URI fixtures run it.
     fn window_frame(rig: &mut Rig) {
-        let mut fr = Frame::begin(&rig.app.player.session, rig.app.bridge.metadata_view());
+        let mut fr = Frame::begin(&rig.app.player.session, rig.app.runtime.metadata_view());
         unsafe { playback_tick(&mut rig.app, &mut fr); }
     }
 
@@ -1534,7 +1708,7 @@ mod uri_boot_tests {
         let mut resolved = None;
         poll_until("qualified URI source did not resolve", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         assert!(rig.app.adapters.player.offer_qualified_uri(&mut rig.app.player.session,
@@ -1583,7 +1757,7 @@ mod uri_boot_tests {
         let mut replacement = None;
         poll_until("automatic Feed rescue did not resolve", || {
             replacement = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             replacement.is_some()
         });
         assert!(replacement.unwrap().uri_offer.is_none(), "automatic rescue cannot loop back to URI");
@@ -1624,12 +1798,12 @@ mod uri_boot_tests {
         assert_eq!(windows(), held, "premise: the quarantined driver still holds its window");
         // The viewer asks for the title again.
         assert!(plx_media::route::request_play(&mut rig.app.player.session,
-            rig.app.bridge.metadata_mut(), plx_platform::devcaps::caps(), rig.sid, "1",
+            rig.app.runtime.metadata_mut(), plx_os::devcaps::caps(), rig.sid, "1",
             "/library/parts/1/file.mkv", "h264", "aac", "First", "", None, ""));
         let mut resolved = None;
         poll_until("the new request did not resolve", || {
             resolved = plx_media::route::pump_play(&mut rig.app.player.session,
-                rig.app.bridge.metadata_mut());
+                rig.app.runtime.metadata_mut());
             resolved.is_some()
         });
         if let Some(offer) = resolved.unwrap().uri_offer {
@@ -1642,5 +1816,420 @@ mod uri_boot_tests {
         assert_eq!(windows(), held, "the new request made another window (start outcome {started:?})");
         assert!(matches!(started, plx_media::player::BufferfeedStartOutcome::Failed),
             "the start over the quarantined registration is refused, not launched: {started:?}");
+    }
+    // ---- #1394: the URI engine's ACB handle is created when its first play is OFFERED, not by the boot ----
+
+    /// The URI driver composed over a scripted ACB display (`create_ids` is what its creates answer)
+    /// with production's ACB evidence and `qualifier` standing in for the viewer's engine choice.
+    fn compose_acb(rig: &mut Rig, create_ids: &[c_long], qualifier: Arc<dyn OriginalQualifier>)
+        -> (&'static Bus, &'static plx_os::tv::sink::ScriptedPlaneSink) {
+        use plx_os::tv::sink::{PlaneUnload, ScriptedPlaneSink};
+        plx_os::tv::plane::installed().reset_for_test();
+        plx_plex::plex::client_for(rig.sid).unwrap()
+            .set_link(plx_plex::plex::probe::Location::Local);
+        let bus: &'static Bus = Box::leak(Box::new(Bus::new()));
+        let display: &'static ScriptedPlaneSink =
+            Box::leak(Box::new(ScriptedPlaneSink::new(PlaneUnload { rv: 1, task: 5 })));
+        display.create_ids.lock().unwrap().extend(create_ids.iter().copied());
+        let caps = Capabilities { progressive_uri: true, hls_uri: false,
+            packet_feed: false, pause: true, seek: true, audio_track: true,
+            subtitle_track: true, audio_off: false, subtitle_off: false };
+        let product = UriProduct { binding: Binding::Acb, callable: caps, certified: caps, qualifier };
+        assert!(crate::app::adapters::backends::install_and_publish_uri_product(
+            &mut rig.app.adapters.player, &mut rig.app.player.session, product, bus, display));
+        assert!(display.created_player_types().is_empty(), "composing the driver creates no handle");
+        (bus, display)
+    }
+
+    /// Let the pending request resolve and return what the route landed.
+    fn resolve_pending(rig: &mut Rig) -> plx_media::route::ResolvedStart {
+        rig.release.send(()).unwrap();
+        let mut resolved = None;
+        poll_until("the request did not resolve", || {
+            resolved = plx_media::route::pump_play(&mut rig.app.player.session,
+                rig.app.runtime.metadata_mut());
+            resolved.is_some()
+        });
+        resolved.unwrap()
+    }
+
+    /// `offer_qualified_uri` as the app loop calls it, with the event log it wrote.
+    fn offer_with_log(rig: &mut Rig, offer: plx_media::route::QualifiedUriOffer)
+        -> (Result<(), plx_playback_contract::Failure>, String) {
+        plx_base::eventlog::with_private_log(|| {
+            let offered = rig.app.adapters.player.offer_qualified_uri(&mut rig.app.player.session, offer);
+            (offered, std::fs::read_to_string(plx_base::eventlog::events_log()).unwrap_or_default())
+        })
+    }
+
+    /// An offer whose handle cannot be made, declined as the app loop declines it, and the Feed
+    /// resolve it hands the same play to.
+    fn decline_and_resolve_feed(rig: &mut Rig, resolved: plx_media::route::ResolvedStart) -> (String, plx_media::route::ResolvedStart) {
+        let offer = resolved.uri_offer.expect("the viewer's original is offered");
+        let offer_id = offer.offer_id();
+        let (offered, log) = offer_with_log(rig, offer);
+        assert!(offered.is_err(), "the offer is declined");
+        assert!(plx_media::route::retry_declined_uri_source(&mut rig.app.player.session,
+            rig.app.runtime.metadata_mut(), resolved.route_start.expect("route start"), offer_id));
+        let feed = resolve_pending(rig);
+        assert!(feed.uri_offer.is_none(), "a declined original is not offered twice");
+        assert!(matches!(rig.app.player.session.backend_offer(),
+            plx_media::route::backend_policy::Selection::Open(choice)
+                if choice.backend == BackendKind::Feed));
+        (log, feed)
+    }
+
+    /// Start the Feed play a declined offer was handed to.
+    fn start_feed(rig: &mut Rig, feed: &plx_media::route::ResolvedStart) {
+        assert!(matches!(plx_media::player::begin_resume(&mut rig.app.player.session,
+            &mut rig.app.adapters.player, feed.resume_ns), plx_media::player::ResumeStart::Settled(
+                plx_media::player::ResumeOutcome::Prepared)));
+        assert!(matches!(plx_media::player::start_playback_tracked(
+            &mut rig.app.player.session, &mut rig.app.adapters.player),
+            plx_media::player::BufferfeedStartOutcome::Launched(_)), "Feed starts the play");
+    }
+
+    /// An Experimental viewer's offer on an ACB display makes the URI engine's handle (player type 0)
+    /// at the offer, once, and is taken; the Start after it finds the handle there.
+    #[test]
+    fn an_acb_offer_creates_the_uri_handle_at_the_offer_and_is_taken() {
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving(false) else { return };
+        let (bus, display) = compose_acb(&mut rig, &[22], Arc::new(QualifiedOriginal));
+        rig.request();
+        let resolved = resolve_pending(&mut rig);
+        let (offered, log) = offer_with_log(&mut rig, resolved.uri_offer.expect("original offered"));
+        assert!(offered.is_ok());
+        assert_eq!(display.created_player_types(), [plx_os::tv::plane::URI_PLAYER_TYPE],
+            "the offer made the handle, before any Start");
+        assert!(log.contains("acb handle=uri ptype=0 create=22 initialized=true\n"), "{log}");
+        assert!(bus.shapes().is_empty(), "nothing is opened by an offer");
+        assert!(matches!(plx_media::player::start_playback_tracked(
+            &mut rig.app.player.session, &mut rig.app.adapters.player),
+            plx_media::player::BufferfeedStartOutcome::Launched(_)));
+        window_frame(&mut rig);
+        assert_eq!(bus.shapes(), [Shape::Named], "the service is opened over the handle the offer made");
+        assert_eq!(display.created_player_types(), [0], "the Start made no second handle");
+        plx_os::tv::plane::installed().reset_for_test();
+    }
+
+    /// A create that fails declines the offer with the reason, and the same play goes to Feed.
+    #[test]
+    fn an_acb_offer_whose_handle_cannot_be_created_is_declined_and_feed_plays() {
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving(false) else { return };
+        let (bus, display) = compose_acb(&mut rig, &[], Arc::new(QualifiedOriginal));
+        rig.request();
+        let resolved = resolve_pending(&mut rig);
+        let (log, feed) = decline_and_resolve_feed(&mut rig, resolved);
+        assert!(log.contains("acb handle=uri ptype=0 create=0 initialized=false\n"), "{log}");
+        assert!(log.contains("uri: original declined (the ACB handle for the URI engine could not be created)\n"),
+            "{log}");
+        start_feed(&mut rig, &feed);
+        assert_eq!(rig.app.adapters.player.backend_snapshot().backend, Some(BackendKind::Feed));
+        assert!(bus.shapes().is_empty(), "the URI service was never opened");
+        assert_eq!(display.created_player_types(), [0], "one attempt");
+        plx_os::tv::plane::installed().reset_for_test();
+    }
+
+    /// The failed create is recorded: a later offer in the same process declines at once and makes
+    /// no second attempt.
+    #[test]
+    fn a_second_acb_offer_after_a_failed_create_declines_without_another_attempt() {
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving(false) else { return };
+        let (_, display) = compose_acb(&mut rig, &[], Arc::new(QualifiedOriginal));
+        rig.request();
+        let resolved = resolve_pending(&mut rig);
+        let (_, feed) = decline_and_resolve_feed(&mut rig, resolved);
+        start_feed(&mut rig, &feed);
+        plx_media::player::stop_playback(&mut rig.app.player.session, &mut rig.app.adapters.player);
+        assert_eq!(display.created_player_types(), [0]);
+        assert!(plx_media::route::request_play(&mut rig.app.player.session,
+            rig.app.runtime.metadata_mut(), plx_os::devcaps::caps(), rig.sid, "1",
+            "/library/parts/1/file.mkv", "h264", "aac", "First", "", None, ""));
+        let resolved = resolve_pending(&mut rig);
+        let (log, _) = decline_and_resolve_feed(&mut rig, resolved);
+        assert!(log.contains("uri: original declined (the ACB handle for the URI engine could not be created)\n"),
+            "{log}");
+        assert!(!log.contains("acb handle=uri"), "no second attempt is logged: {log}");
+        assert_eq!(display.created_player_types(), [0], "a failed create is not retried");
+        plx_os::tv::plane::installed().reset_for_test();
+    }
+
+    /// A viewer on Standard (the production qualifier answers `NotOptedIn`) is never offered the URI
+    /// engine, so nothing creates its handle: the boot made Feed's alone and a play leaves it so.
+    #[test]
+    fn a_standard_viewers_play_on_an_acb_display_creates_no_uri_handle() {
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving(false) else { return };
+        let (bus, display) = compose_acb(&mut rig, &[22], Arc::new(ProductQualifier::new(Binding::Acb)));
+        rig.request();
+        let resolved = resolve_pending(&mut rig);
+        assert!(resolved.uri_offer.is_none(), "Standard is never offered the URI engine");
+        assert!(matches!(rig.app.player.session.backend_offer(),
+            plx_media::route::backend_policy::Selection::Open(choice)
+                if choice.backend == BackendKind::Feed));
+        window_frame(&mut rig);
+        assert!(display.created_player_types().is_empty(), "no handle was made for a Standard play");
+        assert!(bus.shapes().is_empty());
+        plx_os::tv::plane::installed().reset_for_test();
+    }
+
+    /// **A Home round trip with a URI-original attempt reopens the same item at the saved position.** The
+    /// background parks the attempt (`park_playback`: Stop(Suspend), the native session is closed) and the
+    /// foreground's restore goes through the lifecycle machine's `Prepare`. A URI original plan installs no
+    /// `PlaybackSession::url` (`plan.uri_source_ready`), so `begin_resume` answered `NoRoute` and the restore
+    /// never opened anything: the Tizen emulator's "Home with a player open never resumes". The restore now
+    /// re-resolves the same source at the saved position through the foreground flight, and the Load that
+    /// follows opens the URI driver again.
+    #[test]
+    fn a_home_round_trip_reopens_a_uri_original_attempt_at_the_saved_position() {
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving(false) else { return };
+        let bus = compose_self_certified(&mut rig);
+        rig.request();
+        assert!(plx_media::route::arm_play_resume(&mut rig.app.player.session, 12_000_000_000));
+        launch_uri(&mut rig);
+        for _ in 0..3 { window_frame(&mut rig); }
+        assert_eq!(bus.shapes().len(), 1, "the first open");
+        assert!(plx_media::route::url(&rig.app.player.session).is_empty(),
+            "a URI original installs no stream URL: this is what `begin_resume` reads");
+        let saved = intended_pos(&mut rig.app.player.session);
+        assert_eq!(saved, 12_000_000_000, "the resume position is the saved one");
+        park_playback(&mut rig.app);
+        // The native session's close completes, as the hub's would.
+        bus.0.lock().unwrap().1 = CloseStatus::Released;
+        for _ in 0..3 { window_frame(&mut rig); }
+        assert!(rig.app.player.lifecycle.awaiting_load(), "the session is parked");
+        let activation = did_foreground_with_link(&mut rig.app);
+        // The restore's own position: the saved one less the foreground's rewind (the machine's `Prepare`).
+        let (ForegroundState::Prepared { resume_ns, .. } | ForegroundState::PreparePending { resume_ns, .. }) =
+            rig.app.player.lifecycle.state() else { panic!("the restore prepares at a position") };
+        let restore_ms = resume_ns / 1_000_000;
+        assert!(restore_ms > 0 && restore_ms <= 12_000, "{restore_ms}");
+        let mut frames = 0;
+        while bus.shapes().len() != 2 {
+            window_frame(&mut rig);
+            frames += 1;
+            std::thread::sleep(Duration::from_millis(2));
+            assert!(frames < 1500, "the foreground restore did not reopen the URI source: activation {:?}, machine {:?}, \
+                play_pending {}, restore outstanding {}, owed {}, source {:?}, url {:?}, control {}", activation,
+                rig.app.player.lifecycle.state(), plx_media::route::play_pending(),
+                rig.app.adapters.player.uri_restore_outstanding(),
+                plx_media::route::uri_restore_owed(&rig.app.player.session), rig.app.player.session.source_selection(),
+                plx_media::route::url(&rig.app.player.session), plx_media::route::control_phase_label());
+        }
+        assert!(rig.app.player.lifecycle.awaiting_load() || bus.shapes().len() == 2);
+        poll_until("the reopened source was not loaded", || {
+            window_frame(&mut rig);
+            bus.calls("load") == 2
+        });
+        bus.say("load", r#"{"errorCode":0,"returnValue":true,"errorText":"No Error","mediaId":"m2"}"#);
+        window_frame(&mut rig);
+        bus.say("subscribe", r#"{"audioInfo":{"track":0,"immersive":"none","mediaId":"m2"}}"#);
+        for _ in 0..3 { window_frame(&mut rig); }
+        bus.say("subscribe", r#"{"loadCompleted":{"mediaId":"m2"}}"#);
+        for _ in 0..3 { window_frame(&mut rig); }
+        assert_eq!(bus.calls("seek"), 1, "the reopened source is sought to the restore's position before its first Play");
+        let sought: serde_json::Value = serde_json::from_str(&bus.last_payload("seek")).unwrap();
+        assert_eq!(sought["position"], restore_ms);
+        plx_os::tv::plane::installed().reset_for_test();
+    }
+    /// A first URI attempt (the item, resumed at 12 s) driven to Playing: the open, the seek to the saved position, the first
+    /// Play and the clock it reports, so that the attempt's own position is 12 s.
+    fn play_uri_to_twelve_seconds(rig: &mut Rig, bus: &'static Bus) {
+        poll_until("the source was not loaded", || { window_frame(rig); bus.calls("load") == 1 });
+        bus.say("load", r#"{"errorCode":0,"returnValue":true,"errorText":"No Error","mediaId":"m1"}"#);
+        window_frame(rig);
+        bus.say("subscribe", r#"{"audioInfo":{"track":0,"immersive":"none","mediaId":"m1"}}"#);
+        window_frame(rig);
+        bus.say("subscribe", r#"{"loadCompleted":{"mediaId":"m1"}}"#);
+        for _ in 0..3 { window_frame(rig); }
+        bus.say("seek", r#"{"errorCode":0,"returnValue":true,"errorText":"No Error","mediaId":"m1"}"#);
+        for _ in 0..3 { window_frame(rig); }
+        bus.say("subscribe", r#"{"seekDone":{"mediaId":"m1"}}"#);
+        for _ in 0..3 { window_frame(rig); }
+        assert_eq!(bus.calls("play"), 1, "the first Play");
+        bus.say("play", r#"{"returnValue":true,"mediaId":"m1","playing":true,"currentTime":12000}"#);
+        for _ in 0..3 { window_frame(rig); }
+        assert_eq!(plx_media::player::intended_pos_known_ns(&rig.app.player.session), Some(12_000_000_000),
+            "the attempt has played to 12 s");
+    }
+
+    /// **The parked attempt's own `stopped` timeline goes out when the restore retires it, at its own position.** A Home round
+    /// trip parks attempt A and the restore plays the item again as B, a new session. A's `stopped` used to be a side effect of
+    /// B's first report (the retired-session mechanism of #1236 reports it at the NEW report's position), so the server saw A
+    /// stopped after B played and at B's time (the emulator's mock: `timeline A playing 9377`, `playQueue B`, `transcode stop A`,
+    /// `timeline A stopped time=15588`, `timeline B playing 15588`). The park itself reports nothing, as the webOS Feed's suspend
+    /// does (a Feed's engine goes on under the same session); the retire reports A's stop, carrying A's saved position, before the
+    /// second resolve starts. The stop and the resolve are two workers, so the order the mock sees rests on the restore's
+    /// `drain_previous` (the resolve drains the stop worker first), not on the workers' speed: with the stop worker slowed by 400 ms
+    /// this test failed before that and passes after it.
+    #[test]
+    fn a_restore_reports_the_parked_attempt_stopped_at_its_own_position_before_the_next_play() {
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving(false) else { return };
+        let bus = compose_self_certified(&mut rig);
+        rig.request();
+        assert!(plx_media::route::arm_play_resume(&mut rig.app.player.session, 12_000_000_000));
+        launch_uri(&mut rig);
+        for _ in 0..3 { window_frame(&mut rig); }
+        assert_eq!(bus.shapes().len(), 1, "the first open");
+        play_uri_to_twelve_seconds(&mut rig, bus);
+        park_playback(&mut rig.app);
+        bus.0.lock().unwrap().1 = CloseStatus::Released;
+        for _ in 0..3 { window_frame(&mut rig); }
+        assert!(rig.app.player.lifecycle.awaiting_load(), "the session is parked");
+        let timelines = |rig: &Rig| rig.requests.lock().unwrap().iter()
+            .filter(|r| r.contains("/:/timeline")).cloned().collect::<Vec<_>>();
+        assert!(timelines(&rig).iter().all(|r| !r.contains("state=stopped")),
+            "the park reports no stop (the webOS Feed's suspend does not either): {:?}", timelines(&rig));
+        did_foreground_with_link(&mut rig.app);
+        let mut frames = 0;
+        while bus.shapes().len() != 2 {
+            window_frame(&mut rig);
+            frames += 1;
+            std::thread::sleep(Duration::from_millis(2));
+            assert!(frames < 1500, "the foreground restore did not reopen the URI source");
+        }
+        // The stop is a worker's POST: give it its moment, then read the order the server saw.
+        poll_until("A's stopped timeline never reached the server", || {
+            window_frame(&mut rig);
+            timelines(&rig).iter().any(|r| r.contains("state=stopped"))
+        });
+        let requests = rig.requests.lock().unwrap().clone();
+        let stopped: Vec<usize> = requests.iter().enumerate()
+            .filter(|(_, r)| r.contains("/:/timeline") && r.contains("state=stopped")).map(|(i, _)| i).collect();
+        assert_eq!(stopped.len(), 1, "one stop for A: {requests:#?}");
+        let queues: Vec<usize> = requests.iter().enumerate()
+            .filter(|(_, r)| r.contains("/playQueues")).map(|(i, _)| i).collect();
+        assert!(queues.len() >= 2, "the restore resolved again: {requests:#?}");
+        assert!(stopped[0] < queues[1], "A is stopped before B's resolve starts: {requests:#?}");
+        assert!(requests[stopped[0]].contains("time=12000"), "A's stop carries A's own position: {}", requests[stopped[0]]);
+        plx_os::tv::plane::installed().reset_for_test();
+    }
+
+    /// **A host terminate while a URI attempt is parked still reports it stopped, at its own position.** The host's terminate reaches
+    /// the library as a Suspend (the emulator's log: `stop requested (Suspend)`, then `the library is stopping, so the close
+    /// cannot be asked`), which parks the attempt: its native session is closed, no route attempt is bound, and the exit's
+    /// `playback_needs_teardown` read false, so the server never heard the title stopped (no `stopped` timeline, no transcode
+    /// stop) and kept showing it as playing. The exit stops it through the same path a Back does.
+    #[test]
+    fn an_exit_while_a_uri_attempt_is_parked_reports_it_stopped_at_its_own_position() {
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving(false) else { return };
+        let bus = compose_self_certified(&mut rig);
+        rig.request();
+        assert!(plx_media::route::arm_play_resume(&mut rig.app.player.session, 12_000_000_000));
+        launch_uri(&mut rig);
+        for _ in 0..3 { window_frame(&mut rig); }
+        play_uri_to_twelve_seconds(&mut rig, bus);
+        park_playback(&mut rig.app);
+        bus.0.lock().unwrap().1 = CloseStatus::Released;
+        for _ in 0..3 { window_frame(&mut rig); }
+        assert!(rig.app.player.lifecycle.awaiting_load(), "the session is parked");
+        let stops = |rig: &Rig| rig.requests.lock().unwrap().iter()
+            .filter(|r| r.contains("/:/timeline") && r.contains("state=stopped")).cloned().collect::<Vec<_>>();
+        assert!(stops(&rig).is_empty(), "the park reports nothing");
+        super::end_playback_for_exit(&mut rig.app.player.session, &mut rig.app.adapters.player);
+        plx_media::route::drain_scrobble();
+        let all = rig.requests.lock().unwrap().clone();
+        let stops = stops(&rig);
+        assert_eq!(stops.len(), 1, "the exit reported the parked attempt stopped: {all:?}");
+        assert!(stops[0].contains("time=12000"), "at its own position: {}", stops[0]);
+        plx_os::tv::plane::installed().reset_for_test();
+    }
+
+    /// **A restore the request door refuses has already reported the parked attempt stopped, and the exit does not report it
+    /// again.** The restore sends A's `stopped` BEFORE the door is asked (the replacement's resolve waits behind it), but nothing
+    /// marked A finalized, so a door that refused left A parked and owing the stop it had sent: the exit's
+    /// `parked_uri_owes_stop` (or the next foreground's restore) reported A stopped a second time.
+    #[test]
+    fn a_refused_restore_leaves_the_parked_attempt_reported_once_and_its_exit_does_not_report_it_again() {
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving(false) else { return };
+        let bus = compose_self_certified(&mut rig);
+        rig.request();
+        assert!(plx_media::route::arm_play_resume(&mut rig.app.player.session, 12_000_000_000));
+        launch_uri(&mut rig);
+        for _ in 0..3 { window_frame(&mut rig); }
+        play_uri_to_twelve_seconds(&mut rig, bus);
+        park_playback(&mut rig.app);
+        bus.0.lock().unwrap().1 = CloseStatus::Released;
+        for _ in 0..3 { window_frame(&mut rig); }
+        assert!(rig.app.player.lifecycle.awaiting_load(), "the session is parked");
+        let stops = |rig: &Rig| rig.requests.lock().unwrap().iter()
+            .filter(|r| r.contains("/:/timeline") && r.contains("state=stopped")).cloned().collect::<Vec<_>>();
+        // A route transition owns the player: the request door refuses the restore's re-resolve.
+        plx_media::route::force_applying_for_test(4242);
+        did_foreground_with_link(&mut rig.app);
+        poll_until("the restore never reported A stopped", || {
+            window_frame(&mut rig);
+            plx_media::route::drain_scrobble();
+            !stops(&rig).is_empty()
+        });
+        poll_until("the refused restore never settled", || {
+            window_frame(&mut rig);
+            !rig.app.adapters.player.uri_restore_outstanding()
+        });
+        assert_eq!(bus.shapes().len(), 1, "the door refused: no second native session was opened");
+        assert_eq!(stops(&rig).len(), 1, "the restore reported A stopped once");
+        super::end_playback_for_exit(&mut rig.app.player.session, &mut rig.app.adapters.player);
+        plx_media::route::drain_scrobble();
+        let all = rig.requests.lock().unwrap().clone();
+        assert_eq!(stops(&rig).len(), 1, "the exit does not report the already reported attempt again: {all:?}");
+        plx_os::tv::plane::installed().reset_for_test();
+    }
+
+    /// **An ended URI attempt with no player page is stopped once, not on every frame of its release.** The EOS orphan
+    /// branch (`playback_tick`) stops an engine nothing owns, and a URI attempt's release is a close the host confirms
+    /// several frames later while the attempt still reads "needing teardown" (the Tizen emulator logged the line five times
+    /// at its end of stream; the webOS URI driver closes its own session at the end, so its release is already underway when
+    /// the branch is first reached). The branch must wait while the release is `Releasing` and then stop exactly once.
+    /// Here the native close is not confirmed for twelve frames, and then it is.
+    #[test]
+    fn an_ended_uri_attempt_with_no_player_page_is_stopped_once_while_its_release_is_pending() {
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving(false) else { return };
+        let bus = compose_self_certified(&mut rig);
+        rig.request();
+        launch_uri(&mut rig);
+        for _ in 0..3 { window_frame(&mut rig); }
+        poll_until("the source was not loaded", || {
+            window_frame(&mut rig);
+            bus.calls("load") == 1
+        });
+        bus.say("load", r#"{"errorCode":0,"returnValue":true,"errorText":"No Error","mediaId":"m1"}"#);
+        window_frame(&mut rig);
+        bus.say("subscribe", r#"{"audioInfo":{"track":0,"immersive":"none","mediaId":"m1"}}"#);
+        for _ in 0..3 { window_frame(&mut rig); }
+        bus.say("subscribe", r#"{"loadCompleted":{"mediaId":"m1"}}"#);
+        for _ in 0..3 { window_frame(&mut rig); }
+        assert!(super::super::bridge::player(&rig.app.pages).is_none(), "no player page is mounted");
+        bus.say("subscribe", r#"{"mediaId":"m1","endOfStream":true}"#);
+        let stops = |log: &str| log.matches("EOS: stopping an off-route engine nothing owns").count();
+        let (releasing, log) = plx_base::eventlog::with_private_log(|| {
+            for _ in 0..12 {
+                window_frame(&mut rig);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            (rig.app.adapters.player.backend_snapshot().phase,
+                std::fs::read_to_string(plx_base::eventlog::events_log()).unwrap_or_default())
+        });
+        assert_eq!(plx_media::player::ended(&rig.app.player.session), Some(true));
+        assert_eq!(releasing, plx_playback_contract::Phase::Releasing, "the native close is not confirmed yet");
+        assert_eq!(stops(&log), 0, "a release already underway is not stopped again on every frame: {log}");
+        // The host confirms the close; the stop nothing else would make follows, once.
+        bus.0.lock().unwrap().1 = CloseStatus::Released;
+        let log = plx_base::eventlog::with_private_log(|| {
+            for _ in 0..12 {
+                window_frame(&mut rig);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::fs::read_to_string(plx_base::eventlog::events_log()).unwrap_or_default()
+        });
+        assert_eq!(stops(&log), 1, "the one stop, once the release is done: {log}");
+        plx_os::tv::plane::installed().reset_for_test();
     }
 }

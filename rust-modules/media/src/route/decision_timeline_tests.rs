@@ -496,7 +496,7 @@ fn a_film_request_retires_the_previous_trailers_preview_mark() {
     assert!(preview_request(&ps), "the trailer's session is marked");
 
     assert!(request_play(
-        &mut ps, &mut meta, plx_platform::devcaps::caps(), ServerId::from_raw(0), "film", "/library/parts/2/file.mkv", "h264", "aac", "Film", "", None, "",
+        &mut ps, &mut meta, plx_os::devcaps::caps(), ServerId::from_raw(0), "film", "/library/parts/2/file.mkv", "h264", "aac", "Film", "", None, "",
     ));
     assert!(!preview_request(&ps), "a film request is not a preview, whatever the last landing was");
 
@@ -718,7 +718,7 @@ fn a_playback_request_clears_a_finished_flag_no_stop_took() {
     ps.finished = true;
 
     assert!(request_play(
-        &mut ps, &mut meta, plx_platform::devcaps::caps(), ServerId::from_raw(0), "film", "/library/parts/2/file.mkv", "h264", "aac", "Film", "", None, "",
+        &mut ps, &mut meta, plx_os::devcaps::caps(), ServerId::from_raw(0), "film", "/library/parts/2/file.mkv", "h264", "aac", "Film", "", None, "",
     ));
     assert!(!ps.finished, "the request retired the flag");
 
@@ -1492,11 +1492,11 @@ fn a_live_switch_waits_for_the_abandoned_tune_to_free_its_tuner() {
     });
     let sid = plx_plex::plex::register_for_test("live-switch", "127.0.0.1", port, "tok", "cid");
     let mut meta = plx_data::stores::metadata::MetadataStore::default();
-    assert!(request_live(&mut ps, &mut meta, plx_platform::devcaps::caps(), sid, "7", "A", "A"));
+    assert!(request_live(&mut ps, &mut meta, plx_os::devcaps::caps(), sid, "7", "A", "A"));
     let first = wire_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(first.contains("/channels/A/tune?"), "{first}");
     cancel_play(&mut ps);
-    assert!(request_live(&mut ps, &mut meta, plx_platform::devcaps::caps(), sid, "7", "B", "B"));
+    assert!(request_live(&mut ps, &mut meta, plx_os::devcaps::caps(), sid, "7", "B", "B"));
     let mut requests = vec![first];
     if let Ok(early) = wire_rx.recv_timeout(Duration::from_millis(200)) { requests.push(early); }
     release_tx.send(()).unwrap();
@@ -1624,7 +1624,7 @@ fn a_live_channel_s_refused_own_playlist_converts_the_recording_it_opened() {
     let (port, rx) = live_pms(false);
     let sid = plx_plex::plex::register_for_test("route-live-open-failed", "127.0.0.1", port, "tok-live", "cid-live");
     let mut meta = plx_data::stores::metadata::MetadataStore::default();
-    assert!(request_live(&mut ps, &mut meta, plx_platform::devcaps::caps(), sid, "7",
+    assert!(request_live(&mut ps, &mut meta, plx_os::devcaps::caps(), sid, "7",
         "C101.242.ersatztv.org", "Channel one"));
     assert!(wait_resolve_workers_for_test(Duration::from_secs(10)));
     let plan = pump_play(&mut ps, &mut meta).expect("the tune lands");
@@ -1765,7 +1765,7 @@ fn the_as_recorded_live_fallback_installs_the_original_route_and_keeps_its_conve
     let (port, rx) = live_pms(true);
     let sid = plx_plex::plex::register_for_test("route-live-as-recorded", "127.0.0.1", port, "tok-live", "cid-live");
     let mut meta = plx_data::stores::metadata::MetadataStore::default();
-    assert!(request_live(&mut ps, &mut meta, plx_platform::devcaps::caps(), sid, "7",
+    assert!(request_live(&mut ps, &mut meta, plx_os::devcaps::caps(), sid, "7",
         "C101.242.ersatztv.org", "Channel one"));
     assert!(wait_resolve_workers_for_test(Duration::from_secs(10)));
     let plan = pump_play(&mut ps, &mut meta).expect("the tune lands");
@@ -1794,7 +1794,7 @@ fn a_live_channel_s_conversion_restarts_playback_through_the_feed_door() {
     let (port, rx) = live_pms(false);
     let sid = plx_plex::plex::register_for_test("route-live-restart", "127.0.0.1", port, "tok-live", "cid-live");
     let mut meta = plx_data::stores::metadata::MetadataStore::default();
-    assert!(request_live(&mut ps, &mut meta, plx_platform::devcaps::caps(), sid, "7",
+    assert!(request_live(&mut ps, &mut meta, plx_os::devcaps::caps(), sid, "7",
         "C101.242.ersatztv.org", "Channel one"));
     assert!(wait_resolve_workers_for_test(Duration::from_secs(10)));
     let plan = pump_play(&mut ps, &mut meta).expect("the tune lands");
@@ -1832,7 +1832,7 @@ fn a_live_conversion_names_a_bare_encoder_and_its_master_variant_opens() {
     let (port, rx) = live_pms(false);
     let sid = plx_plex::plex::register_for_test("route-live-variant", "127.0.0.1", port, "tok-live", "cid-live");
     let mut meta = plx_data::stores::metadata::MetadataStore::default();
-    assert!(request_live(&mut ps, &mut meta, plx_platform::devcaps::caps(), sid, "7",
+    assert!(request_live(&mut ps, &mut meta, plx_os::devcaps::caps(), sid, "7",
         "C101.242.ersatztv.org", "Channel one"));
     assert!(wait_resolve_workers_for_test(Duration::from_secs(10)));
     let plan = pump_play(&mut ps, &mut meta).expect("the tune lands");
@@ -1889,7 +1889,7 @@ fn a_full_stop_retires_the_live_request_but_replacement_keeps_its_descriptor() {
     let mut ps = PlaybackSession::IDLE;
     let _guard = fresh_registry(&mut ps);
     let mut meta = plx_data::stores::metadata::MetadataStore::default();
-    assert!(request_live(&mut ps, &mut meta, plx_platform::devcaps::caps(), ServerId::UNSET,
+    assert!(request_live(&mut ps, &mut meta, plx_os::devcaps::caps(), ServerId::UNSET,
         "7", "channel-1", "Channel one"));
     assert!(is_live(&ps));
     let mut adapter = crate::player::adapter::PlayerAdapter::new(unsafe { plx_base::task::MainThread::assume() });
@@ -1899,7 +1899,7 @@ fn a_full_stop_retires_the_live_request_but_replacement_keeps_its_descriptor() {
     assert!(!is_live(&ps), "Back retires the actual live request, even without a landed engine");
     assert!(!can_retry_current_play(&ps));
     // No library-only facet may ever manufacture /library/metadata/ for a live request.
-    assert!(request_live(&mut ps, &mut meta, plx_platform::devcaps::caps(), ServerId::UNSET,
+    assert!(request_live(&mut ps, &mut meta, plx_os::devcaps::caps(), ServerId::UNSET,
         "7", "channel-2", "Channel two"));
     for video in [VideoLane::AsPlanned, VideoLane::Encode, VideoLane::Both] {
         assert!(matches!(dispatch_refusal_conversion(&mut ps, 0, video), RecoveryDispatch::Refused));
@@ -1919,7 +1919,7 @@ fn a_live_retry_tunes_again_and_starts_at_the_edge_not_at_the_failed_position() 
     let (port, rx) = live_pms(false);
     let sid = plx_plex::plex::register_for_test("route-live-retry", "127.0.0.1", port, "tok-live", "cid-live");
     let mut meta = plx_data::stores::metadata::MetadataStore::default();
-    assert!(request_live(&mut ps, &mut meta, plx_platform::devcaps::caps(), sid, "7",
+    assert!(request_live(&mut ps, &mut meta, plx_os::devcaps::caps(), sid, "7",
         "C101.242.ersatztv.org", "Channel one"));
     assert!(wait_resolve_workers_for_test(Duration::from_secs(10)));
     let first = pump_play(&mut ps, &mut meta).expect("the first tune lands");

@@ -100,6 +100,7 @@ use crate::up_next::{self, Countdown, Decor, Layout};
 pub struct Frame<'a> {
     /// The entry the screen draws under: the key the chapters strip's Shelf reads focus from.
     pub entry: plx_machine::machine::EntryId,
+    pub press: plx_machine::machine::PressRead<u32>,
     pub ps: &'a plx_media::route::PlaybackSession,
     pub model: &'a HudModel,
     pub up: &'a Countdown,
@@ -615,14 +616,14 @@ fn walk<H: Host>(
                         let timer = if matches!(f.slot, ControlSlot::AutomaticUpNext(_)) {
                             up_next::CountdownView::automatic(f.model.skip_progress)
                         } else { f.up.view(f.now) };
-                        offer_drawn |= up_next::draw_over(f.ps, &layout, decor, look, row, timer, q, f.focus == GROUP_ROW, f.btn, f.measure);
+                        offer_drawn |= up_next::draw_over(f.ps, &layout, decor, look, row, timer, q, f.focus == GROUP_ROW, f.btn, f.measure, f.press);
                     }
                 }
                 DrawOp::SkipPill { rects, watch } => {
                     if let ControlSlot::Skip(pr) = f.slot {
                         let face = crate::hud_format::compile::SkipKind::for_prompt(pr) as usize;
                         let (shown, beside) = (rects[face], pr.automatic.then_some(watch[face]));
-                        skip_pill::draw_at(row, q, pr, shown, beside, f.focus == GROUP_ROW, f.btn, f.model.skip_progress);
+                        skip_pill::draw_at(row, q, pr, shown, beside, f.focus == GROUP_ROW, f.btn, f.model.skip_progress, f.press);
                         // a presented offer is every one of its buttons legibly inside the clip, as Up Next's
                         offer_drawn |= q.opacity() >= 0.5 && std::iter::once(shown).chain(beside).all(|r| {
                             let (rect, _, clip) = q.to_screen(r);
@@ -861,10 +862,10 @@ fn draw_labelled(compiled: &Compiled, f: &Frame<'_>, row: &HudMotion, e: &plx_ui
         let Some(i) = c.section.as_deref().and_then(tab_of_section) else { return };
         (f.focus == super::geometry::GROUP_TABS && f.tab == i, 1.0)
     } else if let Some(i) = row_index.and_then(|i| i32::try_from(i).ok()) {
-        (f.focus == GROUP_ROW && f.btn == i, row.scale(i))
+        (f.focus == GROUP_ROW && f.btn == i, row.scale(i, f.press))
     } else {
         let Some(i) = super::geometry::section_buttons(state).position(|k| k.id == c.id) else { return };
-        ((f.focus == GROUP_SECTION && usize::try_from(f.btn).is_ok_and(|b| b == i)) || row.held_button() == Some(i), row.section_scale(i))
+        ((f.focus == GROUP_SECTION && usize::try_from(f.btn).is_ok_and(|b| b == i)) || row.held_button() == Some(i), row.section_scale(i, f.press))
     };
     let model = match f.slot { ControlSlot::Discs(controls) => HudModel { controls, ..*f.model }, _ => *f.model };
     let button = plx_ui::widgets::Button::new(label.as_ptr(), theme::size::BODY, c.rect)
@@ -914,10 +915,10 @@ fn draw_control(
             let (i, focused, scale) = if c.is_action {
                 let Some(i) = super::geometry::section_buttons(state).position(|k| k.id == c.id) else { return };
                 let Ok(index) = i32::try_from(i) else { return };
-                (index, (f.focus == GROUP_SECTION && f.btn == index) || row.held_button() == Some(i), row.section_scale(i))
+                (index, (f.focus == GROUP_SECTION && f.btn == index) || row.held_button() == Some(i), row.section_scale(i, f.press))
             } else {
                 let Some(i) = row_index.and_then(|i| i32::try_from(i).ok()) else { return };
-                (i, f.focus == GROUP_ROW && f.btn == i, row.scale(i))
+                (i, f.focus == GROUP_ROW && f.btn == i, row.scale(i, f.press))
             };
             let model = HudModel { controls, ..*f.model };
             let button = TransportButton::new(i, c.rect)
@@ -967,7 +968,7 @@ fn draw_control(
                 return;
             };
             let focused = (f.focus == GROUP_SECTION && usize::try_from(f.btn).is_ok_and(|b| b == i)) || row.held_button() == Some(i);
-            sections::button(f, q, e, c, focused, row.section_scale(i));
+            sections::button(f, q, e, c, focused, row.section_scale(i, f.press));
         }
     }
 }
@@ -979,7 +980,7 @@ mod tests {
     use crate::player_hud::state::Controls;
     use crate::skip_pill::prompt_for;
     use plx_data::metadata::{Marker, MarkerKind};
-    use plx_platform::i18n::{language_on_this_thread_for_test, Preference, SHIPPED};
+    use plx_os::i18n::{language_on_this_thread_for_test, Preference, SHIPPED};
     use plx_ui::draw_census::{capture, capture_icons, capture_inks, capture_runs, Run};
     use plx_ui::fixture::FixtureMeasure;
     use plx_ui::icons::Icon;
@@ -1007,6 +1008,7 @@ mod tests {
             focus,
             press: PressRead::default(),
             owner: InputOwner::Entry(EntryId(0)),
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
         };
         f(&DrawFrame::new(&cx, Painter::root()))
     }
@@ -1065,7 +1067,7 @@ mod tests {
         let model = HudModel { paused: c.paused, duration_ns: 600_000_000_000, playpos_ns: 90_000_000_000, ..HudModel::default() };
         let up = Countdown::default();
         let mut row = HudMotion::new();
-        let frame = Frame {
+        let frame = Frame { press: Default::default(),
             entry: EntryId(0), ps: &ps,
             model: &model,
             up: &up,
@@ -1162,7 +1164,7 @@ mod tests {
         let mut compared = 0;
         for language in frozen_languages.iter().copied() {
             let _language = language_on_this_thread_for_test(language);
-            let cx = plx_platform::i18n::current();
+            let cx = plx_os::i18n::current();
             let hud = crate::player_hud::loaded::load_classic("0.0.0-test", cx, &FM);
             for (index, c) in cases().into_iter().enumerate() {
                 let (new, drew) = drawn(&hud.compiled, c);
@@ -1181,7 +1183,7 @@ mod tests {
     #[test]
     fn catalan_classic_renders_every_case() {
         let _language = language_on_this_thread_for_test(Preference::Ca);
-        let cx = plx_platform::i18n::current();
+        let cx = plx_os::i18n::current();
         let hud = crate::player_hud::loaded::load_classic("0.0.0-test", cx, &FM);
         for c in cases() {
             let (drawn_census, drew) = drawn(&hud.compiled, c);
@@ -1193,13 +1195,13 @@ mod tests {
     /// A failure owns the frame: nothing of the transport draws, and the title's marquee resets.
     #[test]
     fn a_failure_read_out_owns_the_frame_in_the_renderer_too() {
-        let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_platform::i18n::english(), &FM);
+        let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_os::i18n::english(), &FM);
         let ps = plx_media::route::PlaybackSession::IDLE;
         let store = plx_data::stores::metadata::MetadataStore::default();
         let model = HudModel::default();
         let up = Countdown::default();
         let mut row = HudMotion::new();
-        let frame = Frame {
+        let frame = Frame { press: Default::default(),
             entry: EntryId(0), ps: &ps,
             model: &model,
             up: &up,
@@ -1297,10 +1299,10 @@ mod tests {
 
         fn scene(items: Vec<Chapter>, sel: u32, appear: f32, closing: bool) -> Side {
             let _serial = plx_base::testlock::serial();
-            let _en = language_on_this_thread_for_test(plx_platform::i18n::Preference::En);
+            let _en = language_on_this_thread_for_test(plx_os::i18n::Preference::En);
             let mut store = plx_data::stores::metadata::MetadataStore::default();
             plx_data::metadata::set_playing_chapters_for_test(store.state_mut(), items);
-            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_platform::i18n::english(), &FM);
+            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_os::i18n::english(), &FM);
             let state = hud.compiled.lookup(OPEN_CHAPTERS, Slot::Discs, true, true, false).expect("classic has a chapters state");
             let geo = state.ops.iter().find_map(Geometry::of).expect("the chapters state has a strip");
             let ps = plx_media::route::PlaybackSession::IDLE;
@@ -1308,7 +1310,7 @@ mod tests {
             let up = Countdown::default();
             let mut row = HudMotion::new();
             row.set_section_appear_for_test(Section::Chapters, appear);
-            let frame = Frame {
+            let frame = Frame { press: Default::default(),
                 entry: ENTRY, ps: &ps, model: &model, up: &up, slot: ControlSlot::Discs(Controls::NONE), busy: Busy::None,
                 focus: GROUP_SCRUB, btn: 0, tab: 0, open: if closing { 0 } else { OPEN_CHAPTERS }, now: 1_000, transport: false, measure: &FM, meta: store.view(),
             };
@@ -1513,17 +1515,17 @@ mod tests {
 
         fn scene(detail: Detail, appear: f32, closing: bool) -> Census {
             let _serial = plx_base::testlock::serial();
-            let _en = language_on_this_thread_for_test(plx_platform::i18n::Preference::En);
+            let _en = language_on_this_thread_for_test(plx_os::i18n::Preference::En);
             let mut store = plx_data::stores::metadata::MetadataStore::default();
             plx_data::metadata::set_current_for_test(store.state_mut(), Some(detail));
-            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_platform::i18n::english(), &FM);
+            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_os::i18n::english(), &FM);
             assert!(hud.compiled.lookup(OPEN_INFO, Slot::Discs, true, true, false).is_some(), "classic has an info state");
             let ps = plx_media::route::PlaybackSession::IDLE;
             let model = HudModel::default();
             let up = Countdown::default();
             let mut row = HudMotion::new();
             row.set_section_appear_for_test(Section::Info, appear);
-            let frame = Frame {
+            let frame = Frame { press: Default::default(),
                 entry: EntryId(0), ps: &ps, model: &model, up: &up, slot: ControlSlot::Discs(Controls::NONE), busy: Busy::None,
                 focus: GROUP_SCRUB, btn: 0, tab: 0, open: if closing { 0 } else { OPEN_INFO },
                 now: 1_000, transport: false, measure: &FM, meta: store.view(),
@@ -1664,8 +1666,8 @@ mod tests {
         #[test]
         fn the_synopsis_column_ends_where_the_cards_text_column_ends() {
             let _serial = plx_base::testlock::serial();
-            let _en = language_on_this_thread_for_test(plx_platform::i18n::Preference::En);
-            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_platform::i18n::english(), &FM);
+            let _en = language_on_this_thread_for_test(plx_os::i18n::Preference::En);
+            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_os::i18n::english(), &FM);
             let state = hud.compiled.lookup(OPEN_INFO, Slot::Discs, true, true, false).expect("classic has an info state");
             let text = |bind: &str| {
                 state
@@ -1753,7 +1755,7 @@ mod tests {
         /// what is compared; the full block fills the rect exactly.
         #[test]
         fn a_group_stays_inside_its_worst_case_rect() {
-            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_platform::i18n::english(), &FM);
+            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_os::i18n::english(), &FM);
             let state = hud.compiled.lookup(OPEN_INFO, Slot::Discs, true, true, false).expect("an info state");
             assert_eq!(state.groups.len(), 1, "classic's info text block is one group");
             let rect = state.groups[0].rect;
@@ -1781,7 +1783,7 @@ mod tests {
         #[test]
         fn a_package_vstack_with_the_title_pair_stays_static() {
             let text = include_str!("../hud_format/fixtures/reference/hud.json");
-            let compiled = crate::player_hud::loaded::load(&crate::hud_format::fixtures::with_hud_resources("reference", &text), "0.0.0-test", plx_platform::i18n::english(), &FM)
+            let compiled = crate::player_hud::loaded::load(&crate::hud_format::fixtures::with_hud_resources("reference", &text), "0.0.0-test", plx_os::i18n::english(), &FM)
                 .expect("the reference loads")
                 .compiled;
             let state = compiled.lookup(OPEN_INFO, Slot::Discs, true, true, false).expect("the reference has an info state");
@@ -1790,7 +1792,7 @@ mod tests {
 
         #[test]
         fn an_open_chapters_state_has_no_info_arms_and_the_gate_only_hides_the_compact_state() {
-            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_platform::i18n::english(), &FM);
+            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_os::i18n::english(), &FM);
             assert!(hud.compiled.lookup(OPEN_CHAPTERS, Slot::Discs, true, true, false).is_some());
         }
     }
@@ -1805,15 +1807,15 @@ mod tests {
 
         fn info_frame_census(transport: bool, tab: i32, focus: GroupId, btn: i32, row: &mut HudMotion) -> Census {
             let _serial = plx_base::testlock::serial();
-            let _en = language_on_this_thread_for_test(plx_platform::i18n::Preference::En);
+            let _en = language_on_this_thread_for_test(plx_os::i18n::Preference::En);
             let mut store = plx_data::stores::metadata::MetadataStore::default();
             plx_data::metadata::set_current_for_test(store.state_mut(), Some(plx_data::metadata::Detail { title: "T".into(), ..Default::default() }));
-            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_platform::i18n::english(), &FM);
+            let hud = crate::player_hud::loaded::load_classic("0.0.0-test", plx_os::i18n::english(), &FM);
             let state = hud.compiled.lookup(OPEN_INFO, Slot::Discs, true, true, false).expect("an info state");
             let ps = plx_media::route::PlaybackSession::IDLE;
             let model = HudModel::default();
             let up = Countdown::default();
-            let frame = Frame {
+            let frame = Frame { press: Default::default(),
                 entry: EntryId(0), ps: &ps, model: &model, up: &up, slot: ControlSlot::Discs(Controls::NONE), busy: Busy::None,
                 focus, btn, tab, open: 0, now: 1_000, transport, measure: &FM, meta: store.view(),
             };
@@ -1836,7 +1838,7 @@ mod tests {
         #[test]
         fn a_toggle_section_control_reads_selected_while_its_section_is_open() {
             let text = include_str!("../hud_format/fixtures/reference/hud.json");
-            let compiled = crate::player_hud::loaded::load(&crate::hud_format::fixtures::with_hud_resources("reference", &text), "0.0.0-test", plx_platform::i18n::english(), &FM)
+            let compiled = crate::player_hud::loaded::load(&crate::hud_format::fixtures::with_hud_resources("reference", &text), "0.0.0-test", plx_os::i18n::english(), &FM)
                 .expect("the reference loads")
                 .compiled;
             let open = |bits: u8| {
@@ -1856,13 +1858,13 @@ mod tests {
             for _ in 0..20 {
                 row.step(slot, GROUP_SECTION, 1, 0.05, 1_000, Some(true), false);
             }
-            assert!(row.section_scale(1) > 1.0, "the focused section button pops: {}", row.section_scale(1));
-            assert_eq!(row.section_scale(0), 1.0, "its sibling does not");
-            assert_eq!(row.scale(1), 1.0, "and the control row's own springs are not the section's");
+            assert!(row.section_scale(1, Default::default()) > 1.0, "the focused section button pops: {}", row.section_scale(1, Default::default()));
+            assert_eq!(row.section_scale(0, Default::default()), 1.0, "its sibling does not");
+            assert_eq!(row.scale(1, Default::default()), 1.0, "and the control row's own springs are not the section's");
             for _ in 0..40 {
                 row.step(slot, GROUP_ROW, 1, 0.05, 1_000, Some(true), false);
             }
-            assert_eq!(row.section_scale(1), 1.0, "focus moved off the section group: it settles");
+            assert_eq!(row.section_scale(1, Default::default()), 1.0, "focus moved off the section group: it settles");
         }
 
         /// The drawn button wears the pop: the focused button's census differs from its resting one.
@@ -1890,7 +1892,7 @@ mod tests {
 
         fn reference() -> std::sync::Arc<Compiled> {
             let text = include_str!("../hud_format/fixtures/reference/hud.json");
-            crate::player_hud::loaded::load(&crate::hud_format::fixtures::with_hud_resources("reference", &text), "0.0.0-test", plx_platform::i18n::english(), &FM)
+            crate::player_hud::loaded::load(&crate::hud_format::fixtures::with_hud_resources("reference", &text), "0.0.0-test", plx_os::i18n::english(), &FM)
                 .expect("the reference loads")
                 .compiled
         }
@@ -1904,7 +1906,7 @@ mod tests {
             let store = plx_data::stores::metadata::MetadataStore::default();
             let up = Countdown::default();
             let mut row = HudMotion::new();
-            let frame = Frame {
+            let frame = Frame { press: Default::default(),
                 entry: EntryId(0), ps: &ps, model: &model, up: &up, slot, busy: Busy::None, focus, btn,
                 tab: 0, open: 0, now: 1_000, transport: true, measure: &FM, meta: store.view(),
             };
@@ -2008,7 +2010,7 @@ mod tests {
                 if let Some(a) = appear {
                     row.set_section_appear_for_test(Section::Info, a);
                 }
-                let frame = Frame {
+                let frame = Frame { press: Default::default(),
                     entry: EntryId(0), ps: &ps, model: &model, up: &up, slot: ControlSlot::Discs(Controls::NONE), busy: Busy::None,
                     focus: GROUP_SCRUB, btn: 0, tab: 0, open, now: 1_000, transport: true, measure: &FM, meta: store.view(),
                 };

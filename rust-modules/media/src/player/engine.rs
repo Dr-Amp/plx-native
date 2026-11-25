@@ -12,7 +12,7 @@
 //! publishes to the Feed's own state.
 #[cfg(test)]
 use plx_play_feed::shared::FEED_SHARED;
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use super::route_start::{exit_native, exit_native_with, finish_release_for_test, poll_release,
     reap_abandoned_load, release_server_stopped_engine, NativeExit};
 #[cfg(test)]
@@ -35,23 +35,23 @@ use plx_play_feed::pcm_lead::{pcm_output_lead, PCM_LEAD_BY_OUTPUT, PCM_SINK_LEAD
 use plx_play_feed::{
     fed_fps_rational, opus_head, pcm_rate_khz, ENVELOPE_FHD60, ENVELOPE_UHD60, PAYLOAD_AV,
 };
-pub(crate) use plx_platform::devcaps::LoadVideo;
+pub(crate) use plx_os::devcaps::LoadVideo;
 #[cfg(test)]
 pub(crate) use plx_play_feed::load_video_refused;
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use plx_playback_contract::feed::Stage;
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use plx_play_feed::seek::{inplace_layout_known, old_abi_seek_tested, select_seek_mode};
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use plx_playback_contract::feed::SeekMode;
 #[cfg(test)]
 use super::log;
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use plx_base::task::MainThread;
 #[cfg(test)]
-use plx_platform::devcaps::AudioStack;
+use plx_os::devcaps::AudioStack;
 use plx_telemetry::telemetry::window::Stage as WindowStage;
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use std::os::raw::{c_char, c_int};
 use std::sync::atomic::Ordering;
 
@@ -112,12 +112,12 @@ pub const fn feed_leads_ms() -> (i64, i64) {
 // levers are one decision and neither is worth landing alone.
 // `docs/measurements/p0-plant-sizing.md` is the record; `requiredMemory` is 160 MB, so +2 MiB RSS
 // on a 32-bit set is inside the budget already declared.
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use plx_play_feed::feed_state::{AQ_VIDEO_BYTES, AQ_AUDIO_BYTES};
 
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use plx_play_feed::feed_state::{Engine, FeedPace, Source};
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use plx_play_feed::feed_state::engines_dropped_for_test;
 
 // The `ENGINE` slot is `App.adapters.player` since phase 9 — a field, reached as
@@ -141,15 +141,15 @@ pub fn exported_window_destroyed() {
     window_step(WindowStage::ExportedWindowDestroy);
 }
 
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 fn release_native_object(mt: &MainThread, epoch: u32) {
     let _ = release_native_object_timed(mt, epoch, &mut TeardownSpans::new());
 }
 
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use plx_play_feed::native_executor::TeardownSpans;
 
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 fn release_native_object_timed(mt: &MainThread, epoch: u32, sp: &mut TeardownSpans)
     -> plx_playback_contract::ReleaseStatus {
     plx_play_feed::native_executor::release_native_object_timed(
@@ -174,7 +174,7 @@ fn window_step(stage: WindowStage) {
 /// route.
 pub(crate) fn speed_fps_ceiling(
     video: Option<LoadVideo>,
-    caps: &plx_platform::devcaps::Caps,
+    caps: &plx_os::devcaps::Caps,
     measured: bool,
 ) -> f64 {
     let row_fps = match video {
@@ -296,7 +296,7 @@ fn with_dolby_hdr_info(p: &str, video: &str, dv: plx_data::metadata::DvPresentat
 #[cfg(test)]
 use plx_play_feed::native_executor::{app_id_key, with_app_id};
 
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 fn with_window_id(mt: &MainThread, p: &str) -> String {
     plx_play_feed::native_executor::with_window_id(mt, p, &crate::player::test_physical::TEST_HOOKS.prepare)
 }
@@ -308,7 +308,7 @@ pub fn exported_window_created() {
 
 pub use super::route_start::{reload_at, reload_transcode, reload_transcode_tracked,
     stop_bufferfeed, suspend_bufferfeed, switch_audio_native, ReloadOutcome};
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 pub(super) use super::route_start::{RELOAD_AT_LOG, RELOAD_PREROLL_LOG};
 
 pub use super::route_start::{start_bufferfeed, start_bufferfeed_tracked, BufferfeedStartOutcome};
@@ -339,7 +339,7 @@ pub(crate) use plx_playback_contract::feed::MAX_FEED_AHEAD_NS;
 pub(crate) use plx_play_feed::feed_state::{AUDIO_LEAD_IN_NS, PRIME_VIDEO_MAX_NS};
 pub use plx_playback_contract::feed::PRES_NONE;
 pub(crate) use plx_playback_contract::feed::AUDIO_SLACK_NS;
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use plx_play_feed::native_executor::{
     AUDIO_STALE_AHEAD_NS, FEED_LANE_SLICE_US, FEED_LOW_WATER_NS, PRIME_AUDIO_NS, PRIME_NS,
 };
@@ -352,19 +352,19 @@ fn audio_sink_pts(fp: i64, pcm_lead_ns: i64) -> i64 {
     plx_play_feed::native_executor::audio_sink_pts(fp, pcm_lead_ns, FEED_SHARED.applied_rate_permille.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use plx_play_feed::native_executor::{settle_pcm_lead, hls_candidate_snapshot_stable};
 
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 use plx_play_feed::native_executor::arm_live_clock_prime;
 
 
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 pub(super) fn try_prime(mt: &MainThread, eng: &mut Engine) {
     plx_play_feed::native_executor::try_prime(mt, eng, &plx_play_feed::shared::FEED_TX, &crate::player::test_physical::TEST_HOOKS.feed);
 }
 
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 pub(super) fn feed_both_lanes(mt: &MainThread, eng: &mut Engine) {
     plx_play_feed::native_executor::feed_both_lanes(mt, eng, &plx_play_feed::shared::FEED_TX, &crate::player::test_physical::TEST_HOOKS.feed);
 }
@@ -372,7 +372,7 @@ pub(super) fn feed_both_lanes(mt: &MainThread, eng: &mut Engine) {
 #[cfg(test)]
 use plx_play_feed::native_executor::audio_lead_in;
 
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 mod native_lifecycle_host_seam_tests {
     use super::*;
 
@@ -503,7 +503,7 @@ mod native_lifecycle_host_seam_tests {
         let mt = unsafe { MainThread::assume() };
         let epoch = loaded_epoch(&mt);
         crate::player::plane().reset_for_test();
-        crate::player::plane().boot(plx_platform::tv::plane::PlaneFacts { handle: true, player_type: 10 });
+        crate::player::plane().boot(plx_os::tv::plane::PlaneFacts { handle: true, player_type: 10 });
         release_native_object(&mt, epoch);
         crate::player::plane().reset_for_test();
         let recorded = plx_telemetry::telemetry::window::take_recorded_for_test();
@@ -678,9 +678,9 @@ mod payload_tests {
             ("aac", "AAC"),
             ("dts", "DTS"),
         ];
-        let video: &[(&str, &str, plx_platform::devcaps::dv::DvCapability)] = &[
-            ("h264", "H264", plx_platform::devcaps::dv::DvCapability::Unsupported),
-            ("hevc", "H265", plx_platform::devcaps::dv::DvCapability::Unsupported),
+        let video: &[(&str, &str, plx_os::devcaps::dv::DvCapability)] = &[
+            ("h264", "H264", plx_os::devcaps::dv::DvCapability::Unsupported),
+            ("hevc", "H265", plx_os::devcaps::dv::DvCapability::Unsupported),
         ];
         // The 1080p60 direct-play envelope — the shape a 5.1/7.1 Bluray direct play carries.
         let env = SinkEnvelope { w: 1920, h: 1080, fps: 60 };
@@ -738,7 +738,7 @@ mod payload_tests {
             23.976,
             p8(),
             false,
-            plx_platform::devcaps::dv::DvCapability::Supported,
+            plx_os::devcaps::dv::DvCapability::Supported,
         ));
         let payload = build_av_payload(
             &ps,
@@ -756,7 +756,7 @@ mod payload_tests {
             23.976,
             p8(),
             false,
-            plx_platform::devcaps::dv::DvCapability::Unsupported,
+            plx_os::devcaps::dv::DvCapability::Unsupported,
         ));
         let payload = build_av_payload(
             &ps,
@@ -779,7 +779,7 @@ mod payload_tests {
             23.976,
             p8(),
             false,
-            plx_platform::devcaps::dv::DvCapability::Supported,
+            plx_os::devcaps::dv::DvCapability::Supported,
         ));
         let env = SinkEnvelope { w: 3840, h: 2160, fps: 60 };
         assert!(build_av_payload(&ps, "H265", "AC3 PLUS", env).contains("DolbyHdrInfo"));
@@ -808,7 +808,7 @@ mod payload_tests {
             23.976,
             p10,
             false,
-            plx_platform::devcaps::dv::DvCapability::Supported,
+            plx_os::devcaps::dv::DvCapability::Supported,
         ));
         assert_eq!(crate::route::stream_dovi(&ps).profile, 10);
         let payload = build_av_payload(
@@ -830,7 +830,7 @@ mod payload_tests {
             23.976,
             p10,
             false,
-            plx_platform::devcaps::dv::DvCapability::Supported,
+            plx_os::devcaps::dv::DvCapability::Supported,
         ));
         assert!(crate::route::stream_dv_presentation(&ps).declared().is_none());
         let payload = build_av_payload(
@@ -852,11 +852,11 @@ mod payload_tests {
             23.976,
             p8(),
             false,
-            plx_platform::devcaps::dv::DvCapability::Unknown,
+            plx_os::devcaps::dv::DvCapability::Unknown,
         ));
         let fresh = p8().presentation(
             true,
-            plx_platform::devcaps::dv::DvCapability::Supported,
+            plx_os::devcaps::dv::DvCapability::Supported,
             true,
         );
         assert!(fresh.declared().is_some(), "a subsequent decision sees Supported");
@@ -988,7 +988,7 @@ mod payload_tests {
         // what `build_av_payload` hands it: the AV template with the codec already set to H265,
         // which is what a native HEVC direct play — the only kind that can be Dolby Vision — sends
         let base = PAYLOAD_AV.replace(r#""video":"H264""#, r#""video":"H265""#);
-        let out = with_dolby_hdr_info(&base, "H265", p5().presentation(true, plx_platform::devcaps::dv::DvCapability::Supported, true));
+        let out = with_dolby_hdr_info(&base, "H265", p5().presentation(true, plx_os::devcaps::dv::DvCapability::Supported, true));
         assert!(
             out.contains(r#""provider":"plxnative","DolbyHdrInfo":{"trackType":"single","encryptionType":"clear","profileId":5}}"#),
             "{out}"
@@ -1026,9 +1026,9 @@ mod payload_tests {
             ..Dovi::NONE
         };
         for dv in [
-            Dovi::NONE.presentation(true, plx_platform::devcaps::dv::DvCapability::Supported, true),
-            unconvertible_p7.presentation(true, plx_platform::devcaps::dv::DvCapability::Supported, true),
-            p5().presentation(false, plx_platform::devcaps::dv::DvCapability::Supported, true),
+            Dovi::NONE.presentation(true, plx_os::devcaps::dv::DvCapability::Supported, true),
+            unconvertible_p7.presentation(true, plx_os::devcaps::dv::DvCapability::Supported, true),
+            p5().presentation(false, plx_os::devcaps::dv::DvCapability::Supported, true),
         ] {
             assert_eq!(with_dolby_hdr_info(PAYLOAD_AV, "H265", dv), PAYLOAD_AV);
         }
@@ -1048,7 +1048,7 @@ mod payload_tests {
         let out = with_dolby_hdr_info(
             PAYLOAD_AV,
             "H265",
-            p7.presentation(true, plx_platform::devcaps::dv::DvCapability::Supported, true),
+            p7.presentation(true, plx_os::devcaps::dv::DvCapability::Supported, true),
         );
         const NODE: &str =
             r#","DolbyHdrInfo":{"trackType":"single","encryptionType":"clear","profileId":8}"#;
@@ -1108,7 +1108,7 @@ mod payload_tests {
     fn dolby_vision_and_atmos_are_siblings_inside_contents() {
         let base = PAYLOAD_AV.replace(r#""video":"H264""#, r#""video":"H265""#);
         let out = with_immersive(
-            &with_dolby_hdr_info(&base, "H265", p5().presentation(true, plx_platform::devcaps::dv::DvCapability::Supported, true)),
+            &with_dolby_hdr_info(&base, "H265", p5().presentation(true, plx_os::devcaps::dv::DvCapability::Supported, true)),
             "AC3 PLUS",
             true,
         );
@@ -1133,7 +1133,7 @@ mod payload_tests {
     #[test]
     fn a_declaration_never_rides_a_non_hevc_payload() {
         assert_eq!(
-            with_dolby_hdr_info(PAYLOAD_AV, "H264", p5().presentation(true, plx_platform::devcaps::dv::DvCapability::Supported, true)),
+            with_dolby_hdr_info(PAYLOAD_AV, "H264", p5().presentation(true, plx_os::devcaps::dv::DvCapability::Supported, true)),
             PAYLOAD_AV
         );
     }
@@ -1224,7 +1224,7 @@ mod stream_open_log_line_tests {
 /// **This test drives the real [`feed_stream`] and [`feed_audio_lane`] against the real host feed
 /// seam** — it is not a restatement of the predicate, which is correct and would pass on the
 /// broken build. What it grades is WHERE the predicate is evaluated.
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 mod prime_livelock_tests {
     use plx_play_feed::shared::{FEED_SHARED, FEED_TX};
     use super::*;
@@ -1256,6 +1256,7 @@ mod prime_livelock_tests {
             segment_landing: None,
                 flushed: false,
             presentation_rearm_pending: false,
+            progressive_hold: plx_play_feed::feed_state::ProgressiveHoldWatch::default(),
             max_fed_video_pts: 0,
             max_fed_audio_pts: 0,
             audio_start_fp: None,
@@ -1391,6 +1392,214 @@ mod prime_livelock_tests {
             PRIME_NS / 1_000_000,
             abuf / 1_000_000,
             PRIME_AUDIO_NS / 1_000_000,
+        );
+    }
+
+    /// Disarms the host clock sink and returns the clock to the state a fresh session leaves.
+    struct StallRig;
+    impl StallRig {
+        fn arm() -> Self {
+            plx_play_feed::ffi_host::force_clocksink_for_test(true);
+            FEED_SHARED.reset_hls_clock_for_test();
+            FEED_SHARED.pres_fed.store(PRES_NONE, Ordering::Relaxed);
+            FEED_SHARED.seek_to_ns.store(-1, Ordering::Relaxed);
+            StallRig
+        }
+    }
+    impl Drop for StallRig {
+        fn drop(&mut self) {
+            FEED_SHARED.reset_hls_clock_for_test();
+            plx_play_feed::ffi_host::force_clocksink_for_test(false);
+        }
+    }
+
+    /// A progressive stream mid-playback whose clock was Running and is now held by the PROGRESSIVE
+    /// stall hold, exactly as `maybe_begin_rebuffer` leaves it: Paused, `prime_play` armed at the
+    /// presented point, Buffering mirror up.
+    fn engine_in_a_stall_hold(mt: &plx_base::task::MainThread) -> Engine {
+        let mut eng = engine_after_reload();
+        push_one_segment(&mut eng);
+        tick(mt, &mut eng);
+        assert!(!eng.prime_play, "PRECONDITION: the initial prime started the clock");
+        let token = FEED_SHARED
+            .prepare_progressive_rebuffer_pause(plx_play_feed::shared::vclock_ms())
+            .expect("a running clock takes the hold");
+        assert_eq!(
+            FEED_SHARED.complete_hls_rebuffer_pause(token, true),
+            plx_playback_contract::feed::HlsPauseCompletion::Accepted,
+        );
+        eng.prime_play = true;
+        eng.seek_base_pts = eng.max_fed_video_pts; // `arm_live_clock_prime` at the presented point
+        eng.audio_start_fp = Some(0);
+        assert!(FEED_SHARED.hls_rebuffering.load(Ordering::Acquire), "Buffering is up for the hold");
+        assert!(
+            matches!(
+                FEED_SHARED.hls_prime_kind(),
+                Some(plx_play_feed::shared::HlsPrimeKind::ProgressiveRebuffer { .. })
+            ),
+            "the hold owns its own certificate"
+        );
+        eng
+    }
+
+    /// A progressive hold has no HLS segments to credit and no runway constant: media
+    /// arriving during it does not release it, only a full queue or the end of the stream does
+    /// (the two tests below). Under the HLS certificate (`recovery.ready`, which needs a credited
+    /// segment) it would hold forever, so this pins that it is NOT that certificate either.
+    #[test]
+    fn progressive_rebuffer_a_stall_hold_stays_on_arriving_media_short_of_a_full_queue() {
+        let _serial = plx_base::testlock::serial();
+        let _rig = StallRig::arm();
+        let mt = unsafe { plx_base::task::MainThread::assume() };
+        let mut eng = engine_in_a_stall_hold(&mt);
+
+        push_segment_at(&mut eng, 2 * 1_000_000_000);
+        tick(&mt, &mut eng);
+        assert!(eng.prime_play, "about 2 s buffered: no runway constant, the hold stays");
+        assert!(FEED_SHARED.hls_rebuffering.load(Ordering::Acquire), "still Buffering");
+
+        push_segment_at(&mut eng, 4 * 1_000_000_000);
+        tick(&mt, &mut eng);
+        assert!(eng.prime_play, "about 4 s buffered: a queue with room is still holding");
+        assert!(FEED_SHARED.hls_rebuffering.load(Ordering::Acquire), "still Buffering");
+    }
+
+    #[test]
+    fn progressive_rebuffer_the_end_of_the_stream_releases_a_hold_without_the_decoder_prime() {
+        let _serial = plx_base::testlock::serial();
+        let _rig = StallRig::arm();
+        let mt = unsafe { plx_base::task::MainThread::assume() };
+        let mut eng = engine_in_a_stall_hold(&mt);
+
+        // The last 0.4 s of the film: under the 700 ms the decoder prime wants, and never more.
+        let au = [0u8; 64];
+        let qv = &mut **eng.aq_video.as_mut().unwrap() as *mut plx_play_feed::aq::AuQueue;
+        let base = eng.max_fed_video_pts + V_STEP_NS;
+        for i in 0..10 {
+            plx_play_feed::aq::aq_push(qv, au.as_ptr(), au.len() as c_int, base + i * V_STEP_NS, c_int::from(i == 0), 1);
+        }
+        plx_play_feed::aq::aq_set_eof(qv);
+        tick(&mt, &mut eng);
+        assert!(!eng.prime_play, "the stream ended: playing out the rest is the only thing left");
+        assert!(!FEED_SHARED.hls_rebuffering.load(Ordering::Acquire));
+        // ... and the release is not the end of the story: the rest drains and the pipeline is told
+        // the stream is over, once, or the film would hang on its last frames.
+        for _ in 0..20 {
+            if eng.eos_pushed {
+                break;
+            }
+            tick(&mt, &mut eng);
+        }
+        assert!(eng.eos_pushed, "pushEOS must follow the EOF release once the video lane drains");
+    }
+
+    /// The video queue at its byte cap parks the demuxer: the stream is back to the reserve it
+    /// played with when healthy, and nothing more can be read until the clock plays. That releases
+    /// the hold, naming why.
+    #[test]
+    fn progressive_rebuffer_a_full_video_queue_releases_a_hold() {
+        let _serial = plx_base::testlock::serial();
+        let _rig = StallRig::arm();
+        let mt = unsafe { plx_base::task::MainThread::assume() };
+        let mut eng = engine_in_a_stall_hold(&mt);
+        let qv = &mut **eng.aq_video.as_mut().unwrap() as *mut plx_play_feed::aq::AuQueue;
+        let base = eng.max_fed_video_pts + V_STEP_NS;
+        let au = [0u8; 64];
+        plx_play_feed::aq::aq_push(qv, au.as_ptr(), au.len() as c_int, base, 1, 1);
+        tick(&mt, &mut eng);
+        assert!(eng.prime_play, "PRECONDITION FAILED, not the defect: one frame released the hold");
+        assert!(!plx_play_feed::aq::aq_would_park(qv), "PRECONDITION FAILED, not the defect: the queue is full");
+
+        // One access unit larger than the whole cap: the queue is now at its producer-park
+        // predicate (`queued_bytes > max_bytes`), the demuxer parked on it.
+        let big = vec![0u8; plx_play_feed::aq::aq_cap(qv) as usize + 1];
+        plx_play_feed::aq::aq_push(qv, big.as_ptr(), big.len() as c_int, base + V_STEP_NS, 0, 1);
+        assert!(plx_play_feed::aq::aq_would_park(qv), "PRECONDITION FAILED, not the defect: the queue did not fill");
+        // The prime check alone, without a feed pass first: the host sink takes every access unit,
+        // so a feed pass would drain the queue the real sink (full native buffers, which is why the
+        // demuxer parked) would have left standing.
+        let text = plx_base::eventlog::with_private_log(|| {
+            try_prime(&mt, &mut eng);
+            std::fs::read_to_string(plx_base::eventlog::events_log()).unwrap_or_default()
+        });
+        assert!(!eng.prime_play, "the full queue did not release the hold");
+        assert!(
+            text.contains("progressive rebuffer resume n=0 reason=full"),
+            "the full queue did not release the hold, or did not say why: {text}"
+        );
+    }
+
+    /// One reader feeds both lanes, so the demuxer parks on whichever queue fills first, and the audio
+    /// queue is the smaller (1 MiB): a lossless track fills it long before the video queue reaches its
+    /// cap. A hold that waited on the video queue alone would then wait for media the parked demuxer
+    /// cannot read (permanent Buffering), so a full AUDIO queue releases it too.
+    #[test]
+    fn progressive_rebuffer_a_full_audio_queue_releases_a_hold_too() {
+        let _serial = plx_base::testlock::serial();
+        let _rig = StallRig::arm();
+        let mt = unsafe { plx_base::task::MainThread::assume() };
+        let mut eng = engine_in_a_stall_hold(&mt);
+        let qv = &mut **eng.aq_video.as_mut().unwrap() as *mut plx_play_feed::aq::AuQueue;
+        let qa = &mut **eng.aq_audio.as_mut().unwrap() as *mut plx_play_feed::aq::AuQueue;
+        assert!(!plx_play_feed::aq::aq_would_park(qv) && !plx_play_feed::aq::aq_would_park(qa));
+        let big = vec![0u8; plx_play_feed::aq::aq_cap(qa) as usize + 1];
+        let base = eng.max_fed_audio_pts + A_STEP_NS;
+        plx_play_feed::aq::aq_push(qa, big.as_ptr(), big.len() as c_int, base, 1, 2);
+        assert!(plx_play_feed::aq::aq_would_park(qa), "PRECONDITION FAILED, not the defect: the audio queue did not fill");
+        assert!(!plx_play_feed::aq::aq_would_park(qv), "PRECONDITION FAILED, not the defect: the video queue is full too");
+        let text = plx_base::eventlog::with_private_log(|| {
+            try_prime(&mt, &mut eng);
+            std::fs::read_to_string(plx_base::eventlog::events_log()).unwrap_or_default()
+        });
+        assert!(!eng.prime_play, "the full audio queue did not release the hold");
+        assert!(text.contains("progressive rebuffer resume n=0 reason=full"), "no full resume line: {text}");
+    }
+
+    /// The HLS hold's certificate is untouched: a Rebuffer hold with no credited segment still
+    /// does not resume on queued media alone.
+    #[test]
+    fn progressive_rebuffer_leaves_the_hls_hold_waiting_for_its_own_certificate() {
+        let _serial = plx_base::testlock::serial();
+        let _rig = StallRig::arm();
+        let mt = unsafe { plx_base::task::MainThread::assume() };
+        let mut eng = engine_after_reload();
+        push_one_segment(&mut eng);
+        tick(&mt, &mut eng);
+        assert!(!eng.prime_play);
+        let token = FEED_SHARED.prepare_hls_rebuffer_pause().expect("running");
+        FEED_SHARED.complete_hls_rebuffer_pause(token, true);
+        eng.prime_play = true;
+        eng.seek_base_pts = eng.max_fed_video_pts;
+        assert_eq!(
+            FEED_SHARED.hls_prime_kind(),
+            Some(plx_play_feed::shared::HlsPrimeKind::Rebuffer),
+            "an HLS hold is not a progressive stall hold"
+        );
+        push_segment_at(&mut eng, 2 * 1_000_000_000);
+        push_segment_at(&mut eng, 4 * 1_000_000_000);
+        tick(&mt, &mut eng);
+        assert!(eng.prime_play, "no credited HLS segment: the recovery certificate is not met");
+    }
+
+    /// A progressive A/V file whose audio is absent past a seek still starts on video alone: the
+    /// stall hold's own audio rule never reaches `try_prime`'s Fresh decision.
+    #[test]
+    fn progressive_rebuffer_a_start_with_no_audio_still_takes_the_video_only_escape() {
+        let _serial = plx_base::testlock::serial();
+        let _rig = StallRig::arm();
+        let mt = unsafe { plx_base::task::MainThread::assume() };
+        let mut eng = engine_after_reload();
+        let au = [0u8; 64];
+        let qv = &mut **eng.aq_video.as_mut().unwrap() as *mut plx_play_feed::aq::AuQueue;
+        // 3.2 s of video, no audio at all: past PRIME_VIDEO_MAX_NS.
+        for i in 0..77 {
+            plx_play_feed::aq::aq_push(qv, au.as_ptr(), au.len() as c_int, i * V_STEP_NS, c_int::from(i == 0), 1);
+        }
+        tick(&mt, &mut eng);
+        assert!(!eng.prime_play, "video alone past the escape starts the clock, as on main");
+        assert!(
+            !FEED_SHARED.hls_audio_expected.load(Ordering::Acquire),
+            "the hold's audio rule must not publish the flag try_prime reads"
         );
     }
 
@@ -2053,7 +2262,7 @@ mod prime_livelock_tests {
     }
 }
 
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 mod lifecycle_clock_tests {
     use super::*;
 
@@ -2085,10 +2294,10 @@ mod lifecycle_clock_tests {
 /// request path: `app.rs` re-arms `auto_tried`, the fixture entry calls `start_playback`, and
 /// `start_bufferfeed_tracked` asks the reducer for a start owner directly. So the phase a
 /// completed stop leaves behind is the whole contract between the two halves.
-/// Gated on `hostsim` for the same reason [`lifecycle_clock_tests`] is: `stop_bufferfeed` reaches
-/// the video sink, and only the simulator's (`ffi_host::HostSink`) keeps the state this asserts;
-/// the default build's `NoSink` answers every verb with nothing.
-#[cfg(all(test, feature = "hostsim"))]
+/// Runs over the host sink for the same reason [`lifecycle_clock_tests`] does: `stop_bufferfeed`
+/// reaches the video sink, and only the host stand-in (`ffi_host::HostSink`) keeps the state this
+/// asserts; a `NoSink` answers every verb with nothing.
+#[cfg(test)]
 mod replay_after_stop_tests {
     use super::*;
 
@@ -2133,7 +2342,7 @@ mod replay_after_stop_tests {
 
 /// Test-only: an Engine parked at `Stage::Streaming` on the host sink, for the pump-level rigs
 /// that live outside this module (`pump::flight_tests`).
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 pub(super) fn streaming_engine_for_test(native_epoch: u32) -> Engine {
     let mut eng = prime_livelock_tests::engine_after_reload();
     eng.native_epoch = native_epoch;
@@ -2148,7 +2357,7 @@ pub(super) fn streaming_engine_for_test(native_epoch: u32) -> Engine {
 /// session owns, no native session can begin while the object is still being released, and a start
 /// issued meanwhile is queued behind the release instead of racing it — and the release still ends in a
 /// D1 with complete evidence, not a quarantine.
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 mod off_frame_release_tests {
     use super::*;
 
@@ -2456,7 +2665,7 @@ mod off_frame_release_tests {
         assert_eq!(shape.kind.code(), "release_timeout");
         let actions = crate::player::failure_actions(
             shape.kind,
-            crate::player::FailureContext { forced: false, can_retry: true, repair_idle: true },
+            crate::player::FailureContext { forced: false, can_retry: true, quality_carriable: true, repair_idle: true },
         );
         assert!(actions.contains(&crate::player::FailureAction::TryAgain), "{actions:?}");
 
@@ -2744,7 +2953,7 @@ mod off_frame_release_tests {
 /// `sf_play`/`sf_feed`/etc. could dispatch into an object whose LoadCommon ctor path was still
 /// running on the load thread: investigation.md's run A (a null-arg SIGSEGV on the priming path)
 /// and run B (a Play-vs-LoadCommon mutex deadlock ending in an OMX_VideoComp abort).
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 mod load_in_flight_tests {
     use super::*;
 
@@ -3853,7 +4062,7 @@ mod load_in_flight_tests {
         assert_eq!(shape.kind, crate::player::FailureKind::LoadTimeout);
         let actions = crate::player::failure_actions(
             shape.kind,
-            crate::player::FailureContext { forced: false, can_retry: true, repair_idle: true },
+            crate::player::FailureContext { forced: false, can_retry: true, quality_carriable: true, repair_idle: true },
         );
         assert!(
             actions.contains(&crate::player::FailureAction::TryAgain),
@@ -4000,7 +4209,7 @@ mod pcm_info_tests {
     #[test]
     fn the_sample_rate_is_declared_in_kilohertz() {
         let want = ["8", "12", "16", "22.05", "24", "32", "44.1", "48"];
-        for (hz, khz) in plx_platform::devcaps::PCM_SAMPLE_RATES.into_iter().zip(want) {
+        for (hz, khz) in plx_os::devcaps::PCM_SAMPLE_RATES.into_iter().zip(want) {
             assert_eq!(pcm_rate_khz(hz), khz);
             let p = with_pcm_info(BASE, "PCM", Some(PcmFormat { sample_rate: hz, bits: 16, channels: 2, source_rate: hz }));
             let v: serde_json::Value = serde_json::from_str(&p).unwrap();
@@ -4033,7 +4242,7 @@ mod pcm_info_tests {
         assert!(off.contains(r#""audio":"DTS""#) && !off.contains("pcmInfo"), "{off}");
 
         crate::route::begin_attempt_for_test(
-            &mut ps, std::sync::Arc::new(plx_platform::devcaps::Caps::assumed().with_app_lossy()),
+            &mut ps, std::sync::Arc::new(plx_os::devcaps::Caps::assumed().with_app_lossy()),
         );
         let shape = crate::route::stream_pcm(&ps).and_then(Result::ok);
         assert_eq!(shape, Some(crate::route::PcmFormat::STEREO_48K));
@@ -4056,9 +4265,9 @@ mod pcm_info_tests {
     /// (`forced_resolve_refuses_a_surround_dts_track_instead_of_mixing_it_down`).
     #[test]
     fn a_forced_dts_with_no_row_is_declared_as_stereo_48k_pcm() {
-        let caps = std::sync::Arc::new(plx_platform::devcaps::Caps {
-            app_lossy: plx_platform::devcaps::AppLossy::Measured,
-            ..plx_platform::devcaps::Caps::assumed()
+        let caps = std::sync::Arc::new(plx_os::devcaps::Caps {
+            app_lossy: plx_os::devcaps::AppLossy::Measured,
+            ..plx_os::devcaps::Caps::assumed()
         });
         let mut ps = crate::route::PlaybackSession::IDLE;
         crate::route::begin_attempt_for_test(&mut ps, caps);
@@ -4092,7 +4301,7 @@ mod pcm_info_tests {
             assert_eq!(audio_declaration(codec, off.is_some()).map(|d| d.0).filter(|n| *n == "PCM"), None, "{codec}");
         }
         crate::route::begin_attempt_for_test(
-            &mut ps, std::sync::Arc::new(plx_platform::devcaps::Caps::assumed().with_app_lossy()),
+            &mut ps, std::sync::Arc::new(plx_os::devcaps::Caps::assumed().with_app_lossy()),
         );
         for codec in ["mp3", "vorbis"] {
             crate::route::set_stream_codecs(&mut ps, "h264", codec);
@@ -4115,7 +4324,7 @@ mod pcm_info_tests {
         crate::route::set_stream_codecs(&mut ps, "h264", "truehd");
         assert_eq!(crate::route::stream_pcm(&ps).and_then(Result::ok), None, "not in force");
         crate::route::begin_attempt_for_test(
-            &mut ps, std::sync::Arc::new(plx_platform::devcaps::Caps::assumed().with_app_lossy()),
+            &mut ps, std::sync::Arc::new(plx_os::devcaps::Caps::assumed().with_app_lossy()),
         );
         crate::route::set_stream_codecs(&mut ps, "h264", "truehd");
         let shape = crate::route::stream_pcm(&ps).and_then(Result::ok);
@@ -4139,7 +4348,7 @@ mod pcm_info_tests {
     fn an_app_decoded_lossy_track_loads_as_pcm_at_a_speed() {
         let mut ps = crate::route::PlaybackSession::IDLE;
         crate::route::begin_attempt_for_test(
-            &mut ps, std::sync::Arc::new(plx_platform::devcaps::Caps::assumed().with_app_lossy()),
+            &mut ps, std::sync::Arc::new(plx_os::devcaps::Caps::assumed().with_app_lossy()),
         );
         for codec in ["mp3", "vorbis", "truehd"] {
             crate::route::set_stream_codecs(&mut ps, "h264", codec);
@@ -4173,7 +4382,7 @@ mod pcm_info_tests {
 ///
 /// This test is that artifact, host-side, watched RED before the fix (2026-09-03): the red is the
 /// lab set's measured sequence, NOT a reproduction of issue #63, whose set nobody here has seen a
-/// log from. Under `hostsim` only because it borrows `prime_livelock_tests`' engine constructor.
+/// log from. It borrows `prime_livelock_tests`' engine constructor, so it runs over the host sink.
 /// The envelope rule, cell by cell. Every value here is either a measured declaration
 /// (`ENVELOPE_UHD60`, `ENVELOPE_FHD60`) or today's behaviour; the test exists so the narrow rule
 /// stays narrow — a "smarter" envelope that changes HEVC or the unknown-raster case fails here.
@@ -4181,8 +4390,8 @@ mod pcm_info_tests {
 mod sink_envelope_tests {
     use super::*;
 
-    fn caps(h264: (u32, u32, u32), hevc: (u32, u32, u32)) -> plx_platform::devcaps::Caps {
-        let mut c = plx_platform::devcaps::Caps::assumed();
+    fn caps(h264: (u32, u32, u32), hevc: (u32, u32, u32)) -> plx_os::devcaps::Caps {
+        let mut c = plx_os::devcaps::Caps::assumed();
         c.h264_row = h264;
         c.hevc_row = hevc;
         c
@@ -4232,11 +4441,11 @@ mod sink_envelope_tests {
     /// declare, or for a row with no rate, the flat [`SPEED_MAX_FPS`] ceiling stands.
     #[test]
     fn the_speed_offer_stops_at_the_measured_rows_frame_rate() {
-        let row30 = plx_platform::devcaps::Caps {
+        let row30 = plx_os::devcaps::Caps {
             h264_row: (3840, 2160, 30),
-            ..plx_platform::devcaps::Caps::assumed()
+            ..plx_os::devcaps::Caps::assumed()
         };
-        let offered = |fps: f64, video: Option<LoadVideo>, caps: &plx_platform::devcaps::Caps, measured: bool| {
+        let offered = |fps: f64, video: Option<LoadVideo>, caps: &plx_os::devcaps::Caps, measured: bool| {
             crate::player::speeds_within(fps, speed_fps_ceiling(video, caps, measured))
         };
         assert_eq!(
@@ -4260,15 +4469,15 @@ mod sink_envelope_tests {
             (
                 "a row with no rate",
                 Some(LoadVideo::H264),
-                &plx_platform::devcaps::Caps { h264_row: (3840, 2160, 0), ..plx_platform::devcaps::Caps::assumed() },
+                &plx_os::devcaps::Caps { h264_row: (3840, 2160, 0), ..plx_os::devcaps::Caps::assumed() },
                 true,
             ),
         ] {
             assert_eq!(speed_fps_ceiling(video, caps, measured), crate::player::SPEED_MAX_FPS, "{what}");
         }
-        let row120 = plx_platform::devcaps::Caps {
+        let row120 = plx_os::devcaps::Caps {
             h264_row: (3840, 2160, 120),
-            ..plx_platform::devcaps::Caps::assumed()
+            ..plx_os::devcaps::Caps::assumed()
         };
         assert_eq!(
             speed_fps_ceiling(Some(LoadVideo::H264), &row120, true),
@@ -4342,7 +4551,7 @@ mod sink_envelope_tests {
         assert_eq!(sink_envelope(LoadVideo::H265, (0, 0), 0.0, &c, true), ENVELOPE_FHD60);
         // the same rows, not measured: never a clamp
         assert_eq!(sink_envelope(LoadVideo::H265, (3840, 2160), 0.0, &c, false), ENVELOPE_UHD60);
-        assert_eq!(sink_envelope(LoadVideo::H265, (0, 0), 0.0, &plx_platform::devcaps::Caps::assumed(), true), ENVELOPE_UHD60);
+        assert_eq!(sink_envelope(LoadVideo::H265, (0, 0), 0.0, &plx_os::devcaps::Caps::assumed(), true), ENVELOPE_UHD60);
         // a table stating a lower frame rate clamps it; a higher one never raises it
         let slow = caps((3840, 2160, 30), (3840, 2160, 120));
         assert_eq!(sink_envelope(LoadVideo::H264, (3840, 2160), 0.0, &slow, true).fps, 30);
@@ -4425,7 +4634,7 @@ mod sink_envelope_tests {
             0.0,
             plx_data::metadata::Dovi::NONE,
             false,
-            plx_platform::devcaps::dv::DvCapability::Supported,
+            plx_os::devcaps::dv::DvCapability::Supported,
         ));
         crate::route::set_carried_audio_for_test(
             &mut ps,
@@ -4583,21 +4792,21 @@ mod sink_envelope_tests {
 
     #[test]
     fn load_video_refused_only_for_av1_and_vp9_without_their_rows() {
-        let assumed = plx_platform::devcaps::Caps::assumed();
+        let assumed = plx_os::devcaps::Caps::assumed();
         assert!(load_video_refused(LoadVideo::Av1, &assumed));
         assert!(load_video_refused(LoadVideo::Vp9, &assumed));
         assert!(!load_video_refused(LoadVideo::H264, &assumed));
         assert!(!load_video_refused(LoadVideo::H265, &assumed));
-        let with_row = plx_platform::devcaps::Caps {
+        let with_row = plx_os::devcaps::Caps {
             av1: true,
             vp9: true,
-            ..plx_platform::devcaps::Caps::assumed()
+            ..plx_os::devcaps::Caps::assumed()
         };
         for video in [LoadVideo::H264, LoadVideo::H265, LoadVideo::Av1, LoadVideo::Vp9] {
             assert!(!load_video_refused(video, &with_row), "{video:?}");
         }
         // one row never admits the other codec
-        let av1_only = plx_platform::devcaps::Caps { av1: true, ..plx_platform::devcaps::Caps::assumed() };
+        let av1_only = plx_os::devcaps::Caps { av1: true, ..plx_os::devcaps::Caps::assumed() };
         assert!(load_video_refused(LoadVideo::Vp9, &av1_only));
     }
 
@@ -4615,7 +4824,7 @@ mod sink_envelope_tests {
     }
 }
 
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 mod load_refusal_tests {
     use super::*;
     use std::sync::atomic::Ordering;
@@ -4706,7 +4915,7 @@ mod audio_lead_in_tests {
 /// [`AUDIO_STALE_AHEAD_NS`] past that video. These tests drive the real lanes through
 /// [`feed_both_lanes`] against the host feed seam, in the state a progressive start leaves:
 /// Play already issued, nothing presented (`pres_fed` 0, not [`PRES_NONE`]).
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 mod late_audio_start_tests {
     use super::*;
 
@@ -4805,7 +5014,7 @@ mod late_audio_start_tests {
 /// dropped every AU past 5 s of it, silently. The host sink never answers BufferFull, so the state
 /// a full sink leaves is built directly: the video lane parked at [`FED_VIDEO_NS`], the AUs the
 /// demuxer read past it queued for audio.
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 mod audio_under_video_backpressure_tests {
     use super::*;
 
@@ -4928,7 +5137,7 @@ mod audio_under_video_backpressure_tests {
 /// These drive the real mode selection, the pump's reload-or-in-place decision and the real
 /// [`feed_stream`] re-anchor against the host sink with the clock sink armed, which reports
 /// `VP_EXPORTED` exactly as a webOS 5+ set does.
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 mod native_seek_tests {
     use plx_play_feed::shared::{FEED_SHARED, FEED_TX};
     use super::*;
@@ -5419,10 +5628,10 @@ mod pcm_sink_lead_pure_tests {
 /// `start_bufferfeed_inner` reads `devcaps::audio_stack()` and hands it to `load_audio`. A start that
 /// stopped passing it on (or passed a fixed one) leaves every other test green, because they all
 /// build the plan or the Engine by hand.
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 mod pcm_stack_wiring_tests {
     use super::*;
-    use plx_platform::devcaps::{audio_stack_on_this_thread_for_test, AudioStack};
+    use plx_os::devcaps::{audio_stack_on_this_thread_for_test, AudioStack};
 
     struct Cleanup;
     impl Drop for Cleanup {
@@ -5600,7 +5809,7 @@ mod pcm_stack_wiring_tests {
     }
 }
 
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 mod pcm_sink_lead_tests {
     use super::*;
     use plx_play_feed::ffi_host;
@@ -5834,7 +6043,7 @@ mod pcm_sink_lead_tests {
 /// way the dev arm does (`route::clear_url`, then the start) and read what it answered. Every other
 /// start test in this file qualifies its recipe BY HAND (`qualify_resolved_feed_offer`) before it
 /// starts, which is why none of them could see the hole.
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(test)]
 mod explicit_source_start_tests {
     use super::*;
     use crate::route::backend_policy::OfferId;

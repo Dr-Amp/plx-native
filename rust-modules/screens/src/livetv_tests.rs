@@ -104,7 +104,7 @@ fn asked_plays(out: &[Stamped<TestHost>]) -> Vec<PlayIntent> {
 #[test]
 fn own_store_supplies_adjacent_channels_and_on_now_shelves_with_distinct_art() {
     let _policy = captions::PolicyPin::default_setting();
-    let _language = plx_platform::i18n::language_on_this_thread_for_test(plx_platform::i18n::Preference::En);
+    let _language = plx_os::i18n::language_on_this_thread_for_test(plx_os::i18n::Preference::En);
     let (store, screen) = seeded();
     let context = cx(store.view(), None);
     let mut sections = Vec::new();
@@ -165,7 +165,7 @@ fn store_revisions_and_notices_refresh_programmes_and_status_retry_targets_live_
         assert_eq!(screen.page.status, status);
         let overlay = screen.page.status_overlay(0);
         assert_eq!(overlay.kind, match status { LiveTvStatus::Loading => StatusKind::Working, LiveTvStatus::Empty => StatusKind::Empty, _ => StatusKind::Failed });
-        if status == LiveTvStatus::Empty { assert_eq!(overlay.caption, plx_platform::i18n::msg::browse_livetv_empty_c()); }
+        if status == LiveTvStatus::Empty { assert_eq!(overlay.caption, plx_os::i18n::msg::browse_livetv_empty_c()); }
         assert_eq!(overlay.action.is_some(), status == LiveTvStatus::Failed);
     }
     let failed = LiveTvView::for_test(LiveTvStatus::Failed, &[], &[], 200);

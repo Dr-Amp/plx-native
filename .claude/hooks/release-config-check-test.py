@@ -23,10 +23,10 @@ fixed in `run_check`, because its message carried an em-dash.
 The interesting cases are the NEGATIVES. A missed edit costs one unchecked release configuration
 and the next edit re-runs it; a false fire costs 0.55 s on every `.rs` write in the session and
 teaches the reader to reach for `PLX_RELEASE_CHECK_SKIP`. The three that are easy to get wrong are
-`src/bin/sim.rs` (a real Rust file under the tree, which `--lib` does not compile and the release
-set could not build anyway — `required-features = ["hostsim"]`), `build.rs` (cargo compiles the script in
+the simulator's `src/bin/sim.rs` (a real Rust file under the tree, which `--lib` does not compile and the release
+set could not build anyway — `required-features = ["sim"]`), `build.rs` (cargo compiles the script in
 EVERY configuration, so a break in it is already covered by `make check` — true even though it now
-emits `PLX_VERSION` for every build rather than early-returning outside `hostsim`), and a file in a sibling `.claude/worktrees/`
+emits `PLX_VERSION` for every build rather than early-returning outside `sim`), and a file in a sibling `.claude/worktrees/`
 checkout (another lane's crate, another lane's target dir).
 
 `/repo` below is a fabricated root: `rust_src_target` is pure path arithmetic, so nothing needs to
@@ -66,7 +66,7 @@ CASES = [
     (FIRE, "Write", edit("/repo/rust-modules/src/dev.rs", tool="Write"), ROOT),
     (FIRE, "a layer crate's source", edit("/repo/rust-modules/base/src/paths.rs"), ROOT),
     (FIRE, "the machine layer crate's source", edit("/repo/rust-modules/machine/src/idle.rs"), ROOT),
-    (FIRE, "the platform layer crate's source", edit("/repo/rust-modules/platform/src/webos.rs"), ROOT),
+    (FIRE, "the os layer crate's source", edit("/repo/rust-modules/os/src/devcaps.rs"), ROOT),
     (FIRE, "the gfx layer crate's source", edit("/repo/rust-modules/gfx/src/gfx.rs"), ROOT),
     (FIRE, "the net layer crate's source", edit("/repo/rust-modules/net/src/net.rs"), ROOT),
     (FIRE, "the ui layer crate's source", edit("/repo/rust-modules/ui/src/widgets.rs"), ROOT),
@@ -77,6 +77,8 @@ CASES = [
     (FIRE, "the media layer crate\\'s source", edit("/repo/rust-modules/media/src/player/mod.rs"), ROOT),
     (FIRE, "the appkit layer crate\\'s source", edit("/repo/rust-modules/appkit/src/player_hud/mod.rs"), ROOT),
     (FIRE, "the screens layer crate\\'s source", edit("/repo/rust-modules/screens/src/home/mod.rs"), ROOT),
+    (FIRE, "the shell_sdl layer crate's source", edit("/repo/rust-modules/shell-sdl/src/window.rs"), ROOT),
+    (FIRE, "the webOS platform crate's source (the ARM staticlib's own crate)", edit("/repo/rust-modules/platform-webos/src/port.rs"), ROOT),
     (FIRE, "MultiEdit", edit("/repo/rust-modules/src/app/run.rs", tool="MultiEdit"), ROOT),
     (FIRE, "relative to root", edit("rust-modules/src/route.rs"), ROOT),
     (FIRE, "relative to a subdir", edit("src/plex/client.rs"), "/repo/rust-modules"),
@@ -88,8 +90,14 @@ CASES = [
       "cwd": WT}, WT, WT),
 
     # --- does not fire: right extension, wrong target -------------------------
-    (SKIP, "src/bin/sim.rs (not a --lib target, needs hostsim)",
+    (SKIP, "a bin under the application's src (not a --lib target, needs sim)",
      edit("/repo/rust-modules/src/bin/sim.rs"), ROOT),
+    (SKIP, "the desktop platform crate's source (sim only: it compiles to nothing in the release set)",
+     edit("/repo/rust-modules/platform-desktop/src/lib.rs"), ROOT),
+    (SKIP, "the desktop platform crate's simulator binary",
+     edit("/repo/rust-modules/platform-desktop/src/bin/sim.rs"), ROOT),
+    (SKIP, "the Tizen platform crate's source (tizen only: it compiles to nothing in the release set)",
+     edit("/repo/rust-modules/platform-tizen/src/lib.rs"), ROOT),
     (SKIP, "build.rs (cargo compiles the script in every configuration)",
      edit("/repo/rust-modules/build.rs"), ROOT),
     (SKIP, "tools/ script", edit("/repo/tools/some_helper.rs"), ROOT),

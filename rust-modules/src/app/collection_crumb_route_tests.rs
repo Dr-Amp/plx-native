@@ -33,7 +33,7 @@ fn open_over_top(w: &mut World) {
 fn caption(w: &World) -> Option<String> {
     let entry = w.d.nav.top_page().expect("a page is on top").id;
     let screen = &*w.d.nav.entry(entry).and_then(|e| e.inst.as_ref()).expect("it is mounted").screen;
-    let cx = w.d.page_cx(tick(w.frame), entry, w.bridge.views(), &w.bridge.measure);
+    let cx = w.d.page_cx(tick(w.frame), entry, w.bridge.views(), &w.bridge.retained().measure);
     screen.crumb(&cx).map(std::borrow::Cow::into_owned)
 }
 
@@ -42,7 +42,7 @@ fn caption(w: &World) -> Option<String> {
 #[test]
 fn opened_from_the_collections_page_it_names_collections() {
     let w = super::arrival_seat_tests::collection_screen("crumb-from-collections");
-    assert_eq!(caption(&w).as_deref(), Some(plx_platform::i18n::msg::browse_kind_collections()));
+    assert_eq!(caption(&w).as_deref(), Some(plx_os::i18n::msg::browse_kind_collections()));
 }
 
 /// From a Home hub it names Home.
@@ -50,7 +50,7 @@ fn opened_from_the_collections_page_it_names_collections() {
 fn opened_from_a_home_hub_it_names_home() {
     let mut w = World::home_with_disc("crumb-from-home", [7; 12]);
     open_over_top(&mut w);
-    assert_eq!(caption(&w).as_deref(), Some(plx_platform::i18n::msg::browse_chrome_home()));
+    assert_eq!(caption(&w).as_deref(), Some(plx_os::i18n::msg::browse_chrome_home()));
 }
 
 /// From the Recommended page it names Recommended.
@@ -58,7 +58,7 @@ fn opened_from_a_home_hub_it_names_home() {
 fn opened_from_recommended_it_names_recommended() {
     let mut w = World::recommended("crumb-from-recommended");
     open_over_top(&mut w);
-    assert_eq!(caption(&w).as_deref(), Some(plx_platform::i18n::msg::library_header_recommended()));
+    assert_eq!(caption(&w).as_deref(), Some(plx_os::i18n::msg::library_header_recommended()));
 }
 
 /// From a library's grid it names the library, as that page names itself.
@@ -77,14 +77,14 @@ fn opened_from_search_it_names_search() {
     w.frames(60);
     assert!(w.on(&AppArg::Search), "premise: Search is on top");
     open_over_top(&mut w);
-    assert_eq!(caption(&w).as_deref(), Some(plx_platform::i18n::msg::browse_chrome_search()));
+    assert_eq!(caption(&w).as_deref(), Some(plx_os::i18n::msg::browse_chrome_search()));
 }
 
 /// From an item's Detail it names the item, as that page titles itself.
 #[test]
 fn opened_from_an_item_detail_it_names_the_item() {
     let mut w = World::detail_with_disc("crumb-from-detail", [7; 12]);
-    plx_data::metadata::set_current_for_test(w.bridge.stores.metadata.state_mut(), Some(plx_data::metadata::Detail {
+    plx_data::metadata::set_current_for_test(w.bridge.bridge().stores.metadata.state_mut(), Some(plx_data::metadata::Detail {
         sid: plx_plex::plex::ServerId::UNSET, rk: "movie".into(), kind: "movie".into(),
         title: "Synthetic film".into(), ..Default::default()
     }));

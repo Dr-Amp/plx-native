@@ -139,8 +139,9 @@ pub fn declare_chrome_glass_for_test(p: Painter, rects: &[Rect]) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ground {
     /// A MENU (Sort & Filter, the account menu, the item hold menu): glass on the frozen ground
-    /// (`popover_glass`: the latched field and the host snapshot), the latched-field ground only
-    /// when there is nothing frozen to stand on.
+    /// (`popover_glass`: a frost of the host snapshot, the latched field as its fallback body, and
+    /// the snapshot itself for the rim), the latched-field ground only when there is nothing frozen
+    /// to stand on.
     Menu,
     /// Everything else that stands on a panel (alerts, About, Tracks, the person bio, the decision
     /// alert): the pre-DS6 ground, the latched underlay field under the frost. Never glass.
@@ -173,8 +174,8 @@ pub enum Ground {
 /// **DS6 put glass back on MENUS, and only menus** (owner decision, wave 2 review): the caller
 /// states which ground it wants with a [`Ground`], per call, and there is no global switch.
 /// [`Ground::Menu`] runs `popover_glass::draw` first and wins whenever the field is latched; that
-/// glass stands on the same frozen pictures (this field, and the host snapshot for its rim) and
-/// reads no framebuffer either. Everything described above is the ground of [`Ground::Sheet`]
+/// glass stands on frozen pictures (the host's frost of the page for its body, this field as the
+/// body's fallback, and the host snapshot for its rim) and reads no framebuffer either. Everything described above is the ground of [`Ground::Sheet`]
 /// (alerts, About, Tracks, the person bio, the decision alert) and the FALLBACK ground of a menu
 /// with nothing frozen to stand on. The chrome (the top bar's track, the profile chip's capsule,
 /// the hold hint) is the only live-blur user.
@@ -185,23 +186,27 @@ pub fn panel_ground(
     field: Option<&crate::underlay::UnderlayField>,
     ground: Ground,
 ) {
-    panel_ground_shadowed(p, r, radius, field, ground, 1.0);
+    panel_ground_shadowed(p, r, r, radius, field, ground, 1.0, plx_gfx::gfx::GlassMorph::NONE);
 }
 
 /// [`panel_ground`] with a menu glass's drop shadow at `shadow` of the painter's opacity
-/// ([`crate::popover_glass::draw_shadowed`]); the field ground casts none, so it is unchanged.
+/// ([`crate::popover_glass::draw_shadowed`]) and a morph's join (`morph`, which only the glass wears:
+/// the field ground casts no shadow and has no join, so it is unchanged).
+#[allow(clippy::too_many_arguments)]
 pub fn panel_ground_shadowed(
     p: Painter,
     r: Rect,
+    settled: Rect,
     radius: f32,
     field: Option<&crate::underlay::UnderlayField>,
     ground: Ground,
     shadow: f32,
+    morph: plx_gfx::gfx::GlassMorph,
 ) {
     // DS6: a menu is glass on the frozen ground (`popover_glass`); the field ground below is the
     // fallback when there is nothing frozen to stand on. A sheet never takes this branch.
     if ground == Ground::Menu
-        && crate::profile::phase("panel.glass", || crate::popover_glass::draw_shadowed(p, r, radius, field, shadow))
+        && crate::profile::phase("panel.glass", || crate::popover_glass::draw_shadowed(p, r, settled, radius, field, shadow, morph))
     {
         return;
     }
@@ -413,19 +418,21 @@ impl ArtCycle {
     const HOLD_MS: u32 = 6000;
     const FADE_MS: u32 = 1200;
 
-    pub fn set_frames(&mut self, frames: &[&str]) {
+    /// Return discrete resource replacement for the owner's typed UI effect.
+    pub fn set_frames(&mut self, frames: &[&str]) -> bool {
         let mut unique = Vec::new();
         for frame in frames {
             if !unique.contains(frame) { unique.push(*frame); }
         }
-        if self.frames.iter().map(String::as_str).eq(unique.iter().copied()) { return; }
+        if self.frames.iter().map(String::as_str).eq(unique.iter().copied()) { return false; }
         self.frames = unique.into_iter().map(str::to_owned).collect();
         self.current = 0;
         self.clock = plx_machine::motion::Ramp::default();
         self.mix = 0.0;
         self.fading = false;
         self.ready.set(false);
-        plx_machine::idle::invalidate();
+        // Resource replacement is landed by the owning UI/result boundary.
+        true
     }
 
     pub fn is_empty(&self) -> bool { self.frames.is_empty() }
@@ -484,6 +491,12 @@ mod art_cycle_tests {
 
     fn tick(ms: u32) -> Tick { Tick { ms, dt_us: 16_000 } }
 
+    fn presented(present: &mut Present) -> bool {
+        let admitted = present.take(0);
+        if admitted { present.acknowledge(0); }
+        admitted
+    }
+
     #[test]
     fn equivalent_frames_cycle_without_changing_the_owners_scene() {
         let _g = plx_base::testlock::serial();
@@ -491,26 +504,26 @@ mod art_cycle_tests {
         let mut present = Present::new();
         cycle.set_frames(&["coast", "painted", "city"]);
         cycle.ready.set(true);
-        let _ = present.take(0);
+        let _ = presented(&mut present);
         cycle.tick(tick(16), true, &mut PresentHandle(&mut present));
         cycle.tick(tick(5000), true, &mut PresentHandle(&mut present));
         assert_eq!(cycle.current, 0);
         assert!(!cycle.fading);
-        assert!(!present.take(0), "the hold must not redraw at 60 FPS");
+        assert!(!presented(&mut present), "the hold must not redraw at 60 FPS");
         cycle.tick(tick(6000), true, &mut PresentHandle(&mut present));
         assert!(cycle.fading);
-        assert!(present.take(0), "the first fade frame must wake the idle gate");
+        assert!(presented(&mut present), "the first fade frame must wake the idle gate");
         for frame in 1..60 {
             cycle.tick(tick(6000 + frame * 16), true, &mut PresentHandle(&mut present));
-            assert!(present.take(0), "every overlapping frame must be presented");
+            assert!(presented(&mut present), "every overlapping frame must be presented");
         }
         cycle.tick(tick(7300), true, &mut PresentHandle(&mut present));
         assert_eq!(cycle.current, 1);
         assert!(!cycle.fading);
-        assert!(present.take(0), "the final frame must be presented too");
+        assert!(presented(&mut present), "the final frame must be presented too");
         cycle.ready.set(true);
         cycle.tick(tick(7316), true, &mut PresentHandle(&mut present));
-        assert!(!present.take(0));
+        assert!(!presented(&mut present));
     }
 
     #[test]
@@ -519,23 +532,23 @@ mod art_cycle_tests {
         let mut cycle = ArtCycle::default();
         let mut present = Present::new();
         cycle.set_frames(&["one", "two"]);
-        let _ = present.take(0);
+        let _ = presented(&mut present);
         cycle.tick(tick(1000), true, &mut PresentHandle(&mut present));
         assert_eq!(cycle.clock.len_ms, 0);
-        assert!(!present.take(0));
+        assert!(!presented(&mut present));
         cycle.ready.set(true);
         cycle.tick(tick(1016), true, &mut PresentHandle(&mut present));
         cycle.pause(tick(1100));
         cycle.tick(tick(20000), false, &mut PresentHandle(&mut present));
         cycle.tick(tick(21000), true, &mut PresentHandle(&mut present));
         assert!(!cycle.fading, "suspension must not consume the hold");
-        assert!(!present.take(0));
+        assert!(!presented(&mut present));
         cycle.set_frames(&["one", "one"]);
-        let _ = present.take(0);
+        let _ = presented(&mut present);
         cycle.ready.set(true);
         cycle.tick(tick(100000), true, &mut PresentHandle(&mut present));
         assert_eq!(cycle.frames.len(), 1);
-        assert!(!present.take(0));
+        assert!(!presented(&mut present));
         cycle.set_frames(&["two", "three"]);
         assert_eq!(cycle.current, 0);
         assert_eq!(cycle.clock.len_ms, 0);
@@ -809,7 +822,7 @@ pub fn still_overlay(
                 ),
                 (None, _) => {
                     let tag = tag_of();
-                    let status = if tag.is_empty() { String::new() } else { plx_platform::i18n::msg::widgets_card_new_episode().to_owned() };
+                    let status = if tag.is_empty() { String::new() } else { plx_os::i18n::msg::widgets_card_new_episode().to_owned() };
                     (tag, status, crate::still_footer::Right::None)
                 }
             };
@@ -1276,8 +1289,8 @@ pub fn row_watch_state<T: crate::tile::Tile + ?Sized>(m: &T) -> PosterMark {
 ///
 /// Each names the OUTCOME its press produces, never the state the item is in — which is what lets
 /// a part-watched item show both at once without either being a lie.
-pub fn mark_watched_verb() -> &'static str { plx_platform::i18n::msg::widgets_action_mark_watched() }
-pub fn mark_unwatched_verb() -> &'static str { plx_platform::i18n::msg::widgets_action_mark_unwatched() }
+pub fn mark_watched_verb() -> &'static str { plx_os::i18n::msg::widgets_action_mark_watched() }
+pub fn mark_unwatched_verb() -> &'static str { plx_os::i18n::msg::widgets_action_mark_unwatched() }
 
 /// …and the third verb the same two surfaces share: **play this from 00:00, ignoring the resume
 /// point.** The detail hero's disc and the card menu's row are one action, so they carry one WORD —
@@ -1291,8 +1304,8 @@ pub fn mark_unwatched_verb() -> &'static str { plx_platform::i18n::msg::widgets_
 /// resembling a play mark. The two were reconciled onto one glyph for a day and it was wrong;
 /// `Icon::Restart`'s doc is the argument. One action, one word, and the mark chosen per surface for
 /// what that surface has to tell apart.
-pub fn play_from_start_verb() -> &'static str { plx_platform::i18n::msg::widgets_action_play_start() }
-pub fn play_trailer_verb() -> &'static str { plx_platform::i18n::msg::widgets_action_play_trailer() }
+pub fn play_from_start_verb() -> &'static str { plx_os::i18n::msg::widgets_action_play_start() }
+pub fn play_trailer_verb() -> &'static str { plx_os::i18n::msg::widgets_action_play_trailer() }
 
 /// The **watched tick** on a poster, as fractions of the tile's DRAWN width: the tick's box, its
 /// corner inset, then the veil's box. Anchored on the design system's `ArtTile` — a 26px tick inset
@@ -1500,7 +1513,7 @@ pub const CONTROL_GAP: f32 = 20.0;
 /// same event at the same rate, which is the thing that was actually worth sharing. What still
 /// belongs to `press` is the click, and that is folded in by [`scale`](Self::scale) below.
 ///
-/// [`scale`](Self::scale) folds in [`press::scale`](crate::press::scale) for the PRESSED control. The
+/// [`scale`](Self::scale) folds in the supplied `PressRead` for the PRESSED control. The
 /// dip is a FACTOR on top of the focus scale — that is what makes a press read the same on a 1.07
 /// capsule as on a 1.09 poster. Unlike a card's dip (`cards::press_scale`, which matches
 /// `PressRead::owner`) a row of controls has no element keys, so the pressed control is LATCHED
@@ -1517,7 +1530,7 @@ pub struct CtlPop<const N: usize> {
 /// keys to match `PressRead::owner` against, so the dip latches the FOCUSED index the first time
 /// the press reads off rest and holds it until the press is back at exactly rest: focus moving
 /// away (a direction key abandons the press) then leaves the spring-back on the pressed control.
-/// The latch also remembers WHICH press it was taken for ([`press::arm_id`](crate::press::arm_id)),
+/// The latch also remembers WHICH press it was taken for (`PressRead::identity`),
 /// so a row that was not drawn when the last press returned to rest (the press committed a page or
 /// a popover) or a press armed inside the previous one's spring-back re-latches to the control
 /// holding focus when the new press arms, instead of dipping the old one. A draw-side cache, not
@@ -1527,16 +1540,18 @@ pub struct DipLatch(std::cell::Cell<Option<(u32, usize)>>);
 impl DipLatch {
     /// The dip factor for control `i` given the press scale `press` (`0.0` = no press read) and
     /// the control holding focus (`None` for none).
-    pub fn factor(&self, i: usize, focused: Option<usize>, press: f32) -> f32 {
-        let press = if press > 0.0 { press } else { 1.0 };
-        if press == 1.0 {
+    pub fn factor<K: Copy>(&self, i: usize, focused: Option<usize>, read: plx_machine::machine::PressRead<K>) -> f32 {
+        let press = read.dip();
+        if !read.active {
             self.0.set(None);
             return 1.0;
         }
-        let arm = crate::press::arm_id();
+        let arm = read.identity;
         match self.0.get() {
             Some((a, _)) if a == arm => {}
-            _ => self.0.set(focused.map(|f| (arm, f))),
+            // A cancelled spring may keep its latch, never acquire another row.
+            _ if read.live => self.0.set(focused.map(|f| (arm, f))),
+            _ => self.0.set(None),
         }
         if self.0.get().is_some_and(|(_, l)| l == i) { press } else { 1.0 }
     }
@@ -1579,8 +1594,8 @@ impl<const N: usize> CtlPop<N> {
     /// Control `i`'s drawn scale this frame, press dip included. Out-of-range asks answer 1.0 rather
     /// than panicking: a row whose control COUNT changes with the item (`detail::hero_ctls`) indexes
     /// this by a position that can outrun `N` for a frame while the set is being rebuilt.
-    pub fn scale(&self, i: usize) -> f32 {
-        self.scale_with(i, crate::press::scale())
+    pub fn scale<K: Copy>(&self, i: usize, press: plx_machine::machine::PressRead<K>) -> f32 {
+        self.scale_with(i, press)
     }
     /// How far control `i` is into its focus, 0 (resting) to 1 (focused), read off the SAME lift
     /// spring [`scale`](Self::scale) reads: the fill of a control cross-fades on this (its ink flips on
@@ -1590,11 +1605,10 @@ impl<const N: usize> CtlPop<N> {
         let pos = self.sp.get(i).map(|sp| sp.pos).unwrap_or(1.0);
         ((pos - 1.0) / (CTRL_FOCUS_SCALE - 1.0)).clamp(0.0, 1.0)
     }
-    /// Captured-input counterpart for owned screens: paint and placement use the same frame's
-    /// press value, without consulting the legacy global press machine. Zero means no press read.
-    pub fn scale_with(&self, i: usize, press_scale: f32) -> f32 {
+    /// Paint and placement use the same explicit press, including its arm identity.
+    pub fn scale_with<K: Copy>(&self, i: usize, press: plx_machine::machine::PressRead<K>) -> f32 {
         let s = self.sp.get(i).map(|sp| sp.pos).unwrap_or(1.0);
-        s * self.dip.factor(i, self.focused, press_scale)
+        s * self.dip.factor(i, self.focused, press)
     }
     /// Drop every pop to rest with no motion in between — for a page being torn down or re-mounted,
     /// so the next mount does not open on a control already popped (`detail::reset_view_state`).
@@ -1792,7 +1806,8 @@ pub fn keyline_chip(p: Painter, x: f32, cy: f32, text: &str, col: [f32; 4], meas
 }
 
 /// The identity band shared by both full-bleed heroes. The text run yields room to the
-/// outlined resolution/accessibility chips, and overlong metadata elides within its column.
+/// outlined resolution, dynamic-range and accessibility chips, and overlong metadata elides within
+/// its column.
 /// Returns the width drawn, from `r.x` to the last chip's edge.
 pub fn hero_identity(p: Painter, r: Rect, parts: &[&str], resolution: Option<&str>, chips: &[&str], measure: &dyn plx_machine::machine::Measure) -> f32 {
     identity_row(Some(p), r, parts, resolution, chips, theme::TEXT_SECONDARY, measure)
@@ -1805,10 +1820,10 @@ pub fn hero_identity_w(r: Rect, parts: &[&str], resolution: Option<&str>, chips:
 }
 
 /// Home's metadata band uses brighter reading ink over the hero art and reserves room for the rating.
-pub fn hero_metadata(p: Painter, r: Rect, parts: &[&str], quality: Option<&str>, rating: &str, measure: &dyn plx_machine::machine::Measure) {
+pub fn hero_metadata(p: Painter, r: Rect, parts: &[&str], quality: Option<&str>, range: Option<&str>, rating: &str, measure: &dyn plx_machine::machine::Measure) {
     let rating = (!rating.is_empty() && keyline_chip_w(rating, measure) <= r.w * 0.5).then_some(rating);
-    let chips = rating.as_ref().map_or(&[][..], std::slice::from_ref);
-    identity_row(Some(p), r, parts, quality, chips, theme::TEXT_READING, measure);
+    let chips: Vec<&str> = range.into_iter().chain(rating).collect();
+    identity_row(Some(p), r, parts, quality, &chips, theme::TEXT_READING, measure);
 }
 
 /// The one layout of the identity band, painted with `paint` or only measured without it.
@@ -2508,7 +2523,7 @@ pub fn skeleton_phase(ms: u32) -> f32 {
 /// something keeps drawing one.
 fn skeleton_sheen(p: Painter, r: Rect, rad: f32, phase: f32) {
     // placeholder-exempt: the sweep is paint over a skeleton its caller (`skeleton_bar`, `skeleton_sheet`) counted first
-    plx_machine::idle::invalidate();
+    plx_machine::motion::report::note_motion();
     let band = (r.w * SKEL_BAND).max(1.0);
     // travel from fully off the left edge to fully off the right, so the block is clean at both
     // ends of the cycle rather than starting mid-flash
@@ -2898,26 +2913,39 @@ pub(crate) fn chip_face(face: plx_gfx::gfx::GlassFace, e: f32) -> plx_gfx::gfx::
 /// reach they still sample the page, never each other, so they keep one source
 /// (`backdrop::surface_with`).
 ///
-/// **`frozen` is the opener lift's ground** (`lift_profile_chip`, the account menu up): the
-/// capsule then stands on the stack's latched underlay field through `Painter::glass_frozen`, with
-/// the host snapshot behind its rim and no dim (it is drawn above the dim), and requests no
-/// backdrop entry and no blur source pass. It is the LATCHED field's texture, so an unlatched ground
-/// is not representable here: [`lift_profile_chip`] draws no lift at all until the field has latched,
-/// because a flat capsule over the bar's own would darken the chip twice. The chip on the tab strip
-/// passes `None` and keeps the live glass.
+/// **`stand` is the opener lift's ground** ([`lift_profile_chip`], the account menu up): the capsule
+/// then stands on FROZEN pictures through `Painter::glass_frozen` ([`LiftGround`]) and requests no
+/// backdrop entry and no blur source pass. The chip on the tab strip passes `None` and keeps the
+/// live glass.
 fn glass_capsule(
     p: Painter,
     cap: Rect,
     e: f32,
     bar_material: Option<plx_gfx::gfx::GlassFace>,
-    frozen: Option<u32>,
+    stand: Option<LiftGround>,
 ) -> bool {
     let face = match bar_material {
         None => return false,
         Some(f) => chip_face(f, e),
     };
-    if let Some(ground) = frozen {
-        let sharp = crate::popover::host::page_tex().unwrap_or(0);
+    if let Some(stand) = stand {
+        // A GlassFace does not ride the painter's alpha (`popover_glass::face_at`): the lift of a
+        // morphing menu's opener fades, and its rim must fade with it.
+        let face = chip_face(face, p.opacity().clamp(0.0, 1.0));
+        let (ground, sharp, morph) = match stand {
+            // the frosted material: the field behind the body, the snapshot behind the rim
+            LiftGround::Field(field) =>
+                (field, crate::popover::host::page_tex().unwrap_or(0), plx_gfx::gfx::GlassMorph::NONE),
+            // CLEAR glass (`GlassMorph::clear`, which only this lift draws now: a morphing menu's own
+            // glass is frosted on every frame): the body shows the sharp
+            // snapshot through `sharp`, whose window is the one flipped the way the snapshot is held;
+            // the texture in the `ground` slot is only the program's required non-zero binding, and
+            // `u_clear` 1 mixes every texel of it away
+            LiftGround::Snapshot(page) =>
+                (page, page, plx_gfx::gfx::GlassMorph { clear: 1.0, ..plx_gfx::gfx::GlassMorph::NONE }),
+            // the flat capsule below is this ground
+            LiftGround::Flat => return false,
+        };
         return p.glass_frozen(
             cap,
             cap.h * 0.5,
@@ -2927,6 +2955,7 @@ fn glass_capsule(
             [1.0, 1.0, 1.0, e],
             plx_gfx::gfx::GlassRim::Standing,
             face,
+            morph,
         );
     }
     Glass::DYNAMIC_BACKDROP.backdrop(
@@ -3042,15 +3071,14 @@ pub fn profile_chip_with(p: Painter, data: ProfileChipRead<'_>, chip_expand: f32
     profile_chip_on(p, data, chip_expand, bar_material, None);
 }
 
-/// [`profile_chip_with`] on a chosen ground for its capsule: `frozen` is the latched underlay field
-/// of the modal stack the chip is lifted over ([`lift_profile_chip`]) as its texture, `None` the live
-/// tab-strip glass.
+/// [`profile_chip_with`] on a chosen ground for its capsule: `stand` is what the chip is lifted over
+/// ([`lift_profile_chip`]), `None` the live tab-strip glass.
 fn profile_chip_on(
     p: Painter,
     data: ProfileChipRead<'_>,
     chip_expand: f32,
     bar_material: Option<plx_gfx::gfx::GlassFace>,
-    frozen: Option<u32>,
+    stand: Option<LiftGround>,
 ) {
     let r = CHIP_FRAME;
     let expand = chip_expand;
@@ -3074,7 +3102,7 @@ fn profile_chip_on(
         let cap = chip_cap(e, name_w);
         // the tab track's own material — literally the same material: glass when the track
         // resolved glass this frame, the flat capsule when it did not.
-        if !glass_capsule(p, cap, 1.0, bar_material, frozen) {
+        if !glass_capsule(p, cap, 1.0, bar_material, stand) {
             p.rect_sheened(
                 cap,
                 cap.h * 0.5,
@@ -3149,6 +3177,36 @@ fn profile_chip_on(
     }
 }
 
+/// What the opener lift's capsule stands on ([`lift_ground`]). **Never nothing**: the chrome pass
+/// leaves the chip out from the frame its menu mounts, so the lift is the chip's only copy on every
+/// frame of the open and the close and has to paint on each one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LiftGround {
+    /// The stack's latched underlay field: the frosted material, no live glass and no dim (it is
+    /// drawn above the dim), the host snapshot behind its rim.
+    Field(u32),
+    /// The host snapshot, before the field has latched: the same capsule drawn CLEAR over the
+    /// undimmed page it was taken of (the opener's own cap, which is whole on these frames; the menu's
+    /// glass beside it is frosted, never clear). The field is read
+    /// back from the GPU a frame or two after the menu mounts; the snapshot is taken in the mount
+    /// frame's own page pass, before the lift.
+    Snapshot(u32),
+    /// Neither exists: the flat tab-track capsule, `profile_chip_on`'s own fallback.
+    Flat,
+}
+
+/// **What the lift stands on this frame, decided where it paints**: the latched `field` once the
+/// stack has one, else the host `snapshot` (`popover::host::page_tex`), else [`LiftGround::Flat`].
+/// A state, not a frame count: the read takes "a frame or two" and may be refused, and the chip is
+/// painted on whichever frames those are.
+pub fn lift_ground(field: &crate::underlay::UnderlayField, snapshot: Option<u32>) -> LiftGround {
+    match (field.ground_tex(), snapshot) {
+        (Some(field), _) => LiftGround::Field(field),
+        (None, Some(page)) => LiftGround::Snapshot(page),
+        (None, None) => LiftGround::Flat,
+    }
+}
+
 /// [`profile_chip_with`], re-drawn above the account menu's scrim AND panel: the lit copy of the
 /// opener the dispatcher's lift pass (`Z::OPENER`, `Dispatcher::lifted_opener`, `Screen::bar_opener`)
 /// asks the rig for (`Rig::lift_bar_member`), the one place any opener is lifted. The control is
@@ -3157,13 +3215,12 @@ fn profile_chip_on(
 /// copy lies exactly on the chip the bar drew.
 ///
 /// **The lift's capsule stands on FROZEN ground** (owner rule, 2026-10-17: no live-refracting glass
-/// over a page): while the menu is up the capsule is `Painter::glass_frozen` over the stack's
-/// latched underlay field, its rim bending the host snapshot, and it requests no backdrop entry or
-/// blur source pass. **Before the field has latched it draws nothing** (CONFIRM2 CB1): the field
-/// latches a frame after the OK that opens the menu, the dim is still 0 on that frame, and the bar's
-/// own chip is already on screen at the same rect — the flat capsule this used to fall back to landed
-/// on top of that one and the chip blinked near-black for a frame on every open. The chip on the tab
-/// strip, with no menu up, stays live glass.
+/// over a page): while the menu is up the capsule is `Painter::glass_frozen`, its rim bending the host
+/// snapshot, and it requests no backdrop entry or blur source pass. What it stands on is chosen HERE,
+/// at paint time ([`lift_ground`]): the stack's latched field, or until that latches the snapshot
+/// drawn clear. **It always paints**: the lift owns the chip from the frame its menu mounts (the chrome
+/// pass leaves it out so the snapshot never holds it), and a frame it drew nothing on was a frame the
+/// chip blinked out. The chip on the tab strip, with no menu up, stays live glass.
 pub fn lift_profile_chip(
     p: Painter,
     data: ProfileChipRead<'_>,
@@ -3171,8 +3228,18 @@ pub fn lift_profile_chip(
     bar_material: Option<plx_gfx::gfx::GlassFace>,
     ground: &crate::underlay::UnderlayField,
 ) {
-    let Some(ground) = ground.ground_tex() else { return };
-    crate::guard(|| profile_chip_on(p, data, chip_expand, bar_material, Some(ground)));
+    lift_profile_chip_on(p, data, chip_expand, bar_material, lift_ground(ground, crate::popover::host::page_tex()));
+}
+
+/// [`lift_profile_chip`] on a chosen ground, for a test to state the frame's.
+pub(crate) fn lift_profile_chip_on(
+    p: Painter,
+    data: ProfileChipRead<'_>,
+    chip_expand: f32,
+    bar_material: Option<plx_gfx::gfx::GlassFace>,
+    stand: LiftGround,
+) {
+    crate::guard(|| profile_chip_on(p, data, chip_expand, bar_material, Some(stand)));
 }
 
 // ---- CircleButton: circular disc + centered glyph, same keyed/unkeyed ControlStyle family as
@@ -3216,6 +3283,9 @@ pub struct CircleButton {
     pub frame: Rect,
     pub glyph: *const c_char,
     pub icon: Option<crate::icons::Icon>, // vector glyph; overrides the text glyph when set
+    /// Whether the control can act: a disabled disc wears the disabled ink and never the focused
+    /// face, whatever order the builder ran in ([`CircleButton::enabled`]).
+    pub enabled: bool,
     pub focused: bool,
     /// Focus PROGRESS 0..1 when driven off a spring ([`CircleButton::focus_mix`]); `None` is the
     /// plain binary [`focused`](Self::focused).
@@ -3243,6 +3313,7 @@ impl CircleButton {
             glyph,
             icon: None,
             fill: None,
+            enabled: true,
             focused: false,
             focus: None,
             style: ControlStyle::Accent,
@@ -3291,6 +3362,15 @@ impl CircleButton {
         self.focused = f;
         self
     }
+    /// A disc that cannot act: the disabled ink ([`theme::INK_DISABLED`]), and never the focused
+    /// face whatever order the two are set in — [`Button::enabled`]'s and
+    /// [`TransportButton::enabled`]'s own rule, so a disabled disc reads the same on every row.
+    /// A disabled control owns no focus stop (`focus::next_enabled_index`), so the caller that
+    /// disables one also keeps focus off it. Defaults to enabled.
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
     /// Draw the focus fill at progress `t` (0..1) — normally [`CtlPop::focus`], the lift spring —
     /// instead of the binary [`focused`](Self::focused); see [`ControlStyle::face_at`].
     pub fn focus_mix(mut self, t: f32) -> Self {
@@ -3300,7 +3380,15 @@ impl CircleButton {
     }
     /// The face this disc draws now.
     fn face_now(&self) -> ControlFace {
-        self.style.face_at(self.focus.unwrap_or(f32::from(self.focused)), self.ground, self.palette)
+        let mut face = self.style.face_at(
+            if self.enabled { self.focus.unwrap_or(f32::from(self.focused)) } else { 0.0 },
+            self.ground,
+            self.palette,
+        );
+        if !self.enabled {
+            face.ink = theme::INK_DISABLED;
+        }
+        face
     }
     /// The [FOCUS POP](CTRL_FOCUS_SCALE), about the control's centre — normally
     /// [`CtlPop::scale`], which already folds the press dip in. `1.0` is the resting control, which
@@ -3436,14 +3524,15 @@ impl View for CircleButton {
         // capsule, and `face_box`/`face_outline` pick that up from the shape rather than from a
         // flag — at rest both are no-ops on a circle.
         let plate = face_box(r);
-        if self.focused {
+        let focused = self.enabled && self.focused;
+        if focused {
             control_cast_at(p, plate, plate.h * 0.5, self.focus.unwrap_or(1.0));
         }
         let glass = self.ground == ControlGround::Keyed
             && glass_capsule(p, plate, 1.0, self.glass, None);
         if !glass {
-            control_rim(p, plate, plate.h * 0.5, face.top, face.body, self.focused, self.ground);
-        } else if self.focused {
+            control_rim(p, plate, plate.h * 0.5, face.top, face.body, focused, self.ground);
+        } else if focused {
             let focus = self.focus.unwrap_or(1.0);
             let bright = self.style.face_at(1.0, self.ground, self.palette);
             control_rim(p.alpha(focus), plate, plate.h * 0.5, bright.top, bright.body, true, self.ground);
@@ -3707,7 +3796,7 @@ impl View for Spinner {
         // from is then a constant, so the next frame would be identical and a waiting screen
         // (the sign-in QR's "Waiting for you to sign in…") could never come to rest.
         if !plx_machine::motion::phase_clocks_held() {
-            plx_machine::idle::invalidate();
+            plx_machine::motion::report::note_motion();
         }
         #[cfg_attr(feature = "placeholder-sentinel", allow(unused_variables))]
         let t = (self.phase % Self::PERIOD_MS) as f32 / Self::PERIOD_MS as f32;
@@ -3745,7 +3834,7 @@ impl View for Spinner {
 /// hand-rolls them ends up doing index arithmetic over a flat array. Fading a wash toward the app's
 /// own GROUND is the one case the cascade *does* handle, and it belongs to the cascade: an alpha
 /// below 1 mixes the corners toward [`theme::SURFACE_APP`] inside `Painter::ambient`, which is what
-/// lets a whole page — wash included — dip for [`ui::nav`](crate::nav)'s route transition.
+/// lets a whole page — wash included — dip for the owning stack's route transition.
 ///
 /// Blend the corners toward a base surface with [`theme::mix`] before handing them over: a wash
 /// keyed at full strength is a photograph, not a wash, and mixing toward [`theme::SURFACE_APP`]
@@ -3876,7 +3965,7 @@ impl AmbientWash {
     /// Dissolve toward `target` at rate `k`. Every channel shares one rate, so the corners move as
     /// one wash rather than twelve independent fades.
     ///
-    /// **A channel that has [`settled`](plx_machine::idle::settled) is landed on its target** (the
+    /// **A channel that has [`settled`](plx_machine::motion::report::settled) is landed on its target** (the
     /// idle gate has stopped asking for frames for it, which is what that function's export is
     /// for), so the wash's last drawn codes are the codes its target maps to, and [`at_rest`](Self::at_rest)
     /// is exact. Without the landing a critically damped tail keeps moving the float's low bits
@@ -3885,7 +3974,7 @@ impl AmbientWash {
         for (c, t) in self.corners.iter_mut().zip(target) {
             for (sp, v) in c.iter_mut().zip(t) {
                 sp.step(v, k, dt);
-                if plx_machine::idle::settled(sp.pos, v, sp.vel) {
+                if plx_machine::motion::report::settled(sp.pos, v, sp.vel) {
                     // Change-guarded, so a wash already at rest reports nothing frame after frame.
                     sp.jump(v);
                 }
@@ -3936,6 +4025,17 @@ impl AmbientWash {
     /// sent, so a settled wash is bit-stable (see [`code`]). [`sample`](Self::sample) stays exact.
     pub fn drawn_corners(&self) -> [[f32; 3]; 4] {
         self.corners.map(|c| [code(c[0].pos), code(c[1].pos), code(c[2].pos)])
+    }
+    /// **Everything [`draw`](Self::draw) and [`draw_ground`](Self::draw_ground) read of the wash**, as
+    /// the exact bits of its twelve positions in corner order, for a caller that has to NAME the
+    /// picture it paints ([`Painter::cached_ground`]).
+    ///
+    /// Not [`drawn_corners`](Self::drawn_corners): those are the corner codes, but `draw_ground` also
+    /// samples the wash's INTERIOR at the corners of each band it cuts (`sample`, then `code`), and
+    /// two washes with the same corner codes can code an interior point one apart. The positions
+    /// decide every pixel, so they are the name.
+    pub fn paint_bits(&self) -> [u32; 12] {
+        std::array::from_fn(|i| self.corners[i / 3][i % 3].pos.to_bits())
     }
     /// Paint it over `r`. Opaque — this REPLACES what is under it (see the type docs), so it belongs
     /// at the bottom of a screen's draw, standing in for the flat clear.
@@ -4145,6 +4245,18 @@ impl WashScrim {
     /// The scrim's alpha at the authored point `(x, y)`.
     pub fn alpha(&self, x: f32, y: f32) -> f32 {
         self.field.at(x, y)
+    }
+
+    /// **The scrim by value, as a draw reads it**: the ink, the shader's mode/count and every
+    /// uniform it is uploaded, by bits ([`AmbientWash::paint_bits`] for the wash it rides). Two
+    /// scrims with the same bits draw the same field, cell for cell, so a screen that caches the
+    /// picture a scrim is drawn into (`Painter::cached_ground`) names the scrim by it.
+    pub fn paint_bits(&self) -> ([u32; 4], u32, [[u32; 4]; plx_gfx::gfx::scrim::VEC4S]) {
+        (
+            self.ink.map(f32::to_bits),
+            self.field.shader_count().to_bits(),
+            self.field.uniforms().map(|v| v.map(f32::to_bits)),
+        )
     }
 }
 
@@ -6998,7 +7110,7 @@ impl StripRender {
     /// through `ChromeSnapshot::pulse`; no screen does.
     pub fn pulse(&mut self, idx: usize) {
         self.pulse = Some(TabPulse { idx, age: 0.0 });
-        plx_machine::idle::invalidate();
+        // The input boundary selects the first pulse frame; step reports its ramp.
     }
 
     /// The running pulse as `(pill index, envelope)`, `None` at rest.
@@ -7950,11 +8062,11 @@ impl StripRender {
         // dismissed, and damage under that fading menu re-captured the host and re-latched the
         // dim's field on every one of its frames.
         if let Some(mut pulse) = self.pulse.take() {
-            plx_machine::idle::decorative(|| {
+            plx_machine::motion::report::decorative(|| {
                 pulse.age = pulse.age + dt; // the strip's own step, as its springs take
                 if pulse.age < TAB_PULSE_S {
                     self.pulse = Some(pulse);
-                    plx_machine::idle::note_motion();
+                    plx_machine::motion::report::note_motion();
                 }
             });
         }
@@ -7993,7 +8105,7 @@ impl StripRender {
 /// the legacy Library screen); every caller now owns its captured `TabLabels` and draws through
 /// `Bridge::draw` -> `self.strip.draw(self.chrome.labels(), …)` directly.
 impl StripRender {
-    pub fn draw(&mut self, data: TabLabels<'_>, p: Painter, band: &mut TabBand) {
+    pub fn draw(&mut self, data: TabLabels<'_>, p: Painter, band: &mut TabBand, nav: crate::screen::NavPresentation) {
                    // The band's material resets first: every early
                    // return below must leave [`profile_chip_with`] on the flat capsule rather than on the stops some
                    // previous frame solved. See [`BarMaterial`].
@@ -8023,7 +8135,7 @@ impl StripRender {
         // is also the honest answer on the two screens that really do have it up there.
         // …and never DURING a route transition: `nav` dips the page under this bar while the bar
         // itself holds still, so those pixels are the app ground fading, not the screen's colour.
-        let settled = crate::nav::page_alpha() >= 0.999;
+        let settled = nav.page_alpha >= 0.999 && nav.blur_amount <= 0.001;
         // **Decided BEFORE the ground is sampled, because it decides whether to sample at all.**
         // `sample_ground` reads its taps from the retained image of the band this track's glass
         // draws from — so a track that is about to draw FLAT because the `flattabs` experiment is

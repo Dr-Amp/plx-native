@@ -37,6 +37,7 @@
 use std::borrow::Cow;
 
 use plx_ui::containers::modal::EntryMotion;
+use plx_ui::a11y::{A11y, A11yPath};
 use plx_ui::containers::stack::{Instance, NavStack};
 use plx_ui::containers::transition::Immediate;
 use plx_ui::containers::{Life, Minter};
@@ -333,6 +334,7 @@ impl RouteSurface {
                 Fx::App(a) => fx.push(Fx::App(a)),
                 Fx::Log(l) => fx.push(Fx::Log(l)),
                 Fx::Press(arm) => fx.push(Fx::Press(arm)),
+                Fx::HoldHint(event) => fx.push(Fx::HoldHint(event)),
                 Fx::Remember { group, elem } => {
                     // Forwarding re-stamps the emission as this surface. Preserve inner
                     // ownership before doing so: covered/leaving pages still receive ticks.
@@ -486,13 +488,13 @@ fn mount_page(
     fx: &mut Effects<'_, InnerHost>,
 ) -> Box<dyn Screen<InnerHost>> {
     match arg {
-        SettingsPage::Root => Box::new(RootPage::new(entry, cx.views.directory)),
-        SettingsPage::Language => Box::new(LanguagePage::new(entry)),
+        SettingsPage::Root => Box::new(RootPage::new(entry, cx.views.directory, &cx.views.inputs)),
+        SettingsPage::Language => Box::new(LanguagePage::new(entry, cx.views.inputs)),
         SettingsPage::UnderPosters => Box::new(under_posters::UnderPostersPage::new(entry)),
         SettingsPage::UnderPostersDetails(kind) => Box::new(under_posters::DetailsPage::new(entry, kind)),
         SettingsPage::Contribute => Box::new(super::legal::DocumentPage::contribute(entry)),
-        SettingsPage::Playback => Box::new(super::preferences::PreferencesPage::new(entry, super::preferences::Kind::Playback)),
-        SettingsPage::AudioSubtitles => Box::new(super::preferences::PreferencesPage::new(entry, super::preferences::Kind::AudioSubtitles)),
+        SettingsPage::Playback => Box::new(super::preferences::PreferencesPage::new(entry, super::preferences::Kind::Playback, &cx.views.inputs)),
+        SettingsPage::AudioSubtitles => Box::new(super::preferences::PreferencesPage::new(entry, super::preferences::Kind::AudioSubtitles, &cx.views.inputs)),
         SettingsPage::Legal => Box::new(super::legal::LegalIndex::new(entry)),
         SettingsPage::About => Box::new(super::legal::DocumentPage::about(entry)),
         SettingsPage::Document(i) => Box::new(super::legal::DocumentPage::legal(entry, i)),
@@ -503,7 +505,7 @@ fn mount_page(
         }
         SettingsPage::Favourites => Box::new(super::onboard::OnboardScreen::settings(entry, cx.views.directory)),
         SettingsPage::LibraryFavourites => Box::new(super::onboard::OnboardScreen::library(entry, cx.views.directory)),
-        SettingsPage::Picker(kind) => Box::new(super::preferences::PickerPage::new(entry, kind)),
+        SettingsPage::Picker(kind) => Box::new(super::preferences::PickerPage::new(entry, kind, &cx.views.inputs)),
         SettingsPage::PlayerHud => Box::new(super::hud_settings::HudPage::new(entry)),
         SettingsPage::Diagnostics => Box::new(diagnostics::DiagnosticsPage::new(entry)),
         page @ (SettingsPage::HudGallery | SettingsPage::HudDetail(..) | SettingsPage::HudAbout(..) | SettingsPage::HudPreview(..)) =>
@@ -549,9 +551,8 @@ fn mount_page(
 ///  * `ConsentPage` (Privacy & data, and each first-run stage) → `ConsentState`: the mode, both
 ///    halves of the draft decision, and whether the delete alert is up.
 ///  * `OnboardScreen` (Favorite libraries) → `OnboardState`: whether it is the Settings or the
-///    first-run instance, whether it currently HAS an action band (the group set the engine is
-///    reasoning about, cached at `rebuild` for the reason that field's own doc gives), and the
-///    whole draft pin list.
+///    first-run instance, where it is in its lifecycle (`Exit`: editing, committing after a pin
+///    commit count, or left), and the whole draft pin list.
 ///  * `DocumentPage` (the six Legal documents and About) → `DocState`: WHICH document, and its
 ///    reading position in whole `document_reader::STEP`s.
 ///  * `PreviewPage` (the five Privacy previews) → `PreviewState`: which preview. **Its reading
@@ -853,11 +854,29 @@ impl<H: DirectoryLike> Focusable<H> for RouteSurface {
             |t| t.screen.seat(g, from, &inner_cx(cx)),
         )
     }
+    // The ids are the top page's own, relative to it: the surface adds nothing and answers for the
+    // page that owns input (its namespace is the page's, `Screen::a11y_ns` below).
+    fn a11y(&self, key: &u32, cx: &Cx<'_, H>) -> Option<A11y<'_>> {
+        self.top().and_then(|t| t.screen.a11y(key, &inner_cx(cx)))
+    }
+    fn a11y_elems(&self, g: GroupId, cx: &Cx<'_, H>, out: &mut Vec<u32>) {
+        if let Some(top) = self.top() {
+            top.screen.a11y_elems(g, &inner_cx(cx), out);
+        }
+    }
+    fn a11y_find(&self, path: &A11yPath, cx: &Cx<'_, H>) -> Option<u32> {
+        self.top().and_then(|t| t.screen.a11y_find(path, &inner_cx(cx)))
+    }
 }
 
 impl<H: DirectoryLike> Screen<H> for RouteSurface {
     fn name(&self) -> &'static str {
         self.top_word()
+    }
+    /// The top page's namespace, not its heartbeat word: two pages that share a word (a Legal
+    /// document and the index, a Privacy preview and the page) answer different namespaces.
+    fn a11y_ns(&self) -> &'static str {
+        self.top().map_or(word::SETTINGS, |i| i.screen.a11y_ns())
     }
     fn state(&self) -> &dyn LogicalState {
         // the surface itself, so the hash covers the inner stack — see the `LogicalState` impl
@@ -891,7 +910,7 @@ impl<H: DirectoryLike> Screen<H> for RouteSurface {
                 // opaque ground at rest and what fades out over the host on dismissal
                 let dim = theme::scrim_black(settings_scrim_alpha(a, f.nav_page_alpha));
                 root.rect(Rect::FULL, 0.0, dim, dim, 0.0);
-                plx_ui::profile::phase("st.ground", || self.ground.draw_host(root.alpha(a)));
+                plx_ui::profile::phase("st.ground", || { if self.ground.draw_host(root.alpha(a)) { f.request_frame(); } });
             }
             Family::FirstRunConsent => {
                 self.ground.draw_home(root);
@@ -917,6 +936,7 @@ impl<H: DirectoryLike> Screen<H> for RouteSurface {
         if let Some(inst) = self.top_mut() {
             let mut inner = DrawFrame::with_navigation(&icx, f.painter, navigation);
             inst.screen.draw(&mut inner);
+            if inner.take_frame_request() { f.request_frame(); }
         }
         self.push.route.walked();
     }
@@ -994,6 +1014,7 @@ impl RouteSurface {
             if let Some(inst) = self.top_mut() {
                 let mut inner = DrawFrame::with_navigation(&icx, entrance, navigation);
                 inst.screen.draw(&mut inner);
+                if inner.take_frame_request() { f.request_frame(); }
                 stops.extend(inner.into_stops());
             }
         } else {
@@ -1002,6 +1023,7 @@ impl RouteSurface {
                     let mut inner = DrawFrame::with_navigation(&icx, parent_p, navigation);
                     inner.push = parent_frame;
                     inst.screen.draw(&mut inner);
+                    if inner.take_frame_request() { f.request_frame(); }
                     stops.extend(inner.into_stops());
                 }
             }
@@ -1015,6 +1037,7 @@ impl RouteSurface {
                     let mut inner = DrawFrame::with_navigation(&icx, child_p, navigation);
                     inner.push = child_frame;
                     inst.screen.draw(&mut inner);
+                    if inner.take_frame_request() { f.request_frame(); }
                     // a leaving page takes no input: its stops are not registered
                     if !popping {
                         stops.extend(inner.into_stops());
@@ -1099,6 +1122,24 @@ impl FormId for RootId {
             RootId::Plaintext(_) => PLAINTEXT_KEY_BASE,
         })
     }
+    fn a11y(&self) -> Option<&'static str> {
+        Some(match self {
+            RootId::Favourites => "favourites",
+            RootId::UnderPosters => "under_posters",
+            RootId::Playback => "playback",
+            RootId::AudioSubtitles => "audio_subtitles",
+            RootId::Language => "language",
+            RootId::AutoSignIn => "auto_sign_in",
+            RootId::TrailerAutoplay => "trailer_autoplay",
+            RootId::Resolution => "resolution",
+            // one row per server, so no one name fits them all: the position names each (`row.<i>`)
+            RootId::Plaintext(_) => return None,
+            RootId::Privacy => "privacy",
+            RootId::Diagnostics => "diagnostics",
+            RootId::Legal => "legal",
+            RootId::About => "about",
+        })
+    }
 }
 
 /// What a root row does beyond opening a page (a `Nav` row never reaches it — see
@@ -1118,14 +1159,19 @@ pub struct RootPage {
     entry: EntryId,
     form: FormTable<RootId, Action, SettingsPage>,
     state: RootState,
-    session_watch: plx_plex::plex::session::VisibleSessionWatch,
+    session_watch: Option<(u64, bool, u32)>,
+    inputs: crate::registry::ScreenInputs,
     session_snapshot: std::sync::Arc<plx_plex::plex::session::Session>,
-    pending_auto: Option<(bool, plx_base::storage_worker::TypedTicket<bool>)>,
+    pending_auto: Option<(bool, std::sync::mpsc::Receiver<bool>)>,
     /// The hero trailer switch picked here and not yet answered: the value the row shows meanwhile,
     /// and the receipt of its `route::choose` (Confirm) write. A `false` (or dropped) receipt means
     /// the pick was not saved, and the row goes back to the stored value.
     pending_trailer: Option<(bool, std::sync::mpsc::Receiver<bool>)>,
-    /// The servers the signed-in account answered plx_platform::i18n::msg::settings_plaintext_question() for, then the
+    auto_receipt: Option<bool>,
+    trailer_receipt: Option<bool>,
+    trailer_seat: plx_plex::plex::session::Seat,
+    trailer_scope: u32,
+    /// The servers the signed-in account answered plx_os::i18n::msg::settings_plaintext_question() for, then the
     /// ones discovery offers it for and nobody has answered, by row — the `(machine_id, allowed)`
     /// each switch shows.
     plaintext_rows: Vec<(String, bool)>,
@@ -1148,14 +1194,14 @@ struct RootState {
     sel: RowKey,
     auto_sign_in: bool,
     trailer_autoplay: bool,
-    language: plx_platform::i18n::Preference,
+    language: plx_os::i18n::Preference,
     /// What shows under a poster, as the Under posters row summarises it. Written to the canon only
     /// when it is not the default, so every default root's digest is unchanged.
     under_posters: plx_plex::plex::session::UnderPosters,
     /// Each unencrypted-connection switch, in row order. Written to the canon only when there is
     /// one, so every other root's digest is unchanged.
     plaintext: Vec<bool>,
-    trace: plx_platform::playback_trace::Status,
+    trace: plx_os::playback_trace::Status,
 }
 
 impl LogicalState for RootState {
@@ -1164,7 +1210,7 @@ impl LogicalState for RootState {
         if self.under_posters != plx_plex::plex::session::UnderPosters::DEFAULT {
             w.u32(u32::from(self.under_posters.pack()));
         }
-        if self.trace != plx_platform::playback_trace::Status::Off { w.u8(0xd1).u8(self.trace as u8); }
+        if self.trace != plx_os::playback_trace::Status::Off { w.u8(0xd1).u8(self.trace as u8); }
         if !self.plaintext.is_empty() {
             w.u32(self.plaintext.len() as u32);
             for &on in &self.plaintext {
@@ -1203,7 +1249,7 @@ struct PlaintextRowInput {
 /// state) before calling the pure builder, so the builder itself never reads a global and a test
 /// can drive it directly with a synthesized combination no real session may currently be in.
 struct RootInputs {
-    trace: plx_platform::playback_trace::Status,
+    trace: plx_os::playback_trace::Status,
     signed_in: bool,
     /// A one-person account already skips the profile picker; only a multi-user account is ever
     /// shown the Automatically Sign In switch.
@@ -1213,10 +1259,10 @@ struct RootInputs {
     trailer_autoplay: bool,
     resolution: UiResolution,
     /// Whether this set is offered the Interface resolution row at all: webOS 1-3 only
-    /// (`plx_platform::tv::device::ui_resolution_offered`). A plain flag, like the others, so the
+    /// (`plx_os::tv::device::ui_resolution_offered`). A plain flag, like the others, so the
     /// builder stays pure and a test can state either answer.
     resolution_offered: bool,
-    language: plx_platform::i18n::Preference,
+    language: plx_os::i18n::Preference,
     /// What shows under a poster (the stored setting, read at the build), which the Under posters
     /// row summarises the way Language shows its name.
     under_posters: plx_plex::plex::session::UnderPosters,
@@ -1229,16 +1275,16 @@ struct RootInputs {
 /// [`RootInputs`]. `RootPage::rebuild` gathers the inputs and calls this; the text-fit tests
 /// (`settings_text_fit_tests.rs`) call it directly, over every `RootInputs` combination worth
 /// checking, without a real signed-in session. Reordering the page is moving a line here.
-fn trace_label(status: plx_platform::playback_trace::Status) -> &'static str {
-    use plx_platform::playback_trace::Status;
+fn trace_label(status: plx_os::playback_trace::Status) -> &'static str {
+    use plx_os::playback_trace::Status;
     match status {
-        Status::Off => plx_platform::i18n::msg::settings_trace_off(),
-        Status::Recording => plx_platform::i18n::msg::settings_trace_recording(),
-        Status::Saved => plx_platform::i18n::msg::settings_trace_saved(),
-        Status::Saving => plx_platform::i18n::msg::settings_trace_saving(),
-        Status::Exported => plx_platform::i18n::msg::settings_trace_exported(),
-        Status::Unavailable => plx_platform::i18n::msg::settings_trace_unavailable(),
-        Status::Failed => plx_platform::i18n::msg::settings_trace_failed(),
+        Status::Off => plx_os::i18n::msg::settings_trace_off(),
+        Status::Recording => plx_os::i18n::msg::settings_trace_recording(),
+        Status::Saved => plx_os::i18n::msg::settings_trace_saved(),
+        Status::Saving => plx_os::i18n::msg::settings_trace_saving(),
+        Status::Exported => plx_os::i18n::msg::settings_trace_exported(),
+        Status::Unavailable => plx_os::i18n::msg::settings_trace_unavailable(),
+        Status::Failed => plx_os::i18n::msg::settings_trace_failed(),
     }
 }
 
@@ -1248,7 +1294,7 @@ fn trace_label(status: plx_platform::playback_trace::Status) -> &'static str {
 /// table) shows the page's. Pure: a function of the focused row's identity alone, so a test states
 /// every answer and the screen only fades between them.
 fn sentence_for(id: Option<&RootId>) -> Cow<'static, str> {
-    use plx_platform::i18n::msg;
+    use plx_os::i18n::msg;
     match id {
         Some(RootId::Favourites) => Cow::Owned(format!("{} {}", msg::settings_libraries_detail(), msg::settings_libraries_more())),
         Some(RootId::UnderPosters) => Cow::Borrowed(msg::under_posters_detail()),
@@ -1276,44 +1322,44 @@ fn root_form(inputs: &RootInputs) -> Form<RootId, Action, SettingsPage> {
     //
     // The Libraries section is Libraries and the row is Favorite libraries: the switch governs
     // the whole app — Home's shelves, the top tab strip and the Library's Sources picker.
-    let libraries = FormSection::new(plx_platform::i18n::msg::settings_libraries_section())
+    let libraries = FormSection::new(plx_os::i18n::msg::settings_libraries_section())
         .visible(signed_in)
         .item(
             RootId::Favourites,
             RowKind::Nav(SettingsPage::Favourites),
             Action::Door,
-            Row::new(plx_platform::i18n::msg::settings_libraries_title())
-                .value(plx_platform::i18n::msg::settings_libraries_count(inputs.library_count))
+            Row::new(plx_os::i18n::msg::settings_libraries_title())
+                .value(plx_os::i18n::msg::settings_libraries_count(inputs.library_count))
                 .chevron(true),
         )
         .item(
             RootId::UnderPosters,
             RowKind::Nav(SettingsPage::UnderPosters),
             Action::Door,
-            Row::new(plx_platform::i18n::msg::under_posters_title())
+            Row::new(plx_os::i18n::msg::under_posters_title())
                 .value(under_posters::summary(inputs.under_posters))
                 .chevron(true),
         );
-    let playback = FormSection::new(plx_platform::i18n::msg::settings_playback_section())
+    let playback = FormSection::new(plx_os::i18n::msg::settings_playback_section())
         .item(
             RootId::Playback,
             RowKind::Nav(SettingsPage::Playback),
             Action::Door,
-            Row::new(plx_platform::i18n::msg::settings_playback_title()).chevron(true),
+            Row::new(plx_os::i18n::msg::settings_playback_title()).chevron(true),
         )
         .item_if(
             signed_in,
             RootId::AudioSubtitles,
             RowKind::Nav(SettingsPage::AudioSubtitles),
             Action::Door,
-            Row::new(plx_platform::i18n::msg::settings_audio_title()).chevron(true),
+            Row::new(plx_os::i18n::msg::settings_audio_title()).chevron(true),
         );
-    let system = FormSection::new(plx_platform::i18n::msg::settings_system_section())
+    let system = FormSection::new(plx_os::i18n::msg::settings_system_section())
         .item(
             RootId::Language,
             RowKind::Nav(SettingsPage::Language),
             Action::Door,
-            Row::new(plx_platform::i18n::msg::settings_language_title())
+            Row::new(plx_os::i18n::msg::settings_language_title())
                 .value(preference_name(inputs.language))
                 .chevron(true),
         )
@@ -1322,14 +1368,14 @@ fn root_form(inputs: &RootInputs) -> Form<RootId, Action, SettingsPage> {
             RootId::AutoSignIn,
             RowKind::Toggle,
             Action::AutoSignIn,
-            Row::new(plx_platform::i18n::msg::settings_auto_sign_in_title()).toggle(inputs.auto_sign_in),
+            Row::new(plx_os::i18n::msg::settings_auto_sign_in_title()).toggle(inputs.auto_sign_in),
         )
         .item_if(
             signed_in,
             RootId::TrailerAutoplay,
             RowKind::Toggle,
             Action::TrailerAutoplay,
-            Row::new(plx_platform::i18n::msg::settings_trailers_title()).toggle(inputs.trailer_autoplay),
+            Row::new(plx_os::i18n::msg::settings_trailers_title()).toggle(inputs.trailer_autoplay),
         )
         // Signed in AND on webOS 1-3 only (`resolution_offered`), like the switches above for the
         // first: the signed-out root is the sign-in path's own short list. On webOS 4+ the root is
@@ -1341,12 +1387,12 @@ fn root_form(inputs: &RootInputs) -> Form<RootId, Action, SettingsPage> {
             RootId::Resolution,
             RowKind::Nav(SettingsPage::Picker(PickerKind::UiResolution)),
             Action::Door,
-            Row::new(plx_platform::i18n::msg::settings_resolution_title())
+            Row::new(plx_os::i18n::msg::settings_resolution_title())
                 .value(super::preferences::resolution_label(inputs.resolution))
                 .chevron(true),
         );
     let has_plaintext = signed_in && !inputs.plaintext.is_empty();
-    let mut plaintext = FormSection::new(plx_platform::i18n::msg::settings_plaintext_section()).visible(has_plaintext);
+    let mut plaintext = FormSection::new(plx_os::i18n::msg::settings_plaintext_section()).visible(has_plaintext);
     if has_plaintext {
         for (i, row) in inputs.plaintext.iter().enumerate() {
             let label = Row::new(&row.name);
@@ -1364,18 +1410,18 @@ fn root_form(inputs: &RootInputs) -> Form<RootId, Action, SettingsPage> {
             );
         }
     }
-    let support = FormSection::new(plx_platform::i18n::msg::settings_support_section())
+    let support = FormSection::new(plx_os::i18n::msg::settings_support_section())
         .item(
             RootId::Privacy,
             RowKind::Nav(SettingsPage::Privacy),
             Action::Door,
-            Row::new(plx_platform::i18n::msg::settings_privacy_title()).chevron(true),
+            Row::new(plx_os::i18n::msg::settings_privacy_title()).chevron(true),
         )
         .item(
             RootId::Diagnostics,
             RowKind::Nav(SettingsPage::Diagnostics),
             Action::Door,
-            Row::new(plx_platform::i18n::msg::settings_trace_section())
+            Row::new(plx_os::i18n::msg::settings_trace_section())
                 .value(diagnostics::root_value(inputs.trace))
                 .chevron(true),
         )
@@ -1383,13 +1429,13 @@ fn root_form(inputs: &RootInputs) -> Form<RootId, Action, SettingsPage> {
             RootId::Legal,
             RowKind::Nav(SettingsPage::Legal),
             Action::Door,
-            Row::new(plx_platform::i18n::msg::settings_legal_title()).chevron(true),
+            Row::new(plx_os::i18n::msg::settings_legal_title()).chevron(true),
         )
         .item(
             RootId::About,
             RowKind::Nav(SettingsPage::About),
             Action::Door,
-            Row::new(plx_platform::i18n::msg::settings_about_title()).chevron(true),
+            Row::new(plx_os::i18n::msg::settings_about_title()).chevron(true),
         );
     Form::new()
         .section(libraries)
@@ -1400,28 +1446,31 @@ fn root_form(inputs: &RootInputs) -> Form<RootId, Action, SettingsPage> {
 }
 
 impl RootPage {
-    fn new(entry: EntryId, directory: plx_data::stores::browse::DirectoryView<'_>) -> Self {
+    fn new(entry: EntryId, directory: plx_data::stores::browse::DirectoryView<'_>, inputs: &crate::registry::ScreenInputs) -> Self {
         let mut s = Self {
             entry,
-            form: FormTable::new(super::registry::BAND),
+            form: FormTable::page(super::registry::BAND),
             session_watch: Default::default(),
+            inputs: inputs.clone(),
             session_snapshot: Default::default(),
             pending_auto: None, pending_trailer: None,
+            auto_receipt: None, trailer_receipt: None,
+            trailer_seat: inputs.profile.seat(), trailer_scope: inputs.profile.generation,
             under_ask: Default::default(),
             plaintext_rows: Vec::new(),
             pending_plaintext: None,
             alert: PlaintextAlert::new(ALERT_GROUP, super::registry::ALERT, super::registry::ALERT + 1),
-            grant_seen: plx_plex::plex::grant::revision(),
+            grant_seen: inputs.grant_generation,
             // placeholder: the page opens on the sentence of the row it seats, set below
             follow: plx_ui::follow_copy::FollowCopy::new(""),
             state: RootState {
                 sel: RowKey(0),
                 auto_sign_in: false,
                 trailer_autoplay: true,
-                language: plx_platform::i18n::Preference::System,
+                language: plx_os::i18n::Preference::System,
                 under_posters: plx_plex::plex::session::UnderPosters::DEFAULT,
                 plaintext: Vec::new(),
-                trace: plx_platform::playback_trace::Status::Off,
+                trace: plx_os::playback_trace::Status::Off,
             },
         };
         s.rebuild(directory);
@@ -1435,24 +1484,24 @@ impl RootPage {
     /// Re-derive the rows from the session, keeping focus on the row it is on BY IDENTITY (a
     /// vanished row falls to its next, else previous, neighbour — `FormTable::set`).
     fn rebuild(&mut self, directory: plx_data::stores::browse::DirectoryView<'_>) {
-        if let Some(snapshot) = plx_plex::plex::session::peek_settled() {
-            self.session_snapshot = snapshot;
+        if let Some(snapshot) = self.inputs.settled_session() {
+            self.session_snapshot = snapshot.clone();
         }
         let sess = &self.session_snapshot;
-        let signed_in = sess.account(plx_plex::plex::session::current().as_ref()).signed_in;
+        let signed_in = sess.account(self.inputs.profile.user.as_ref()).signed_in;
         let auto_sign_in = self.pending_auto.as_ref().map_or_else(|| sess.auto_sign_in(), |(value, _)| *value);
         // The SEATED profile's own switch, else the TV's older key, else on (`stored_effective`).
-        let trailer_autoplay = self.pending_trailer.as_ref().map_or_else(|| {
+        let trailer_autoplay = self.pending_trailer.as_ref().filter(|_| self.trailer_scope == self.inputs.profile.generation).map_or_else(|| {
             plx_plex::plex::session::stored_effective::<plx_plex::plex::session::TrailerAutoplayPref>(
-                sess, &plx_plex::plex::session::current_seat())
+                sess, &self.inputs.profile.seat())
         }, |(value, _)| *value);
         let resolution = sess.ui_resolution();
-        let resolution_offered = plx_platform::tv::device::ui_resolution_offered();
+        let resolution_offered = self.inputs.resolution_offered;
         let multi_user = sess.home_users.len() > 1;
         self.state.auto_sign_in = auto_sign_in;
         self.state.trailer_autoplay = trailer_autoplay;
-        self.state.language = plx_platform::i18n::saved_preference();
-        self.state.under_posters = plx_media::route::under_posters();
+        self.state.language = self.inputs.install_language;
+        self.state.under_posters = self.inputs.preference::<plx_plex::plex::session::UnderPostersPref>();
         let plaintext = if signed_in { self.plaintext_inputs() } else { Vec::new() };
         let form = root_form(&RootInputs {
             trace: self.state.trace,
@@ -1461,9 +1510,6 @@ impl RootPage {
             under_posters: self.state.under_posters, plaintext,
         });
         let keep = self.form.selected_id().cloned();
-        self.form.table.compact = false;
-        self.form.table.board_metrics(true);
-        self.form.table.header_ink = theme::TEXT_READING;
         self.form.set(form, keep.as_ref());
         self.form.table.list_focused = true;
         if let Some(key) = self.form.key_at(self.form.table.sel.max(0) as usize) {
@@ -1473,7 +1519,7 @@ impl RootPage {
     }
 
     /// **Unencrypted connections**: one input per server the signed-in account answered
-    /// plx_platform::i18n::msg::settings_plaintext_question() for (`grant::choices` — this session's answers over the
+    /// plx_os::i18n::msg::settings_plaintext_question() for (`grant::choices` — this session's answers over the
     /// session file's, for THIS account only), so an allowed one is here to turn off again — and,
     /// switched off, one per server discovery offers the question for that nobody has answered
     /// (`grant::offers`), so a signed-in person whose server went plaintext-only has a place to
@@ -1485,15 +1531,15 @@ impl RootPage {
     fn plaintext_inputs(&mut self) -> Vec<PlaintextRowInput> {
         use plx_plex::plex::session::PlaintextChoice;
         let sess = &self.session_snapshot;
-        let answered = plx_plex::plex::grant::choices(&sess.prefs.plaintext_consent, &sess.account_token);
+        let answered = &self.inputs.grants.choices;
         let mut rows: Vec<(String, bool)> = answered
             .iter()
             .filter(|(_, choice)| *choice != PlaintextChoice::Undecided)
             .map(|(machine, choice)| (machine.clone(), choice.allows()))
             .collect();
-        for offer in plx_plex::plex::grant::offers() {
+        for offer in &self.inputs.grants.offers {
             if plaintext_question::asks(Some(&offer)) && !rows.iter().any(|(m, _)| *m == offer.machine_id) {
-                rows.push((offer.machine_id, false));
+                rows.push((offer.machine_id.clone(), false));
             }
         }
         // The optimistic value holds until the answers read agree with it.
@@ -1506,7 +1552,7 @@ impl RootPage {
         }
         self.plaintext_rows = rows.clone();
         self.state.plaintext = rows.iter().map(|(_, on)| *on).collect();
-        let offers = plx_plex::plex::grant::offers();
+        let offers = &self.inputs.grants.offers;
         rows.into_iter()
             .map(|(machine, on)| {
                 // An offered server was never reached, so the session file does not know it yet:
@@ -1519,8 +1565,8 @@ impl RootPage {
                         .find(|s| s.machine_id == machine && !s.name.is_empty())
                         .map(|s| s.name.clone()));
                 let named = real_name.is_some();
-                let name = real_name.unwrap_or_else(|| plx_platform::i18n::msg::settings_plaintext_server().to_string());
-                let connected = on && plx_plex::plex::grant::granted_origin(&machine).is_some();
+                let name = real_name.unwrap_or_else(|| plx_os::i18n::msg::settings_plaintext_server().to_string());
+                let connected = on && self.inputs.grants.connected.iter().any(|m| m == &machine);
                 PlaintextRowInput { machine: ServerMachineId(machine), name, named, on, connected }
             })
             .collect()
@@ -1529,10 +1575,10 @@ impl RootPage {
     fn view(&self) -> TableScreen<'_> {
         TableScreen::new(
             Header::new(
-                RouteLayout::settings_page(),
+                RouteLayout::screen(),
                 None,
-                plx_platform::i18n::msg::settings_title(),
-                plx_platform::i18n::msg::settings_root_copy(),
+                plx_os::i18n::msg::settings_title(),
+                plx_os::i18n::msg::settings_root_copy(),
             )
             .with_follow(&self.follow),
             &self.form.table,
@@ -1552,10 +1598,10 @@ impl RootPage {
             Action::Door => {}
             Action::AutoSignIn => {
                 let on = !self.state.auto_sign_in;
-                if let Ok(ticket) = plx_plex::plex::session::queue_update_ticket(move |current|
-                    (current.auto_sign_in() != on).then(|| current.with_auto_sign_in(on))) {
-                    self.pending_auto = Some((on, ticket));
-                }
+                let (reply, receipt) = std::sync::mpsc::channel();
+                fx.push(Fx::App(AppFx::Preferences(super::registry::PreferenceCmd::AutoSignIn { on, reply })));
+                self.auto_receipt = None;
+                self.pending_auto = Some((on, receipt));
                 self.rebuild(directory);
             }
             Action::TrailerAutoplay => {
@@ -1565,6 +1611,9 @@ impl RootPage {
                 let (reply, receipt) = std::sync::mpsc::channel();
                 fx.push(Fx::App(AppFx::Preferences(super::registry::PreferenceCmd::Choose(
                     plx_media::route::Choice::TrailerAutoplay(on), reply))));
+                self.trailer_receipt = None;
+                self.trailer_seat = self.inputs.profile.seat();
+                self.trailer_scope = self.inputs.profile.generation;
                 self.pending_trailer = Some((on, receipt));
                 self.rebuild(directory);
             }
@@ -1576,17 +1625,16 @@ impl RootPage {
                 if !on {
                     // ON asks first — the same question the sign-in and the failure read-outs
                     // put, seated on *Not now*; only its *Connect* allows (`alert_answer`).
-                    let sid = plx_plex::plex::id_of_machine(&machine);
+                    let sid = self.inputs.servers.iter().find(|(id, _)| id == &machine).map(|(_, sid)| *sid);
                     self.alert.open(&machine, sid, MachineId::Instance(InstanceId(0)), fx);
                     return;
                 }
-                // OFF is immediate: `grant::record` withdraws the grant NOW, before the
-                // preferences write lands, and records the revocation for this account.
-                plx_base::eventlog::log("settings: unencrypted connections turned off for one server");
-                let account = plx_plex::plex::grant::account_key(&self.session_snapshot.account_token);
-                if plx_plex::plex::grant::record(&account, &machine, PlaintextChoice::Revoked).is_ok() {
-                    self.pending_plaintext = Some((machine, false));
-                }
+                // The same-drain Session runner withdraws the grant before its storage write.
+                fx.push(Fx::App(AppFx::Session(plx_session::auth::SessionCmd::AnswerPlaintext {
+                    machine_id: machine.clone(), choice: PlaintextChoice::Revoked,
+                    sid: self.inputs.servers.iter().find(|(id, _)| id == &machine).map(|(_, sid)| *sid),
+                })));
+                self.pending_plaintext = Some((machine, false));
                 self.rebuild(directory);
             }
         }
@@ -1620,6 +1668,7 @@ impl Machine<InnerHost> for RootPage {
         cx: &Cx<'_, InnerHost>,
         fx: &mut Effects<'_, InnerHost>,
     ) -> Handled {
+        self.inputs = cx.views.inputs.clone();
         match self.alert.step(ev, cx) {
             AlertStep::Pass => {}
             AlertStep::Done(handled) => return handled,
@@ -1631,7 +1680,7 @@ impl Machine<InnerHost> for RootPage {
         match ev {
             ScreenEvent::Enter(_) => {
                 // Read diagnostic status through the runner, never through a global in the screen.
-                fx.push(Fx::App(AppFx::PlaybackTrace(plx_platform::playback_trace::Command::Status)));
+                fx.push(Fx::App(AppFx::PlaybackTrace(plx_os::playback_trace::Command::Status)));
                 // a return from a child: the favourite count may have changed
                 self.rebuild(cx.views.directory);
                 Handled::Yes
@@ -1657,45 +1706,66 @@ impl Machine<InnerHost> for RootPage {
                 if owed && cx.focus.current.is_some_and(|key| key.entry == self.entry) {
                     self.under_ask.step(cx, fx);
                 }
-                let mut landed = self.session_watch.changed();
-                if self.pending_auto.as_ref().is_some_and(|(_, ticket)| !matches!(ticket.try_recv(),
-                    Err(std::sync::mpsc::TryRecvError::Empty))) {
-                    // Read AFTER the receipt: the worker may have installed Locked/Blocked
-                    // while this Tick was polling. Retain a consumed receipt's local value
-                    // until authority settles; subsequent polls see Disconnected.
-                    if let Some(snapshot) = plx_plex::plex::session::peek_settled() {
-                        self.session_snapshot = snapshot;
+                let key = self.inputs.session_key();
+                let mut landed = self.session_watch != Some(key)
+                    || self.state.language != self.inputs.install_language
+                    || self.state.under_posters != self.inputs.preference::<plx_plex::plex::session::UnderPostersPref>();
+                self.session_watch = Some(key);
+                if let Some((value, ticket)) = &self.pending_auto {
+                    if self.auto_receipt.is_none() {
+                        self.auto_receipt = match ticket.try_recv() {
+                            Ok(saved) => Some(saved),
+                            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(false),
+                        };
+                    }
+                    // A receipt may arrive after this pump captured its views. A successful
+                    // write keeps its optimistic value until the retained authority confirms it.
+                    if self.inputs.settled && self.auto_receipt.is_some_and(|saved|
+                        !saved || self.inputs.session.auto_sign_in() == *value) {
                         self.pending_auto = None;
+                        self.auto_receipt = None;
                         landed = true;
                     }
                 }
-                if self.pending_trailer.as_ref().is_some_and(|(_, receipt)| !matches!(receipt.try_recv(),
-                    Err(std::sync::mpsc::TryRecvError::Empty))) {
-                    // Answered (saved, refused or dropped): the row reads the stored value again,
-                    // which holds the pick only if the write was durable. Same wait for a settled
-                    // session as above.
-                    if let Some(snapshot) = plx_plex::plex::session::peek_settled() {
-                        self.session_snapshot = snapshot;
+                if self.pending_trailer.is_some() && self.trailer_scope != self.inputs.profile.generation {
+                    self.pending_trailer = None;
+                    self.trailer_receipt = None;
+                    landed = true;
+                }
+                if let Some((value, ticket)) = &self.pending_trailer {
+                    if self.trailer_receipt.is_none() {
+                        self.trailer_receipt = match ticket.try_recv() {
+                            Ok(saved) => Some(saved),
+                            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(false),
+                        };
+                    }
+                    let stored = plx_plex::plex::session::stored_effective::<
+                        plx_plex::plex::session::TrailerAutoplayPref>(&self.inputs.session, &self.trailer_seat);
+                    if self.inputs.settled && self.trailer_receipt.is_some_and(|saved| !saved || stored == *value) {
                         self.pending_trailer = None;
+                        self.trailer_receipt = None;
                         landed = true;
                     }
                 }
                 // An offer or an answer landed (`grant::revision`): the switches re-read.
-                let revision = plx_plex::plex::grant::revision();
+                let revision = self.inputs.grant_generation;
                 if revision != self.grant_seen {
                     self.grant_seen = revision;
                     landed = true;
                 }
+                if landed { self.rebuild(cx.views.directory); }
                 if self.alert.is_open() && !self.alert.subject().is_some_and(|m|
                     self.plaintext_rows.iter().any(|(row, on)| row == m && !on)) {
                     // the server the question is about left the list, or is on already
                     self.alert.withdraw();
                 }
                 self.alert.update(t.dt());
-                if landed { self.rebuild(cx.views.directory); fx.invalidate(plx_machine::present::Provenance::Landing(MachineId::Session)); }
+                if landed { fx.invalidate(plx_machine::present::Provenance::Landing(MachineId::Session)); }
 
                 self.form.table
-                    .update(t.dt(), RouteLayout::settings_page().sectioned_table().h);
+                    .update(t.dt(), RouteLayout::screen().sectioned_table().h);
                 self.follow.update(t.dt());
                 Handled::Yes
             }
@@ -1770,6 +1840,25 @@ impl Focusable<InnerHost> for RootPage {
         match self.alert.seat(g, self.entry) {
             Some(key) => key,
             None => Focusable::<InnerHost>::seat(&self.view(), g, from, cx),
+        }
+    }
+    // While the question is open its two answers are the page's only elements (`alert.not_now`,
+    // `alert.connect`); the rows beneath it answer nothing, as `groups` lists none of them.
+    fn a11y(&self, key: &u32, cx: &Cx<'_, InnerHost>) -> Option<A11y<'_>> {
+        match self.alert.a11y(*key) {
+            Some(answer) => answer,
+            None => Focusable::<InnerHost>::a11y(&self.view(), key, cx).map(A11y::into_owned),
+        }
+    }
+    fn a11y_elems(&self, g: GroupId, cx: &Cx<'_, InnerHost>, out: &mut Vec<u32>) {
+        if !self.alert.a11y_elems(g, out) {
+            Focusable::<InnerHost>::a11y_elems(&self.view(), g, cx, out)
+        }
+    }
+    fn a11y_find(&self, path: &A11yPath, cx: &Cx<'_, InnerHost>) -> Option<u32> {
+        match self.alert.a11y_find(path) {
+            Some(answer) => answer,
+            None => Focusable::<InnerHost>::a11y_find(&self.view(), path, cx),
         }
     }
 }
@@ -1849,7 +1938,7 @@ mod text_fit_tests;
 
 #[cfg(test)]
 #[path = "settings_root_navigation_tests.rs"]
-mod root_navigation_tests;
+pub(crate) mod root_navigation_tests;
 
 #[cfg(test)]
 #[path = "settings_pop_and_remember_tests.rs"]
@@ -1865,20 +1954,20 @@ mod nav_structure_tests;
 
 // The picker persists an installation preference, while the immutable LocaleContext continues
 // to render the current session. Choosing a language never remounts a screen or resets playback.
-fn preference_name(preference: plx_platform::i18n::Preference) -> &'static str {
-    if preference == plx_platform::i18n::Preference::System {
-        plx_platform::i18n::msg::settings_language_system()
+fn preference_name(preference: plx_os::i18n::Preference) -> &'static str {
+    if preference == plx_os::i18n::Preference::System {
+        plx_os::i18n::msg::settings_language_system()
     } else {
         preference.native_name()
     }
 }
 
 /// System, then every shipped language in the registry's (display) order.
-const LANGUAGES: [plx_platform::i18n::Preference; plx_platform::i18n::SHIPPED.len() + 1] = {
-    let mut all = [plx_platform::i18n::Preference::System; plx_platform::i18n::SHIPPED.len() + 1];
+const LANGUAGES: [plx_os::i18n::Preference; plx_os::i18n::SHIPPED.len() + 1] = {
+    let mut all = [plx_os::i18n::Preference::System; plx_os::i18n::SHIPPED.len() + 1];
     let mut i = 0;
-    while i < plx_platform::i18n::SHIPPED.len() {
-        all[i + 1] = plx_platform::i18n::SHIPPED[i];
+    while i < plx_os::i18n::SHIPPED.len() {
+        all[i + 1] = plx_os::i18n::SHIPPED[i];
         i += 1;
     }
     all
@@ -1887,7 +1976,7 @@ const LANGUAGES: [plx_platform::i18n::Preference; plx_platform::i18n::SHIPPED.le
 /// A Language row's identity: the preference a `Choice` row saves, or the contribution guide.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum LangId {
-    Choice(plx_platform::i18n::Preference),
+    Choice(plx_os::i18n::Preference),
     Contribute,
 }
 
@@ -1900,12 +1989,19 @@ impl FormId for LangId {
             LangId::Contribute => 1000,
         })
     }
+    fn a11y(&self) -> Option<&'static str> {
+        match self {
+            // one row per language, so the position names each (`row.<i>`)
+            LangId::Choice(_) => None,
+            LangId::Contribute => Some("contribute"),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum LangAction {
     /// Save this preference (a `Choice` row).
-    Pick(plx_platform::i18n::Preference),
+    Pick(plx_os::i18n::Preference),
     /// The contribution row's slot: opening its page is [`RowKind::Nav`]'s job, so nothing
     /// dispatches this.
     Open,
@@ -1913,7 +2009,7 @@ enum LangAction {
 
 /// The Language page's rows from plain inputs: one checked `Choice` per language, then the
 /// contribution guide as a `Nav` row in its own section.
-fn language_form(selected: plx_platform::i18n::Preference, busy: bool) -> Form<LangId, LangAction, SettingsPage> {
+fn language_form(selected: plx_os::i18n::Preference, busy: bool) -> Form<LangId, LangAction, SettingsPage> {
     let mut choices = FormSection::new("");
     for language in LANGUAGES {
         choices = choices.item(
@@ -1927,8 +2023,8 @@ fn language_form(selected: plx_platform::i18n::Preference, busy: bool) -> Form<L
         LangId::Contribute,
         RowKind::Nav(SettingsPage::Contribute),
         LangAction::Open,
-        Row::new(plx_platform::i18n::msg::settings_language_contribute())
-            .detail(plx_platform::i18n::msg::settings_language_help())
+        Row::new(plx_os::i18n::msg::settings_language_contribute())
+            .detail(plx_os::i18n::msg::settings_language_help())
             .chevron(true),
     );
     Form::new().section(choices).section(contribution)
@@ -1938,11 +2034,12 @@ struct LanguagePage {
     entry: EntryId,
     form: FormTable<LangId, LangAction, SettingsPage>,
     state: LanguageState,
-    save: Option<(plx_platform::i18n::Preference, std::sync::mpsc::Receiver<bool>)>,
+    save: Option<(plx_os::i18n::Preference, std::sync::mpsc::Receiver<bool>)>,
+    running_language: plx_os::i18n::Preference,
 }
 
 struct LanguageState {
-    selected: plx_platform::i18n::Preference,
+    selected: plx_os::i18n::Preference,
     /// The focused row's key — an identity, not a position.
     sel: RowKey,
     failed: bool,
@@ -1962,44 +2059,42 @@ impl LogicalState for LanguageState {
 /// and BACK at a root only hands the screen to the television (`Key::Exit`'s doc). Holding BACK
 /// closes the app on the owner's set (reported 2026-10-06), which every remote can do.
 fn restart_hint() -> plx_ui::widgets::KeyHint<'static> {
-    plx_ui::widgets::KeyHint::translated(plx_platform::i18n::msg::settings_language_restart_hint("\u{fffc}"), c"BACK")
+    plx_ui::widgets::KeyHint::translated(plx_os::i18n::msg::settings_language_restart_hint("\u{fffc}"), c"BACK")
 }
 
 impl LanguagePage {
-    fn new(entry: EntryId) -> Self {
-        let selected = plx_platform::i18n::saved_preference();
+    fn new(entry: EntryId, inputs: &crate::registry::ScreenInputs) -> Self {
+        let selected = inputs.install_language;
         let sel = LangId::Choice(selected).key();
-        let mut page = Self { entry, form: FormTable::new(super::registry::BAND), state: LanguageState { selected, sel, failed: false, busy: false }, save: None };
+        let mut page = Self { entry, form: FormTable::page(super::registry::BAND), state: LanguageState { selected, sel, failed: false, busy: false }, save: None, running_language: inputs.running_language };
         page.rebuild();
         page
     }
 
     fn pending(&self) -> bool {
-        self.state.selected != plx_platform::i18n::current().preference()
+        self.state.selected != self.running_language
     }
 
     /// Re-derive the rows, keeping the cursor on its row by identity (the saved language on the
     /// first build).
     fn rebuild(&mut self) {
         let keep = self.form.selected_id().cloned().unwrap_or(LangId::Choice(self.state.selected));
-        self.form.table.compact = false;
-        self.form.table.board_metrics(true);
         self.form.set(language_form(self.state.selected, self.state.busy), Some(&keep));
         self.form.table.list_focused = true;
     }
 
     fn view(&self) -> TableScreen<'_> {
         let copy = if self.state.busy {
-            plx_platform::i18n::msg::settings_language_saving()
+            plx_os::i18n::msg::settings_language_saving()
         } else if self.state.failed {
-            plx_platform::i18n::msg::settings_language_save_failed()
+            plx_os::i18n::msg::settings_language_save_failed()
         } else if self.pending() {
-            plx_platform::i18n::msg::settings_language_pending()
+            plx_os::i18n::msg::settings_language_pending()
         } else {
-            plx_platform::i18n::msg::settings_language_copy()
+            plx_os::i18n::msg::settings_language_copy()
         };
-        TableScreen::new(Header::new(RouteLayout::settings_page(), Some(plx_platform::i18n::msg::settings_title()),
-            plx_platform::i18n::msg::settings_language_title(), copy).with_hint(restart_hint()),
+        TableScreen::new(Header::new(RouteLayout::screen(), Some(plx_os::i18n::msg::settings_title()),
+            plx_os::i18n::msg::settings_language_title(), copy).with_hint(restart_hint()),
             &self.form.table, GroupId(0), self.entry).keyed(&self.form)
     }
 
@@ -2055,7 +2150,7 @@ impl Machine<InnerHost> for LanguagePage {
             }
             ScreenEvent::Tick(t) => {
                 if self.poll_save() { fx.invalidate(plx_machine::present::Provenance::Input); }
-                self.form.table.update(t.dt(), RouteLayout::settings_page().sectioned_table().h);
+                self.form.table.update(t.dt(), RouteLayout::screen().sectioned_table().h);
                 Handled::Yes
             }
             ScreenEvent::FocusMoved { to, .. } => {
@@ -2081,7 +2176,7 @@ plx_ui::focusable_via_view!(LanguagePage, InnerHost, view);
 impl Screen<InnerHost> for LanguagePage {
     fn name(&self) -> &'static str { word::LANGUAGE }
     fn state(&self) -> &dyn LogicalState { &self.state }
-    fn crumb(&self, _cx: &Cx<'_, InnerHost>) -> Option<Cow<'_, str>> { Some(Cow::Borrowed(plx_platform::i18n::msg::settings_title())) }
+    fn crumb(&self, _cx: &Cx<'_, InnerHost>) -> Option<Cow<'_, str>> { Some(Cow::Borrowed(plx_os::i18n::msg::settings_title())) }
     fn prepare(&mut self, _b: &mut Budget, _cx: &Cx<'_, InnerHost>) {}
     fn draw(&mut self, f: &mut DrawFrame<'_, '_, InnerHost>) {
         plx_ui::screen::Part::<InnerHost>::draw(&mut self.view(), f, Rect::FULL);

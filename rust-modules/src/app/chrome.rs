@@ -93,7 +93,6 @@ impl ChromeSnapshot {
     /// idle app wakes for it.
     pub(crate) fn pulse(&mut self, key: u32) {
         self.pulse = Some(key);
-        plx_machine::idle::invalidate();
     }
 
     /// The pending pulse as the strip index of its destination; `None` when nothing is pending or
@@ -119,10 +118,10 @@ impl ChromeSnapshot {
         if strip_changed {
             self.keys = strip_keys(directory, live_tv);
             self.faces = self.keys.iter().map(|&key| match key {
-                widgets::TAB_KEY_HOME => TabFace::Label(plx_platform::i18n::msg::browse_chrome_home().into()),
-                widgets::TAB_KEY_MOVIES => TabFace::Label(plx_platform::i18n::msg::browse_kind_movies().into()),
-                widgets::TAB_KEY_SHOWS => TabFace::Label(plx_platform::i18n::msg::browse_kind_tv_shows().into()),
-                widgets::TAB_KEY_LIVETV => TabFace::Label(plx_platform::i18n::msg::browse_chrome_live_tv().into()),
+                widgets::TAB_KEY_HOME => TabFace::Label(plx_os::i18n::msg::browse_chrome_home().into()),
+                widgets::TAB_KEY_MOVIES => TabFace::Label(plx_os::i18n::msg::browse_kind_movies().into()),
+                widgets::TAB_KEY_SHOWS => TabFace::Label(plx_os::i18n::msg::browse_kind_tv_shows().into()),
+                widgets::TAB_KEY_LIVETV => TabFace::Label(plx_os::i18n::msg::browse_chrome_live_tv().into()),
                 widgets::TAB_KEY_WATCHLIST => TabFace::Icon(Icon::Bookmark),
                 _ => TabFace::Icon(Icon::Search),
             }).collect();
@@ -422,7 +421,7 @@ mod tests {
         snapshot.refresh_with_profile(measure, directory.view(), true, captured);
         let tv_generation = snapshot.labels().generation;
         assert_eq!(snapshot.keys, strip_keys(directory.view(), true));
-        assert_eq!(snapshot.faces[3], TabFace::Label(plx_platform::i18n::msg::browse_chrome_live_tv().into()));
+        assert_eq!(snapshot.faces[3], TabFace::Label(plx_os::i18n::msg::browse_chrome_live_tv().into()));
         assert_eq!(snapshot.faces.len(), no_tv_faces.len() + 1);
         assert_eq!(snapshot.widths.len(), no_tv_widths.len() + 1);
         assert_eq!(tv_generation, initial_generation.wrapping_add(1), "the renderer must refresh its cached labels");

@@ -2,7 +2,7 @@
 
 Another app on the television (a launcher's Continue Watching row, say) can open a Plex title in
 PlxNative by passing it in the launch parameters. The code is `rust-modules/src/app/deeplink.rs`;
-the argument plumbing is `rust-modules/platform/src/tv/launch.rs`.
+the argument plumbing is `rust-modules/os/src/tv/launch.rs`.
 
 ## The contract
 
@@ -50,7 +50,7 @@ the window and never reads the parameters. The app cannot hold that subscription
 on webOS 9.2.2, LG C2: SAM answers an anonymous client `cannot find caller id`, the app-id service
 name is already taken in the process, and `LSCallFromApplication` is refused as unprivileged).
 
-Instead, `app::boot::tap_relaunch_payloads` wraps the pointer slot LG's SDL reads each reply's
+Instead, `system::tap_relaunch_payloads` wraps the pointer slot LG's SDL reads each reply's
 payload through (`HELPER_HLunaServiceMessage`, exported by its `libSDL2` and filled in `SDL_Init`).
 A relaunch payload is passed to the link code and returned unchanged, so SDL still raises the
 window. The link then replaces wherever the app was, with Home underneath. A relaunch without a

@@ -48,7 +48,9 @@ first, then other lanes' incremental caches, then idle lanes' trees, and the mai
 incremental cache only as the last resort. The cargo seed is never evicted by it.
 It runs from a Claude Code `SessionEnd` hook and from the hourly launchd agent `make disk-watch`
 installs (`tools/install-disk-watch.sh`, macOS only — run it yourself; nothing here installs it
-for you). Logs land in `~/Library/Logs/plxnative-build-gc.log` (or `$PLX_GC_LOG`).
+for you; when `PLX_FLEET_DIR` is set at install time it is baked into the agent's launchd
+environment, since launchd inherits nothing from your shell). Logs land in
+`~/Library/Logs/plxnative-build-gc.log` (or `$PLX_GC_LOG`).
 
 A build also checks the budget when it starts: every cargo-running `make` target runs
 `make disk-preflight` first (`make -s print-disk-entries` lists them). With room it costs one
@@ -140,7 +142,7 @@ FLAVOR=<f>` when you need to know where a given flavour's binary, logs and dev t
 ## Tests
 
 **`make check`** — the host gate: the lint pass plus the Rust unit suite run twice (default features
-and `hostsim`), alongside the package, C, harness and tooling self-tests. Seconds once warm, no
+and `sim`), alongside the package, C, harness and tooling self-tests. Seconds once warm, no
 television. Run it before you push, and run it on the pinned toolchain — `make check` uses `cargo +$(RUST_TOOLCHAIN)`
 (the `channel` in `rust-modules/rust-toolchain.toml`) while a bare `cargo test` from the repository root picks up
 your default toolchain, and the two have disagreed.

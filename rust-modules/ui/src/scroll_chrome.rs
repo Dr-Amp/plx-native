@@ -134,7 +134,7 @@ impl Handoff {
                 self.chrome = if want { 0.0 } else { 1.0 };
                 self.capsule = if want && capsule_worn { 1.0 } else { 0.0 };
                 if *self != before {
-                    plx_machine::idle::invalidate();
+                    plx_machine::motion::report::note_motion();
                 }
                 return;
             }
@@ -157,7 +157,7 @@ impl Handoff {
         // A ms ramp is invisible to the spring instrumentation (`xfade`'s reasoning): say so while
         // an alpha is on its way, the frame it arrives included, and never once it has finished.
         if *self != before || !self.at_rest(capsule_worn) {
-            plx_machine::idle::invalidate();
+            plx_machine::motion::report::note_motion();
         }
     }
 
@@ -252,7 +252,7 @@ pub fn capsule_shown(selectable: usize) -> bool {
 /// the count, and the sort `criterion` the page carries ("Date viewed"; `None` for a page that
 /// carries none, which draws the plain capsule).
 pub fn capsule_parts(name: &str, total: i64, criterion: Option<&str>) -> (CString, CString, Option<CString>) {
-    let count = plx_platform::i18n::current().number(total);
+    let count = plx_os::i18n::current().number(total);
     (
         CString::new(name).unwrap_or_default(),
         CString::new(count).unwrap_or_default(),
@@ -290,7 +290,7 @@ impl CapsuleText {
     /// language differ. A `build` must read nothing the key does not name, or the held strings go
     /// stale: it takes the pieces by capture, never the page.
     pub fn get_keyed(&mut self, key: &[&str], build: impl FnOnce() -> String, total: i64, criterion: Option<&str>) -> (&CStr, &CStr, Option<&CStr>) {
-        let language = std::ptr::from_ref(plx_platform::i18n::current()) as usize;
+        let language = std::ptr::from_ref(plx_os::i18n::current()) as usize;
         let held = self.key.as_ref().is_some_and(|(pieces, t, c, l)| {
             pieces.len() == key.len() && pieces.iter().zip(key).all(|(piece, now)| piece == now)
                 && *t == total && c.as_deref() == criterion && *l == language
@@ -396,9 +396,12 @@ mod tests {
     /// Did driving the handoff ask the frame gate for a repaint? Consumes the flag, so each call
     /// answers for the frames since the last one (`xfade`'s tests, same reason).
     fn asked_to_repaint() -> bool {
-        plx_machine::idle::frame_begin(DT);
-        plx_machine::idle::note_present(0);
-        plx_machine::idle::should_present(0)
+        let mut present = plx_machine::present::Present::new();
+        present.take(0);
+        present.acknowledge(0);
+        plx_machine::motion::report::collect_into(&mut present, 0);
+        plx_machine::motion::report::frame_begin(DT);
+        present.take(0)
     }
 
     /// Run `frames` frames of a page whose scroll is `pos` and heads for `target`.

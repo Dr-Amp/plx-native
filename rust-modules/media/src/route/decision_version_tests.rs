@@ -28,6 +28,16 @@ const FOUR_K_FIRST: &[u8] = br#"{"MediaContainer":{"Metadata":[{"ratingKey":"rk-
      {"id":31341,"streamType":1,"codec":"h264","index":0},
      {"id":31342,"streamType":2,"codec":"aac","channels":2,"index":1,"languageCode":"eng","default":true,"selected":true}]}]}]}]}}"#;
 
+const FOUR_K_THEN_A_RUNG_SIZED_1080P: &[u8] = br#"{"MediaContainer":{"Metadata":[{"ratingKey":"rk-rung","type":"movie","Media":[
+  {"id":3082,"bitrate":14663,"width":3840,"height":2160,"videoResolution":"4k","videoCodec":"hevc","audioCodec":"eac3","container":"mkv",
+   "Part":[{"id":3130,"key":"/library/parts/3130/1/file.mkv","container":"mkv","Stream":[
+     {"id":31301,"streamType":1,"codec":"hevc","index":0,"bitrate":13900},
+     {"id":31302,"streamType":2,"codec":"eac3","channels":6,"index":1,"languageCode":"eng","default":true,"selected":true}]}]},
+  {"id":3087,"bitrate":8540,"width":1920,"height":800,"videoResolution":"1080","videoCodec":"h264","audioCodec":"aac","container":"mkv",
+   "Part":[{"id":3135,"key":"/library/parts/3135/1/file.mkv","container":"mkv","Stream":[
+     {"id":31351,"streamType":1,"codec":"h264","index":0,"bitrate":7900},
+     {"id":31352,"streamType":2,"codec":"aac","channels":2,"index":1,"languageCode":"eng","default":true,"selected":true,"bitrate":640}]}]}]}]}}"#;
+
 /// A loopback PMS that serves [`TWO_VERSIONS`] for the item, `mde` for every `/decision`, a
 /// bounded body for `start.mkv`, and records every request line until it is told to stop.
 fn versions_pms_observed_with_master(body: &'static [u8], mde: &'static [u8],
@@ -47,6 +57,8 @@ fn versions_pms_observed_with_master(body: &'static [u8], mde: &'static [u8],
                         body
                     } else if line.starts_with("GET /library/metadata/rk-4k") {
                         FOUR_K_FIRST
+                    } else if line.starts_with("GET /library/metadata/rk-rung") {
+                        FOUR_K_THEN_A_RUNG_SIZED_1080P
                     } else if line.contains("/decision?") {
                         mde
                     } else if line.starts_with("GET /video/:/transcode/universal/start.m3u8?") {
@@ -97,7 +109,7 @@ fn resolve_on(
     (part, vcodec, acodec): (&str, &str, &str),
     mde: &'static [u8],
     version: Option<plx_plex::plex::MediaId>,
-    caps: Option<plx_platform::devcaps::Caps>,
+    caps: Option<plx_os::devcaps::Caps>,
 ) -> (Plan, Vec<String>) {
     resolve_with(rk, (part, vcodec, acodec), mde, |env| {
         env.version = version;
@@ -128,8 +140,8 @@ fn resolve_with(
 
 const FOUR_K_DEFAULT: (&str, &str, &str) = ("/library/parts/3130/1/file.mkv", "hevc", "eac3");
 
-fn full_hd_set() -> plx_platform::devcaps::Caps {
-    plx_platform::devcaps::Caps { hevc_max: (1920, 1088), ..plx_platform::devcaps::Caps::assumed() }
+fn full_hd_set() -> plx_os::devcaps::Caps {
+    plx_os::devcaps::Caps { hevc_max: (1920, 1088), ..plx_os::devcaps::Caps::assumed() }
 }
 
 #[test]
@@ -197,6 +209,29 @@ fn a_picked_version_that_is_gone_is_measured_from_the_default_that_plays() {
         env.version = Some(plx_plex::plex::MediaId(9999));
     });
     assert_eq!(plan.src_measure.0, 14663);
+}
+
+#[test]
+#[cfg(feature = "devtriggers")]
+fn a_fixed_quality_judges_the_substituted_version_on_its_video_bitrate() {
+    let (plan, requests) = resolve_with("rk-rung", FOUR_K_DEFAULT, MDE_DIRECTPLAY, |env| {
+        env.caps = std::sync::Arc::new(full_hd_set());
+        env.quality = Quality::P1080;
+    });
+    assert_eq!(plan.src_measure, (7900, 1920, 800));
+    assert!(plan.url.contains("/library/parts/3135/"), "{}", plan.url);
+    assert!(!requests.iter().any(|l| l.contains("/transcode/universal/start")), "{requests:?}");
+}
+
+#[test]
+#[cfg(feature = "devtriggers")]
+fn a_version_picked_by_hand_is_judged_on_its_video_bitrate() {
+    let (plan, requests) = resolve_with("rk-rung", FOUR_K_DEFAULT, MDE_DIRECTPLAY, |env| {
+        env.quality = Quality::P1080;
+        env.version = Some(plx_plex::plex::MediaId(3087));
+    });
+    assert_eq!(plan.src_measure, (7900, 1920, 800));
+    assert!(!requests.iter().any(|l| l.contains("/transcode/universal/start")), "{requests:?}");
 }
 
 fn retry_holding(part_id: i64, audio_sid: i64, sub_sid: i64) -> RetryContext {
@@ -289,7 +324,7 @@ fn a_page_whose_default_the_set_cannot_decode_gives_up_its_cached_copy() {
     );
     let mut env = ResolveEnv::snapshot(&ps, meta.view(), sid, "rk-4k");
     assert!(env.cached_item.is_some(), "the page is the item");
-    env.caps = std::sync::Arc::new(plx_platform::devcaps::Caps::assumed());
+    env.caps = std::sync::Arc::new(plx_os::devcaps::Caps::assumed());
     leave_a_cached_default_the_set_cannot_decode(&mut env, meta.view(), sid, "rk-4k");
     assert!(env.cached_item.is_some(), "a 4K decoder plays the page's own default");
     env.caps = std::sync::Arc::new(full_hd_set());
@@ -368,6 +403,12 @@ const URI_DTS_SELECTED_SUBTITLE: &[u8] = br#"{"MediaContainer":{"Metadata":[{"ra
      {"id":31341,"streamType":1,"codec":"h264","index":0},
      {"id":31342,"streamType":2,"codec":"dca","channels":6,"index":1,"languageCode":"eng","default":true,"selected":true},
      {"id":31343,"streamType":3,"codec":"srt","index":2,"languageCode":"eng","selected":true}]}]}]}]}}"#;
+
+const URI_RUNG_SIZED: &[u8] = br#"{"MediaContainer":{"Metadata":[{"ratingKey":"rk-v","type":"movie","duration":600000,"Media":[
+  {"id":3086,"duration":450000,"bitrate":8540,"width":1920,"height":1080,"videoCodec":"h264","audioCodec":"dca","container":"mkv",
+   "Part":[{"id":3134,"duration":450000,"key":"/library/parts/3134/1/file.mkv","container":"mkv","Stream":[
+     {"id":31341,"streamType":1,"codec":"h264","index":0,"bitrate":7900},
+     {"id":31342,"streamType":2,"codec":"dca","channels":6,"index":1,"languageCode":"eng","default":true,"selected":true,"bitrate":640}]}]}]}]}}"#;
 
 const URI_DTS_EXTERNAL_SUBTITLE: &[u8] = br#"{"MediaContainer":{"Metadata":[{"ratingKey":"rk-v","type":"movie","duration":600000,"Media":[
   {"id":3086,"duration":450000,"bitrate":2372,"width":1920,"height":1080,"videoCodec":"h264","audioCodec":"dca","container":"mkv",
@@ -579,7 +620,6 @@ impl crate::route::uri_preflight::OriginalQualifier for RecordingOriginal {
 #[test]
 #[cfg(feature = "devtriggers")]
 fn the_original_request_carries_the_selected_audio_streams_container_position() {
-    use plx_playback_contract::uri::Binding;
     use plx_playback_contract::Capabilities;
     let mut ps = crate::route::PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
@@ -589,9 +629,7 @@ fn the_original_request_carries_the_selected_audio_streams_container_position() 
         audio_off: false, subtitle_off: false };
     let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     ps.install_uri_preflight_port(crate::route::uri_preflight::ResolvePort::new(
-        crate::route::uri_preflight::ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: capabilities, certified: capabilities, preview_rectangle: false },
+        crate::route::uri_preflight::ProductEvidence { display: plx_playback_contract::uri::DisplayEvidence::ready("test"), callable: capabilities, certified: capabilities },
         std::sync::Arc::new(RecordingOriginal(asked.clone()))));
     let (port, done, server) = versions_pms_with(URI_TWO_AUDIO_OUT_OF_ORDER, MDE_TRANSCODE_VIDEO);
     let sid = plx_plex::plex::register_for_test("two-audio", "127.0.0.1", port, "token", "two-audio-client");
@@ -612,7 +650,6 @@ fn the_original_request_carries_the_selected_audio_streams_container_position() 
 #[test]
 #[cfg(feature = "devtriggers")]
 fn remembered_subtitle_off_remains_off_during_uri_source_qualification() {
-    use plx_playback_contract::uri::Binding;
     use plx_playback_contract::Capabilities;
     use plx_plex::plex::session::prefs::{SubtitleMemo, TrackMemoryEntry};
     let mut ps = crate::route::PlaybackSession::IDLE;
@@ -622,9 +659,7 @@ fn remembered_subtitle_off_remains_off_during_uri_source_qualification() {
         pause: true, seek: true, audio_track: true, subtitle_track: true,
         audio_off: false, subtitle_off: false };
     ps.install_uri_preflight_port(crate::route::uri_preflight::ResolvePort::new(
-        crate::route::uri_preflight::ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: capabilities, certified: capabilities, preview_rectangle: false },
+        crate::route::uri_preflight::ProductEvidence { display: plx_playback_contract::uri::DisplayEvidence::ready("test"), callable: capabilities, certified: capabilities },
         std::sync::Arc::new(QualifiedOriginal { video: "h264", audio: "dca" })));
     let (port, done, server) = versions_pms_with(URI_DTS_SELECTED_SUBTITLE, MDE_TRANSCODE_VIDEO);
     let sid = plx_plex::plex::register_for_test("remembered-off", "127.0.0.1", port,
@@ -678,6 +713,33 @@ fn selected_external_subtitle_remains_common_source_intent_across_resolve() {
     plx_plex::plex::reset_servers_for_test();
 }
 
+#[test]
+#[cfg(feature = "devtriggers")]
+fn a_fixed_quality_qualifies_a_uri_original_on_its_video_bitrate() {
+    use plx_playback_contract::Capabilities;
+    let mut ps = crate::route::PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    assert!(plx_net::net::global_init());
+    let all = Capabilities { progressive_uri: true, hls_uri: false, packet_feed: false,
+        pause: true, seek: true, audio_track: true, subtitle_track: true,
+        audio_off: false, subtitle_off: false };
+    ps.install_uri_preflight_port(crate::route::uri_preflight::ResolvePort::new(
+        crate::route::uri_preflight::ProductEvidence { display: plx_playback_contract::uri::DisplayEvidence::ready("test"), callable: all, certified: all },
+        std::sync::Arc::new(QualifiedOriginal { video: "h264", audio: "dca" })));
+    let (port, done, server) = versions_pms_with(URI_RUNG_SIZED, MDE_TRANSCODE_VIDEO);
+    let sid = plx_plex::plex::register_for_test("uri-rung", "127.0.0.1", port, "token", "uri-rung-client");
+    let mut env = ResolveEnv::snapshot(&ps,
+        plx_data::stores::metadata::MetadataStore::default().view(), sid, "rk-v");
+    env.quality = Quality::P1080;
+    let plan = build_stream(&plx_base::task::OffFrame::for_test(), "rk-v",
+        "/library/parts/3134/1/file.mkv", "h264", "dca", &env);
+    done.send(()).unwrap();
+    let _ = server.join().unwrap();
+    plx_plex::plex::reset_servers_for_test();
+    assert!(plan.uri_original.is_some(), "{:?}", plan.uri_decline);
+    assert_eq!((plan.src_measure, plan.transport_kbps), ((7900, 1920, 1080), 8540));
+}
+
 #[cfg(feature = "devtriggers")]
 struct CountingQualified {
     original: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -705,7 +767,6 @@ impl crate::route::uri_preflight::OriginalQualifier for CountingQualified {
 #[test]
 #[cfg(feature = "devtriggers")]
 fn a_qualified_dts_original_lands_from_the_real_resolve_worker_before_feed_decision() {
-    use plx_playback_contract::uri::Binding;
     use plx_playback_contract::Capabilities;
     let mut ps = crate::route::PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
@@ -713,15 +774,13 @@ fn a_qualified_dts_original_lands_from_the_real_resolve_worker_before_feed_decis
     let all = Capabilities { progressive_uri: true, hls_uri: false, packet_feed: false,
         pause: true, seek: true, audio_track: true, subtitle_track: true,
         audio_off: false, subtitle_off: false };
-    let evidence = crate::route::uri_preflight::ProductEvidence { display_exported: true,
-        binding: Binding::Exported { canvas: (1920, 1080) }, callable: all,
-        certified: all, preview_rectangle: false };
+    let evidence = crate::route::uri_preflight::ProductEvidence { display: plx_playback_contract::uri::DisplayEvidence::ready("test"), callable: all, certified: all };
     ps.install_uri_preflight_port(crate::route::uri_preflight::ResolvePort::new(
         evidence, std::sync::Arc::new(QualifiedOriginal { video: "h264", audio: "dca" })));
     let (port, done, server) = versions_pms_with(URI_DTS, MDE_TRANSCODE_VIDEO);
     let sid = plx_plex::plex::register_for_test("qualified-dts", "127.0.0.1", port, "token", "qualified-dts-client");
     let mut meta = plx_data::stores::metadata::MetadataStore::default();
-    assert!(request_play(&mut ps, &mut meta, plx_platform::devcaps::caps(), sid,
+    assert!(request_play(&mut ps, &mut meta, plx_os::devcaps::caps(), sid,
         "rk-v", "/library/parts/3134/1/file.mkv", "h264", "dca", "Film", "", None, ""));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let start = loop {
@@ -748,7 +807,6 @@ fn a_qualified_dts_original_lands_from_the_real_resolve_worker_before_feed_decis
 #[test]
 #[cfg(feature = "devtriggers")]
 fn a_certified_av1_uri_original_does_not_inherit_feeds_video_refusal() {
-    use plx_playback_contract::uri::Binding;
     use plx_playback_contract::Capabilities;
     let mut ps = crate::route::PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
@@ -757,15 +815,13 @@ fn a_certified_av1_uri_original_does_not_inherit_feeds_video_refusal() {
         pause: true, seek: true, audio_track: true, subtitle_track: true,
         audio_off: false, subtitle_off: false };
     ps.install_uri_preflight_port(crate::route::uri_preflight::ResolvePort::new(
-        crate::route::uri_preflight::ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) }, callable: all,
-            certified: all, preview_rectangle: false },
+        crate::route::uri_preflight::ProductEvidence { display: plx_playback_contract::uri::DisplayEvidence::ready("test"), callable: all, certified: all },
         std::sync::Arc::new(QualifiedOriginal { video: "av1", audio: "aac" })));
     let (port, done, server) = versions_pms_with(URI_AV1, MDE_TRANSCODE_VIDEO);
     let sid = plx_plex::plex::register_for_test("qualified-av1", "127.0.0.1", port, "token", "qualified-av1-client");
     let mut meta = plx_data::stores::metadata::MetadataStore::default();
-    let feed_cannot_decode_av1 = std::sync::Arc::new(plx_platform::devcaps::Caps {
-        av1: false, ..plx_platform::devcaps::Caps::assumed()
+    let feed_cannot_decode_av1 = std::sync::Arc::new(plx_os::devcaps::Caps {
+        av1: false, ..plx_os::devcaps::Caps::assumed()
     });
     assert!(request_play(&mut ps, &mut meta, feed_cannot_decode_av1, sid,
         "rk-v", "/library/parts/3134/1/file.mkv", "av1", "aac", "Film", "", None, ""));
@@ -784,8 +840,8 @@ fn a_certified_av1_uri_original_does_not_inherit_feeds_video_refusal() {
 #[test]
 #[cfg(feature = "devtriggers")]
 fn an_unqualified_uri_original_still_uses_the_feed_compatible_version() {
-    use crate::route::uri_preflight::{ProductEvidence, ProductQualifier, ResolvePort};
-    use plx_playback_contract::{uri::Binding, Capabilities};
+    use crate::route::uri_preflight::{CarrierQualifier, ProductEvidence, ResolvePort};
+    use plx_playback_contract::Capabilities;
     let (plan, requests) = resolve_with("rk-4k", FOUR_K_DEFAULT, MDE_DIRECTPLAY, |env| {
         env.caps = std::sync::Arc::new(full_hd_set());
         env.quality = Quality::Original;
@@ -794,9 +850,9 @@ fn an_unqualified_uri_original_still_uses_the_feed_compatible_version() {
             audio_track: true, subtitle_track: true, audio_off: false, subtitle_off: false,
         };
         env.uri_preflight_port = Some(ResolvePort::new(ProductEvidence {
-            display_exported: true, binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: capabilities, certified: capabilities, preview_rectangle: false,
-        }, std::sync::Arc::new(ProductQualifier)));
+            display: plx_playback_contract::uri::DisplayEvidence::ready("test"),
+            callable: capabilities, certified: capabilities,
+        }, std::sync::Arc::new(CarrierQualifier)));
     });
     assert!(plan.uri_original.is_none());
     assert_eq!((plan.part_id, plan.media_index), (3134, 1));
@@ -808,7 +864,6 @@ fn an_unqualified_uri_original_still_uses_the_feed_compatible_version() {
 #[test]
 #[cfg(feature = "devtriggers")]
 fn an_accepted_pms_decision_produces_an_owned_uri_offer_from_its_output() {
-    use plx_playback_contract::uri::Binding;
     use plx_playback_contract::Capabilities;
     let mut ps = crate::route::PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
@@ -818,15 +873,13 @@ fn an_accepted_pms_decision_produces_an_owned_uri_offer_from_its_output() {
         audio_off: false, subtitle_off: false };
     let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     ps.install_uri_preflight_port(crate::route::uri_preflight::ResolvePort::new(
-        crate::route::uri_preflight::ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: capabilities, certified: capabilities, preview_rectangle: false },
+        crate::route::uri_preflight::ProductEvidence { display: plx_playback_contract::uri::DisplayEvidence::ready("test"), callable: capabilities, certified: capabilities },
         std::sync::Arc::new(QualifiedPms(observed.clone()))));
     let (port, done, server) = versions_pms_with(URI_DTS, MDE_PMS_OUTPUT);
     let sid = plx_plex::plex::register_for_test("qualified-pms", "127.0.0.1", port,
         "token", "qualified-pms-client");
     let mut meta = plx_data::stores::metadata::MetadataStore::default();
-    assert!(request_play(&mut ps, &mut meta, plx_platform::devcaps::caps(), sid,
+    assert!(request_play(&mut ps, &mut meta, plx_os::devcaps::caps(), sid,
         "rk-v", "/library/parts/3134/1/file.mkv", "h264", "dca", "Film", "", None, ""));
     assert!(wait_resolve_workers_for_test(std::time::Duration::from_secs(15)));
     let start = pump_play(&mut ps, &mut meta).expect("accepted PMS output start");
@@ -850,7 +903,6 @@ fn an_accepted_pms_decision_produces_an_owned_uri_offer_from_its_output() {
 #[test]
 #[cfg(feature = "devtriggers")]
 fn an_explicit_external_source_pick_can_use_a_server_accepted_burned_wire() {
-    use plx_playback_contract::uri::Binding;
     use plx_playback_contract::Capabilities;
     let mut ps = crate::route::PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
@@ -859,9 +911,7 @@ fn an_explicit_external_source_pick_can_use_a_server_accepted_burned_wire() {
         pause: true, seek: true, audio_track: true, subtitle_track: true,
         audio_off: false, subtitle_off: false };
     ps.install_uri_preflight_port(crate::route::uri_preflight::ResolvePort::new(
-        crate::route::uri_preflight::ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: capabilities, certified: capabilities, preview_rectangle: false },
+        crate::route::uri_preflight::ProductEvidence { display: plx_playback_contract::uri::DisplayEvidence::ready("test"), callable: capabilities, certified: capabilities },
         std::sync::Arc::new(QualifiedPms(std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))))));
     let (port, done, server) = versions_pms_with(URI_DTS_EXTERNAL_SUBTITLE, MDE_PMS_BURNED_EXTERNAL);
     let sid = plx_plex::plex::register_for_test("burned-external", "127.0.0.1", port,
@@ -883,7 +933,6 @@ fn an_explicit_external_source_pick_can_use_a_server_accepted_burned_wire() {
 #[test]
 #[cfg(feature = "devtriggers")]
 fn viewer_off_re_resolves_a_burned_pms_uri_without_reusing_its_subtitle() {
-    use plx_playback_contract::uri::Binding;
     use plx_playback_contract::{BackendKind, Capabilities};
     let mut ps = crate::route::PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
@@ -892,16 +941,14 @@ fn viewer_off_re_resolves_a_burned_pms_uri_without_reusing_its_subtitle() {
         pause: true, seek: true, audio_track: true, subtitle_track: true,
         audio_off: false, subtitle_off: false };
     ps.install_uri_preflight_port(crate::route::uri_preflight::ResolvePort::new(
-        crate::route::uri_preflight::ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: capabilities, certified: capabilities, preview_rectangle: false },
+        crate::route::uri_preflight::ProductEvidence { display: plx_playback_contract::uri::DisplayEvidence::ready("test"), callable: capabilities, certified: capabilities },
         std::sync::Arc::new(QualifiedPms(std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))))));
     let (port, done, server) = versions_pms_with(URI_AV1_EXTERNAL_SUBTITLE, MDE_PMS_BURNED_EXTERNAL);
     let sid = plx_plex::plex::register_for_test("burned-off", "127.0.0.1", port,
         "token", "burned-off-client");
     let mut meta = plx_data::stores::metadata::MetadataStore::default();
-    let feed_cannot_decode_av1 = std::sync::Arc::new(plx_platform::devcaps::Caps {
-        av1: false, ..plx_platform::devcaps::Caps::assumed()
+    let feed_cannot_decode_av1 = std::sync::Arc::new(plx_os::devcaps::Caps {
+        av1: false, ..plx_os::devcaps::Caps::assumed()
     });
     assert!(request_play(&mut ps, &mut meta, feed_cannot_decode_av1, sid,
         "rk-v", "/library/parts/3134/1/file.mkv", "av1", "dca", "Film", "", None, ""));
@@ -943,7 +990,6 @@ fn viewer_off_re_resolves_a_burned_pms_uri_without_reusing_its_subtitle() {
 #[test]
 #[cfg(feature = "devtriggers")]
 fn native_hls_master_offer_requires_the_fetched_multi_variant_response() {
-    use plx_playback_contract::uri::Binding;
     use plx_playback_contract::Capabilities;
     for (master_body, qualifies) in [
         (TWO_VARIANT_MASTER as &[u8], true), (FIXED_MEDIA_PLAYLIST as &[u8], false)
@@ -956,16 +1002,14 @@ fn native_hls_master_offer_requires_the_fetched_multi_variant_response() {
             pause: true, seek: true, audio_track: true, subtitle_track: true,
             audio_off: false, subtitle_off: false };
         ps.install_uri_preflight_port(crate::route::uri_preflight::ResolvePort::new(
-            crate::route::uri_preflight::ProductEvidence { display_exported: true,
-                binding: Binding::Exported { canvas: (1920, 1080) },
-                callable: capabilities, certified: capabilities, preview_rectangle: false },
+            crate::route::uri_preflight::ProductEvidence { display: plx_playback_contract::uri::DisplayEvidence::ready("test"), callable: capabilities, certified: capabilities },
             std::sync::Arc::new(QualifiedNativeMaster)));
         let (port, done, server) = versions_pms_observed_with_master(URI_DTS,
             MDE_PMS_HLS_OUTPUT, None, Some(master_body));
         let sid = plx_plex::plex::register_for_test("native-master", "127.0.0.1", port,
             "token", "native-master-client");
         let mut meta = plx_data::stores::metadata::MetadataStore::default();
-        assert!(request_play(&mut ps, &mut meta, plx_platform::devcaps::caps(), sid,
+        assert!(request_play(&mut ps, &mut meta, plx_os::devcaps::caps(), sid,
             "rk-v", "/library/parts/3134/1/file.mkv", "h264", "dca", "Film", "", None, ""));
         assert!(wait_resolve_workers_for_test(std::time::Duration::from_secs(15)));
         let start = pump_play(&mut ps, &mut meta);
@@ -988,7 +1032,6 @@ fn native_hls_master_offer_requires_the_fetched_multi_variant_response() {
 #[test]
 #[cfg(feature = "devtriggers")]
 fn unknown_uri_qualification_keeps_the_existing_feed_decision_path() {
-    use plx_playback_contract::uri::Binding;
     use plx_playback_contract::Capabilities;
     let mut ps = crate::route::PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
@@ -998,14 +1041,12 @@ fn unknown_uri_qualification_keeps_the_existing_feed_decision_path() {
         pause: true, seek: true, audio_track: true, subtitle_track: true,
         audio_off: false, subtitle_off: false };
     ps.install_uri_preflight_port(crate::route::uri_preflight::ResolvePort::new(
-        crate::route::uri_preflight::ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) }, callable,
-            certified: callable, preview_rectangle: false },
-        std::sync::Arc::new(crate::route::uri_preflight::ProductQualifier)));
+        crate::route::uri_preflight::ProductEvidence { display: plx_playback_contract::uri::DisplayEvidence::ready("test"), callable, certified: callable },
+        std::sync::Arc::new(crate::route::uri_preflight::CarrierQualifier)));
     let (port, done, server) = versions_pms_with(URI_DTS, MDE_TRANSCODE_VIDEO);
     let sid = plx_plex::plex::register_for_test("unknown-dts", "127.0.0.1", port, "token", "unknown-dts-client");
     let mut meta = plx_data::stores::metadata::MetadataStore::default();
-    assert!(request_play(&mut ps, &mut meta, plx_platform::devcaps::caps(), sid,
+    assert!(request_play(&mut ps, &mut meta, plx_os::devcaps::caps(), sid,
         "rk-v", "/library/parts/3134/1/file.mkv", "h264", "dca", "Film", "", None, ""));
     let finished = wait_resolve_workers_for_test(std::time::Duration::from_secs(15));
     let start = pump_play(&mut ps, &mut meta);
@@ -1021,7 +1062,6 @@ fn unknown_uri_qualification_keeps_the_existing_feed_decision_path() {
 
 #[cfg(feature = "devtriggers")]
 fn expired_original_skips_its_spent_recipe_but_qualifies_unspent_pms_uri(backends: plx_playback_contract::BackendSet) {
-    use plx_playback_contract::uri::Binding;
     use plx_playback_contract::{BackendKind, Capabilities};
     use super::super::backend_policy::{BackendPolicy, OfferId, Qualification};
     use super::super::backend_policy::Selection;
@@ -1036,9 +1076,7 @@ fn expired_original_skips_its_spent_recipe_but_qualifies_unspent_pms_uri(backend
     let qualification_calls = std::sync::Arc::new(AtomicUsize::new(0));
     let pms_calls = std::sync::Arc::new(AtomicUsize::new(0));
     ps.install_uri_preflight_port(crate::route::uri_preflight::ResolvePort::new(
-        crate::route::uri_preflight::ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) }, callable: capabilities,
-            certified: capabilities, preview_rectangle: false },
+        crate::route::uri_preflight::ProductEvidence { display: plx_playback_contract::uri::DisplayEvidence::ready("test"), callable: capabilities, certified: capabilities },
         std::sync::Arc::new(CountingQualified {
             original: qualification_calls.clone(), pms: pms_calls.clone(),
         })));
@@ -1047,7 +1085,7 @@ fn expired_original_skips_its_spent_recipe_but_qualifies_unspent_pms_uri(backend
     let sid = plx_plex::plex::register_for_test("expiring-dts", "127.0.0.1", port,
         "token", "expiring-dts-client");
     let mut meta = plx_data::stores::metadata::MetadataStore::default();
-    assert!(request_play(&mut ps, &mut meta, plx_platform::devcaps::caps(), sid,
+    assert!(request_play(&mut ps, &mut meta, plx_os::devcaps::caps(), sid,
         "rk-v", "/library/parts/3134/1/file.mkv", "h264", "dca", "Film", "", None, ""));
 
     // This is an existing episode, not a fresh catalog. The both-backend variant has
@@ -1150,10 +1188,10 @@ fn unknown_uri_without_feed_has_a_named_refusal_before_pms_encoder_work() {
     let _g = fresh_registry(&mut ps);
     ps.install_backends(plx_playback_contract::BackendSet::URI);
     assert!(plx_net::net::global_init());
-    let evidence = crate::route::uri_preflight::ProductEvidence::unqualified(
-        plx_platform::tv::sink::VP_EXPORTED);
+    let evidence = crate::route::uri_preflight::ProductEvidence::unqualified_on(
+        plx_playback_contract::uri::DisplayEvidence::unavailable("test"));
     ps.install_uri_preflight_port(crate::route::uri_preflight::ResolvePort::new(
-        evidence, std::sync::Arc::new(crate::route::uri_preflight::ProductQualifier)));
+        evidence, std::sync::Arc::new(crate::route::uri_preflight::CarrierQualifier)));
     let (port, done, server) = versions_pms_with(URI_DTS, MDE_TRANSCODE_VIDEO);
     let sid = plx_plex::plex::register_for_test("unqualified-dts", "127.0.0.1", port, "token", "unqualified-client");
     let env = ResolveEnv::snapshot(&ps, plx_data::stores::metadata::MetadataStore::default().view(), sid, "rk-v");
@@ -1173,7 +1211,6 @@ fn unknown_uri_without_feed_has_a_named_refusal_before_pms_encoder_work() {
 #[test]
 #[cfg(feature = "devtriggers")]
 fn unknown_pms_output_in_uri_only_retires_the_accepted_encoder_once() {
-    use plx_playback_contract::uri::Binding;
     use plx_playback_contract::Capabilities;
     let mut ps = crate::route::PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
@@ -1183,16 +1220,14 @@ fn unknown_pms_output_in_uri_only_retires_the_accepted_encoder_once() {
         pause: true, seek: true, audio_track: true, subtitle_track: true,
         audio_off: false, subtitle_off: false };
     ps.install_uri_preflight_port(crate::route::uri_preflight::ResolvePort::new(
-        crate::route::uri_preflight::ProductEvidence { display_exported: true,
-            binding: Binding::Exported { canvas: (1920, 1080) },
-            callable: capabilities, certified: capabilities, preview_rectangle: false },
-        std::sync::Arc::new(crate::route::uri_preflight::ProductQualifier)));
+        crate::route::uri_preflight::ProductEvidence { display: plx_playback_contract::uri::DisplayEvidence::ready("test"), callable: capabilities, certified: capabilities },
+        std::sync::Arc::new(crate::route::uri_preflight::CarrierQualifier)));
     let (seen_tx, seen_rx) = std::sync::mpsc::channel();
     let (port, done, server) = versions_pms_observed(URI_DTS, MDE_PMS_OUTPUT, Some(seen_tx));
     let sid = plx_plex::plex::register_for_test("unknown-pms", "127.0.0.1", port,
         "token", "unknown-pms-client");
     let mut meta = plx_data::stores::metadata::MetadataStore::default();
-    assert!(request_play(&mut ps, &mut meta, plx_platform::devcaps::caps(), sid,
+    assert!(request_play(&mut ps, &mut meta, plx_os::devcaps::caps(), sid,
         "rk-v", "/library/parts/3134/1/file.mkv", "h264", "dca", "Film", "", None, ""));
     assert!(wait_resolve_workers_for_test(std::time::Duration::from_secs(15)));
     assert!(pump_play(&mut ps, &mut meta).is_none());
@@ -1226,7 +1261,7 @@ fn the_picked_version_rides_the_request_and_the_landing() {
     let mut ps = crate::route::PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
     let mut meta = plx_data::stores::metadata::MetadataStore::default();
-    assert!(request_play(&mut ps, &mut meta, plx_platform::devcaps::caps(), ServerId::from_raw(0), "rk-v", "/library/parts/3134/1/file.mkv",
+    assert!(request_play(&mut ps, &mut meta, plx_os::devcaps::caps(), ServerId::from_raw(0), "rk-v", "/library/parts/3134/1/file.mkv",
         "h264", "aac", "Episode", "", Some(plx_plex::plex::MediaId(3082)), ""));
     assert_eq!(ps.request.as_ref().and_then(|r| r.version), Some(plx_plex::plex::MediaId(3082)));
     let env = request_env(&ps, meta.view(), ps.request.as_ref().unwrap(), None);
@@ -1236,3 +1271,25 @@ fn the_picked_version_rides_the_request_and_the_landing() {
     test_support::apply_plan(&mut ps, Plan { media_index: 1, ..Default::default() }, "rk-v");
     assert_eq!(cur_media_index(&ps), 1);
 }
+
+/// The composition's resolver is published as a value, absence included: a bare port installs it,
+/// `None` clears it, and the reader says which. The boot's one publisher relies on all three
+/// (`app::platform::publish_composition` passes the compose's `Option` straight through).
+#[test]
+fn the_published_resolver_is_readable_and_an_absence_clears_it() {
+    use crate::route::uri_preflight::{CarrierQualifier, ProductEvidence, ResolvePort};
+    let port = || ResolvePort::new(
+        ProductEvidence::unqualified_on(plx_playback_contract::uri::DisplayEvidence::ready("test")),
+        std::sync::Arc::new(CarrierQualifier));
+    let mut ps = crate::route::PlaybackSession::IDLE;
+    assert!(ps.uri_preflight_port().is_none(), "a session nobody published to holds none");
+    ps.install_uri_preflight_port(port());
+    assert!(ps.uri_preflight_port().is_some(), "a bare port installs");
+    ps.install_uri_preflight_port(Some(port()));
+    assert!(ps.uri_preflight_port().is_some(), "so does a `Some`");
+    ps.install_uri_preflight_port(Option::<ResolvePort>::None);
+    assert!(ps.uri_preflight_port().is_none(), "an absence clears it");
+}
+
+#[path = "decision_composition_tests.rs"]
+mod composition_tests;

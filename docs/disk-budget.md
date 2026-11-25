@@ -196,8 +196,10 @@ the log line names them (`worktrees: kept <lane> (<branch>): holds ignored files
 output: ...`). A lane whose ignored files git could not list is kept too (fail closed). Build output is
 the allow-list `derived_output` in `tools/build-gc.sh`: `rust-modules/target*`, the FFmpeg, Sentry and libass
 trees under `vendor/`, what `make` stages in `pkg/` (the binaries, `.so`s, `.link.*` evidence, `.flavor`,
-`.build-config`), `ipkroot/`, `src/*.o`, `stub/*.so`, `tools/node_modules`, `__pycache__`, `.DS_Store`
-and a TV session's `.tv-*.pid`/`.log` scratch. Everything else is kept: `pkg/*` is deliberately not a pattern,
+`.build-config`), `ipkroot/`, `src/*.o`, `stub/*.so`, `tools/node_modules`, `__pycache__`, `.DS_Store`,
+the Tizen build's `tizen/out`, `tizen/sdl-build` and the host project's staged `bin/`, `obj/`, `lib/` and `res/` files
+(`make PLATFORM=tizen`), and a TV session's `.tv-*.pid`/`.log` scratch. A Samsung certificate (`*.p12`, `*.pfx`) is a
+credential and is kept. Everything else is kept: `pkg/*` is deliberately not a pattern,
 and what was pulled from the television (`.abi-cache/`, `sysroot/`, `tests/fixtures/softfloat/arm.tbl`) is
 kept because getting it back needs the one TV. A new `.gitignore` pattern must be added to that list or named as
 private in `ci/test_build_gc.py`, which fails otherwise; until then a lane holding it is kept, never removed.
@@ -544,3 +546,25 @@ does.
 | 4 | A `PreToolUse` hook that catches direct `cargo` in a Claude session |
 | 5 (#845, landed) | `make test-hostsim` and `make check-nodef`, which replace the `/tmp` recipe; hooked into `DISK_ENTRIES` by PR 3 |
 | 6 (optional) | `build-gc.sh --dedup` as rung 1 |
+
+## Build directly on a second volume
+
+On macOS, create a dedicated directory on the mounted build volume, then run
+`python3 tools/build-root.py install /absolute/path/to/build-root` from the clone to enable it.
+The path lives in the user's `~/.config/plxnative/build-root`. The installer adds a clone-local
+Git post-checkout hook and exclude rules for target links. It refuses to replace a custom hook.
+Use `install-claude` and `install-codex` to register the same helper for native
+sessions that skip Git's checkout hook. These commands preserve existing user hooks and scope the
+handler to this clone. Codex may request hook trust in its Hooks settings. The Codex desktop local
+environment and build preflight also run the repeatable setup. Grant sandboxed
+builders write access to the configured directory. Checkouts already on the build volume use
+their native target directories. The independent Cargo workspace under `fuzz/` gets its own
+external target for direct Cargo and Rust Analyzer runs.
+
+Run `python3 tools/build-root.py prepare` in an existing checkout. To move existing Cargo trees,
+run `python3 tools/build-root.py migrate` there. Migration checks liveness, copies and compares
+the files, exchanges the original directory with its link atomically on macOS, and checks the
+original again before reclaiming it. A changed or busy original is retained. A diagnostic naming
+a retained copy identifies the paths to inspect before retrying. Closing a session leaves its cache
+available. `make disk` lists external owners and `tools/build-gc.sh --orphans -n` previews the
+derived trees left behind by removed worktrees.

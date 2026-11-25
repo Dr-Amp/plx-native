@@ -78,17 +78,14 @@ pub struct CurlVersionInfo {
 // belief that a macro could not express it — the blocker was never the variadics, only the
 // one-symbol-per-wrapper assumption.
 //
-// **The third name is macOS's, and it is what makes the desktop build able to SIGN IN.** The host
-// simulator and the `PlxNative.app` bundle run this same module, and on a Mac the two ELF SONAMEs
-// simply do not open — which is why signing in "did not work off-device" and was written up as an
-// unfixable property of the simulator. It was one missing candidate: macOS ships libcurl in the
-// dyld shared cache and `dlopen("libcurl.4.dylib")` resolves it with no install, no Homebrew and
-// nothing to bundle (verified 2026-08-16: the handle opens and `curl_easy_setopt` resolves).
-// It is LAST deliberately — a television never reaches it, so this costs the device nothing but
-// one extra failed `dlopen` in the already-fatal no-curl case, and the candidate list stays
-// ordered by "what the fleet actually answers to" first.
+// **The names are the PLATFORM's, not this module's** (`plx_os::tv::Services::libraries`, published into
+// `plx_base::dynlib` before the first load): the television states the two ELF SONAMEs, the desktop
+// states those and macOS's `libcurl.4.dylib` too, which is what makes the desktop build able to SIGN IN
+// (macOS ships libcurl in the dyld shared cache and `dlopen("libcurl.4.dylib")` resolves it with no
+// install; verified 2026-08-16: the handle opens and `curl_easy_setopt` resolves), and a process that
+// published nothing (a host test) reads the union of them all.
 plx_base::dynlib! {
-    pub curl: ["libcurl.so.4", "libcurl.so.5", "libcurl.4.dylib"] {
+    pub curl: platform(curl) {
     fn curl_global_init(flags: c_long) -> c_int;
     fn curl_version() -> *const c_char;
     fn curl_version_info(age: c_int) -> *const CurlVersionInfo;
@@ -1542,9 +1539,11 @@ mod loopback_pms {
                         }
                         let reply = answer(&request);
                         log.lock().unwrap_or_else(|e| e.into_inner()).push(request);
-                        if tls.write_all(&reply).is_err() || tls.flush().is_err() || !keep_alive {
-                            return;
-                        }
+                        if tls.write_all(&reply).is_err() { return; }
+                        // OpenSSL must see an orderly TLS close to keep the TLS 1.3 session
+                        // resumable after this response, not just a bare TCP EOF.
+                        if !keep_alive { tls.conn.send_close_notify(); }
+                        if tls.flush().is_err() || !keep_alive { return; }
                     }
                 });
             }
@@ -5099,6 +5098,20 @@ mod tls_mode_tests {
 
 #[cfg(test)]
 mod blocking_guard_tests {
+    #[test]
+    fn a_logic_step_cannot_dial_even_under_allow_blocking() {
+        let allowed = plx_base::task::allow_blocking(const { &plx_base::task::BlockingLabel::new("fixture") });
+        let step = plx_base::step::StepScope::enter();
+        let refused = std::panic::catch_unwind(|| {
+            super::request_evidence("https://plex.tv.invalid/ping", &[], "GET", None, super::API, false, None, None)
+        });
+        assert!(refused.is_err());
+        drop(step);
+        // A malformed URL returns before curl or DNS, proving the guard unwound and did not leak.
+        assert!(super::request_result("bad\0url", &[], "GET", None, super::API, false, None, None).is_err());
+        drop(allowed);
+    }
+
     use super::*;
 
     /// plex.tv calls (`AccountClient`) never pass `http::request_with`, so its `assert_may_block`
@@ -5276,7 +5289,7 @@ mod key_mode_session_tests {
             type Init = unsafe extern "C" fn() -> *mut c_void;
             type Setopt = unsafe extern "C" fn(*mut c_void, c_int, ...) -> c_int;
             type Cleanup = unsafe extern "C" fn(*mut c_void) -> c_int;
-            let (lib, _) = plx_base::dynlib::Handle::open(curl::CANDIDATES).expect("libcurl is bound");
+            let (lib, _) = plx_base::dynlib::Handle::open(curl::candidates()).expect("libcurl is bound");
             let sym = |name| lib.sym(name).unwrap_or_else(|| panic!("this libcurl has no {name}"));
             unsafe {
                 let init: Init = std::mem::transmute(sym("curl_share_init"));
@@ -5370,5 +5383,22 @@ mod key_mode_session_tests {
         }
         assert_eq!(served.accepted(), ROUNDS, "every round is a connection of its own");
         assert_eq!(served.resumed(), 0, "and none of them resumed a TLS session");
+    }
+}
+
+/// **The three libcurl tables open what the platform stated, and one list.** Each reads
+/// `plx_base::dynlib::libraries().curl` when it loads, so a set carrying both SONAMEs binds all three
+/// against the same library. No host test publishes, so the list is the union a process with no platform
+/// reads (`Libraries::HOST`: today's three names, in today's order), which is what keeps this suite opening
+/// the libcurl it always opened.
+#[cfg(test)]
+mod platform_names_tests {
+    #[test]
+    fn the_three_curl_tables_share_the_platforms_list_which_unset_is_the_union_of_todays_names() {
+        let stated = plx_base::dynlib::libraries().curl;
+        assert_eq!(stated, ["libcurl.so.4", "libcurl.so.5", "libcurl.4.dylib"]);
+        assert_eq!(super::curl::candidates(), stated);
+        assert_eq!(crate::range_io::curlmulti::candidates(), stated);
+        assert_eq!(super::connect_only::raw::candidates(), stated);
     }
 }

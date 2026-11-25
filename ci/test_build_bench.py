@@ -58,15 +58,16 @@ def read(p):
         return open(p).read()
     except OSError:
         return ""
-EDITED = ("base/src/cbuf.rs", "machine/src/landgate.rs", "platform/src/devcaps.rs", "gfx/src/overdraw.rs", "net/src/stream_redirect.rs", "ui/src/dwell.rs", "plex/src/plex/retry.rs", "telemetry/src/telemetry/window.rs", "data/src/stores/tape.rs", "session/src/auth/scripted.rs", "media/src/abr/units.rs", "appkit/src/skip_pill.rs", "screens/src/clock_readout.rs", "src/coldstart.rs", "ui/src/lib.rs")
+EDITED = ("base/src/cbuf.rs", "machine/src/landgate.rs", "os/src/devcaps.rs", "gfx/src/overdraw.rs", "net/src/stream_redirect.rs", "ui/src/dwell.rs", "plex/src/plex/retry.rs", "telemetry/src/telemetry/window.rs", "data/src/stores/tape.rs", "session/src/auth/scripted.rs", "media/src/abr/units.rs", "appkit/src/skip_pill.rs", "screens/src/clock_readout.rs", "src/coldstart.rs", "ui/src/lib.rs")
 if os.environ.get("FAKE_FAIL_ON_EDIT") and "build-bench edit" in "".join(read(p) for p in EDITED):
     sys.stderr.write("error: fake cargo failed on the edited tree\n")
     sys.exit(101)
 if "--no-run" in args:
-    # cargo judges a path package by mtime: stale when a source file is NEWER than what the last build
-    # wrote (the state file's own mtime stands for the dependency info), fresh otherwise
+    # Model active benchmark edits by their controlled marker too: coarse clocks can give an edit
+    # the same mtime as the last build. Restored bytes + original mtime still read fresh.
     state = os.environ["FAKE_STATE"] + "." + (os.environ.get("CARGO_TARGET_DIR") or "target").replace("/", "_")
     fresh = (os.path.exists(state) and all(os.stat(p).st_mtime_ns <= os.stat(state).st_mtime_ns for p in EDITED if os.path.exists(p))
+             and not any("// build-bench edit " in read(p) for p in EDITED)
              and not os.environ.get("FAKE_ALWAYS_DIRTY"))
     open(state, "w").write("built")
     if os.environ.get("FAKE_COUNT_BUILDS"):
@@ -92,7 +93,7 @@ if "--no-run" in args:
     print(json.dumps({"reason": "compiler-artifact", "package_id": "registry+x#serde@1.0.0", "fresh": True}))
     art('/base', 'plx_base', '0.0.0')
     art('/machine', 'plx_machine', '0.0.0')
-    art('/platform', 'plx_platform', '0.0.0')
+    art('/os', 'plx_os', '0.0.0')
     art('/gfx', 'plx_gfx', '0.0.0')
     art('/net', 'plx_net', '0.0.0')
     art('/ui', 'plx_ui', '0.0.0')
@@ -107,13 +108,18 @@ if "--no-run" in args:
     art('/media-codecs', 'plx_media_codecs', '0.0.0')
     art('/appkit', 'plx_appkit', '0.0.0')
     art('/screens', 'plx_screens', '0.0.0')
+    art('/shell-sdl', 'plx_shell_sdl', '0.0.0')
+    art('/platform-webos', 'plx_platform_webos', '0.0.0')
+    art('/platform-desktop', 'plx_platform_desktop', '0.0.0')
+    art('/platform-tizen', 'plx_platform_tizen', '0.0.0')
+    art('/owp', 'plx_owp', '0.0.0')
     art('', 'plxnative-modules', '0.7.0')
 elif args[0] == "rustc":
     tgt = args[args.index("--target") + 1]
     tdir = args[args.index("--target-dir") + 1]
     out = os.path.join(tdir, tgt, "release")
     os.makedirs(out, exist_ok=True)
-    open(os.path.join(out, "libplxnative_modules.a"), "wb").write(b"!<arch>\nfake archive")
+    open(os.path.join(out, "libplx_platform_webos.a"), "wb").write(b"!<arch>\nfake archive")
     print(json.dumps({"reason": "compiler-artifact", "fresh": False}))
 '''
 FAKE_RUSTC = "#!/bin/sh\necho 'rustc 1.99.0-nightly (fake 2026-01-01)'\n"
@@ -123,12 +129,12 @@ FAKE_SYSCTL = ('#!/bin/sh\ncase "$2" in\n'
                '  *) echo "Fake CPU";;\nesac\n')
 SCRATCH_MAKEFILE = r'''print-bench-config:
 	@printf '%s\n' 'RUST_TOOLCHAIN=1.0.0' 'RUST_TDIR=target' 'RUST_TARGET=armv7-unknown-linux-gnueabi' \
-	  'RUST_FEATFLAGS=' 'RUST_LIB=rust-modules/target/armv7-unknown-linux-gnueabi/release/libplxnative_modules.a' \
+	  'RUST_FEATFLAGS=' 'RUST_LIB=rust-modules/target/armv7-unknown-linux-gnueabi/release/libplx_platform_webos.a' \
 	  'RUST_ENV=RUSTFLAGS="-C target-cpu=fake -C x"' 'TEST_FAST_TDIR=target-fast' 'UNIT_RUN=python3 ../tools/cargo-test-parallel.py' 'RELEASE=$(RELEASE)'
 '''
 LEAF = "rust-modules/base/src/cbuf.rs"
 MACHINE_LEAF = "rust-modules/machine/src/landgate.rs"
-PLATFORM_LEAF = "rust-modules/platform/src/devcaps.rs"
+OS_LEAF = "rust-modules/os/src/devcaps.rs"
 GFX_LEAF = "rust-modules/gfx/src/overdraw.rs"
 NET_LEAF = "rust-modules/net/src/stream_redirect.rs"
 UI_LEAF = "rust-modules/ui/src/dwell.rs"
@@ -141,7 +147,7 @@ APPKIT_LEAF = "rust-modules/appkit/src/skip_pill.rs"
 SCREENS_LEAF = "rust-modules/screens/src/clock_readout.rs"
 APP_LEAF = "rust-modules/src/coldstart.rs"
 HUB = "rust-modules/ui/src/lib.rs"
-SRC_FILES = {LEAF: "pub fn leaf() {}\n", MACHINE_LEAF: "pub fn machine() {}\n", PLATFORM_LEAF: "pub fn platform() {}\n", GFX_LEAF: "pub fn gfx() {}\n", NET_LEAF: "pub fn net() {}\n", UI_LEAF: "pub fn ui() {}\n", PLEX_LEAF: "pub fn plex() {}\n", TELEMETRY_LEAF: "pub fn telemetry() {}\n", DATA_LEAF: "pub fn data() {}\n", SESSION_LEAF: "pub fn session() {}\n", MEDIA_LEAF: "pub fn media() {}\n", APPKIT_LEAF: "pub fn appkit() {}\n", SCREENS_LEAF: "pub fn screens() {}\n", APP_LEAF: "pub fn app() {}\n", HUB: "pub fn hub() {}",
+SRC_FILES = {LEAF: "pub fn leaf() {}\n", MACHINE_LEAF: "pub fn machine() {}\n", OS_LEAF: "pub fn os() {}\n", GFX_LEAF: "pub fn gfx() {}\n", NET_LEAF: "pub fn net() {}\n", UI_LEAF: "pub fn ui() {}\n", PLEX_LEAF: "pub fn plex() {}\n", TELEMETRY_LEAF: "pub fn telemetry() {}\n", DATA_LEAF: "pub fn data() {}\n", SESSION_LEAF: "pub fn session() {}\n", MEDIA_LEAF: "pub fn media() {}\n", APPKIT_LEAF: "pub fn appkit() {}\n", SCREENS_LEAF: "pub fn screens() {}\n", APP_LEAF: "pub fn app() {}\n", HUB: "pub fn hub() {}",
              "rust-modules/src/lib.rs": "mod coldstart;\n"}
 
 
@@ -204,11 +210,11 @@ class ShapeTests(unittest.TestCase):
             (sb.repo / "rust-modules" / "target").mkdir(parents=True)
             (sb.repo / "rust-modules" / "target" / "blob").write_bytes(b"x" * 4096)
             out = sb.repo.parent / "out.json"
-            proc = sb.run("--runs", "2", "--only", "noop,leaf,machine,platform,gfx,net,ui,plex,telemetry,data,session,media,appkit,screens,hub,tests,sizes", "--json", str(out))
+            proc = sb.run("--runs", "2", "--only", "noop,leaf,machine,os,gfx,net,ui,plex,telemetry,data,session,media,appkit,screens,hub,tests,sizes", "--json", str(out))
             self.assertEqual(proc.returncode, 0, proc.stderr)
             md = proc.stdout
             self.assertIn("| Scenario | Runs | Median | Min | Max | Notes |", md)
-            for title in (bb.TITLES["noop"], bb.TITLES["leaf"], bb.TITLES["machine"], bb.TITLES["platform"], bb.TITLES["gfx"], bb.TITLES["net"], bb.TITLES["ui"], bb.TITLES["plex"], bb.TITLES["telemetry"], bb.TITLES["data"], bb.TITLES["session"], bb.TITLES["media"], bb.TITLES["appkit"], bb.TITLES["screens"], bb.TITLES["hub"],
+            for title in (bb.TITLES["noop"], bb.TITLES["leaf"], bb.TITLES["machine"], bb.TITLES["os"], bb.TITLES["gfx"], bb.TITLES["net"], bb.TITLES["ui"], bb.TITLES["plex"], bb.TITLES["telemetry"], bb.TITLES["data"], bb.TITLES["session"], bb.TITLES["media"], bb.TITLES["appkit"], bb.TITLES["screens"], bb.TITLES["hub"],
                           bb.TITLES["tests"]):
                 self.assertRegex(md, re.escape(f"| {title} | 2 | ") + r"[\d.]+ s \| [\d.]+ s \| [\d.]+ s \|")
             self.assertIn("app crate rebuilt: no", md)   # the no-op row
@@ -225,7 +231,7 @@ class ShapeTests(unittest.TestCase):
             self.assertGreaterEqual(doc["host"]["cores"], 1)
             self.assertEqual(doc["runs"], 2)
             self.assertTrue(doc["restored_clean"])
-            self.assertEqual([s["id"] for s in doc["scenarios"]], ["noop", "leaf", "machine", "platform", "gfx", "net", "ui", "plex", "telemetry", "data", "session", "media", "appkit", "screens", "hub", "tests", "sizes"])
+            self.assertEqual([s["id"] for s in doc["scenarios"]], ["noop", "leaf", "machine", "os", "gfx", "net", "ui", "plex", "telemetry", "data", "session", "media", "appkit", "screens", "hub", "tests", "sizes"])
             for sc in doc["scenarios"]:
                 if sc["id"] == "sizes":
                     continue
@@ -240,8 +246,8 @@ class ShapeTests(unittest.TestCase):
             self.assertTrue(all(s["app_rebuilt"] for s in by_id["leaf"]["samples"]))
             self.assertTrue(all(s["machine_rebuilt"] and s["app_rebuilt"] for s in by_id["machine"]["samples"]))
             self.assertIn("plx_machine rebuilt: yes", md)
-            self.assertTrue(all(s["platform_rebuilt"] and s["app_rebuilt"] for s in by_id["platform"]["samples"]))
-            self.assertIn("plx_platform rebuilt: yes", md)
+            self.assertTrue(all(s["platform_rebuilt"] and s["app_rebuilt"] for s in by_id["os"]["samples"]))
+            self.assertIn("plx_os rebuilt: yes", md)
             self.assertTrue(all(s["gfx_rebuilt"] and s["app_rebuilt"] for s in by_id["gfx"]["samples"]))
             self.assertIn("plx_gfx rebuilt: yes", md)
             self.assertTrue(all(s["net_rebuilt"] and s["app_rebuilt"] for s in by_id["net"]["samples"]))
@@ -287,7 +293,7 @@ class ShapeTests(unittest.TestCase):
     def test_cargo_is_called_the_way_the_makefile_does(self):
         with Sandbox() as sb:
             (sb.repo / "rust-modules" / "target-fast").mkdir(parents=True)
-            lib = sb.repo / "rust-modules/target/armv7-unknown-linux-gnueabi/release/libplxnative_modules.a"
+            lib = sb.repo / "rust-modules/target/armv7-unknown-linux-gnueabi/release/libplx_platform_webos.a"
             lib.parent.mkdir(parents=True)
             lib.write_bytes(b"old")
             proc = sb.run("--runs", "1", "--only", "noop,leaf-inc,tests,arm")
@@ -309,7 +315,7 @@ class ShapeTests(unittest.TestCase):
             arm = [c for c in calls if c["args"][0] == "rustc"]
             self.assertEqual(len(arm), 1)
             self.assertEqual(arm[0]["args"], ["rustc", "--release", "--target", "armv7-unknown-linux-gnueabi",
-                                              "--lib", "--crate-type", "staticlib", "--target-dir", "target",
+                                              "-p", "plx_platform_webos", "--lib", "--crate-type", "staticlib", "--target-dir", "target",
                                               "--message-format=json-render-diagnostics"])
             self.assertEqual(arm[0]["incr"], "0")
             self.assertEqual(arm[0]["rustflags"], "-C target-cpu=fake -C x")
@@ -364,6 +370,42 @@ class EditRestoreTests(unittest.TestCase):
             self.assertTrue(all(s["app_rebuilt"] for s in by_id["leaf"]["samples"]))
             self.assertTrue(all(s["app_rebuilt"] for s in by_id["ui"]["samples"]))
             self.assertFalse(any(s["app_rebuilt"] for s in by_id["noop"]["samples"]))
+
+    def test_equal_mtimes_do_not_hide_active_edits(self):
+        with Sandbox() as sb:
+            old = 1_700_000_000_000_000_000
+            for rel in SRC_FILES:
+                os.utime(sb.repo / rel, ns=(old, old))
+            counts = sb.repo.parent / "builds.txt"
+            env = dict(os.environ, FAKE_LOG=str(sb.log), FAKE_STATE=str(sb.state),
+                       FAKE_COUNT_BUILDS=str(counts))
+            for key in ("CARGO_TARGET_DIR", "FAKE_ALWAYS_DIRTY", "FAKE_FAIL_ON_EDIT"):
+                env.pop(key, None)
+
+            def build():
+                proc = subprocess.run([sys.executable, str(sb.home / ".cargo/bin/cargo"), "+1.0.0",
+                                       *bb.HOST_TEST_BUILD_ARGS], cwd=sb.repo / "rust-modules",
+                                      capture_output=True, text=True, env=env)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                return [json.loads(line)["fresh"] for line in proc.stdout.splitlines()
+                        if line.startswith("{") and "path+file:" in line]
+
+            self.assertTrue(all(not fresh for fresh in build()))
+            self.assertTrue(all(build()))
+            guard = bb.EditGuard(sb.repo)
+            state = Path(str(sb.state) + ".target")
+            for _ in range(2):
+                for rel in (LEAF, UI_LEAF):
+                    with self.subTest(round=_, rel=rel):
+                        with guard.edited(rel):
+                            stamp = state.stat().st_mtime_ns
+                            os.utime(sb.repo / rel, ns=(stamp, stamp))
+                            self.assertEqual((sb.repo / rel).stat().st_mtime_ns, state.stat().st_mtime_ns)
+                            self.assertTrue(all(not fresh for fresh in build()), "active edit reported fresh")
+                        self.assertEqual((sb.repo / rel).stat().st_mtime_ns, old)
+                        self.assertTrue(all(build()), "restored tree reported dirty")
+            self.assertEqual(counts.read_text().split(), ["rebuilt", "fresh"] + ["rebuilt", "fresh"] * 4)
+            sb.assert_sources_untouched(self)
 
 
 class RedTests(unittest.TestCase):

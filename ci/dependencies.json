@@ -74,11 +74,11 @@
     "id": "harfbuzz",
     "group": "libass",
     "bundled": true,
-    "version": "15.1.0",
+    "version": "15.2.0",
     "license": "MIT",
-    "archive": "harfbuzz-15.1.0.tar.xz",
-    "url": "https://github.com/harfbuzz/harfbuzz/releases/download/15.1.0/harfbuzz-15.1.0.tar.xz",
-    "sha256": "0fc7c565443a5f4be7da65ac5ee5bd737d9b158dc908708b7689a0a5796b0c8d",
+    "archive": "harfbuzz-15.2.0.tar.xz",
+    "url": "https://github.com/harfbuzz/harfbuzz/releases/download/15.2.0/harfbuzz-15.2.0.tar.xz",
+    "sha256": "e2ec49090744383cdbe7df808c1cedaafba06a97be8dc4211fe546ba585f12cb",
     "update": {
       "type": "github-release",
       "repo": "harfbuzz/harfbuzz",
@@ -90,11 +90,11 @@
     "id": "libunibreak",
     "group": "libass",
     "bundled": true,
-    "version": "8.0",
+    "version": "8.0.1",
     "license": "Zlib",
-    "archive": "libunibreak-8.0.tar.gz",
-    "url": "https://github.com/adah1972/libunibreak/releases/download/libunibreak_8_0/libunibreak-8.0.tar.gz",
-    "sha256": "9c4fad6e517338a098373acc9f35579ae2c325e6446666fb9ac2666ba15ceba4",
+    "archive": "libunibreak-8.0.1.tar.gz",
+    "url": "https://github.com/adah1972/libunibreak/releases/download/libunibreak_8_0_1/libunibreak-8.0.1.tar.gz",
+    "sha256": "ac0dcc96c395bc86ff7f86f6b91d8b45bc8c39db775f3f1e73f947a11520737b",
     "update": {
       "type": "github-release",
       "repo": "adah1972/libunibreak",
@@ -149,6 +149,67 @@
     "update": {
       "type": "github-commit",
       "repo": "memononen/nanosvg"
+    },
+    "patches": []
+  },
+  {
+    "id": "tizen60-abi-reference",
+    "version": "6.0",
+    "license": "See SDK component licenses",
+    "upstream": "https://download.tizen.org/sdk/tizenstudio/official/",
+    "assets": {
+      "rootstrap": {
+        "name": "mobile-6.0-rs-device.core_0.0.123_ubuntu-64.zip",
+        "url": "https://download.tizen.org/sdk/tizenstudio/official/binary/mobile-6.0-rs-device.core_0.0.123_ubuntu-64.zip",
+        "sha256": "94fe9569003f6af3ca574166d25052ce6ef2a4588a209bd87bae9b9420bf7566"
+      },
+      "gcc": {
+        "name": "cross-arm-gcc-9.2_0.1.9_ubuntu-64.zip",
+        "url": "https://download.tizen.org/sdk/tizenstudio/official/binary/cross-arm-gcc-9.2_0.1.9_ubuntu-64.zip",
+        "sha256": "706dd9d3df216fe9cbd706625a0fe8edfc83981b06a55bef302c1f23830b3ca0"
+      }
+    },
+    "update": {
+      "type": "manual",
+      "hold": "Pinned to Tizen 6.0 to verify the minimum supported SDK ABI. A new pin requires regenerating and reviewing the export inventory."
+    },
+    "patches": []
+  },
+  {
+    "id": "sdl2",
+    "version": "2.32.10",
+    "license": "Zlib",
+    "upstream": "https://github.com/libsdl-org/SDL",
+    "archive": "SDL2-2.32.10.tar.gz",
+    "url": "https://github.com/libsdl-org/SDL/releases/download/release-2.32.10/SDL2-2.32.10.tar.gz",
+    "mirrors": [
+      "https://www.libsdl.org/release/SDL2-2.32.10.tar.gz"
+    ],
+    "sha256": "5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165",
+    "update": {
+      "type": "github-release",
+      "repo": "libsdl-org/SDL",
+      "tag_pattern": "^release-(2\\.\\d+\\.\\d+)$",
+      "tag_format": "release-{version}"
+    },
+    "patches": []
+  },
+  {
+    "id": "sdl2-ttf",
+    "version": "2.24.0",
+    "license": "Zlib AND FTL AND MIT",
+    "upstream": "https://github.com/libsdl-org/SDL_ttf",
+    "archive": "SDL2_ttf-2.24.0.tar.gz",
+    "url": "https://github.com/libsdl-org/SDL_ttf/releases/download/release-2.24.0/SDL2_ttf-2.24.0.tar.gz",
+    "mirrors": [
+      "https://www.libsdl.org/projects/SDL_ttf/release/SDL2_ttf-2.24.0.tar.gz"
+    ],
+    "sha256": "0b2bf1e7b6568adbdbc9bb924643f79d9dedafe061fa1ed687d1d9ac4e453bfd",
+    "update": {
+      "type": "github-release",
+      "repo": "libsdl-org/SDL_ttf",
+      "tag_pattern": "^release-(2\\.\\d+\\.\\d+)$",
+      "tag_format": "release-{version}"
     },
     "patches": []
   },

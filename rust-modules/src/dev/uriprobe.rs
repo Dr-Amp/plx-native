@@ -19,7 +19,7 @@ use plx_media::route::RouteStartAttempt;
 use plx_play_uri::uriprobe::{AbrBps, Firmware, Kind, Settle, Trigger, Variant};
 use plx_play_uri::uriprobe_drive::{DriverConfig, UriSession as CoreSession};
 
-/// Install the probe on the player adapter, once, at boot (`compose_backends`).
+/// Install the probe on the player adapter, once, at boot (`backends::compose_with`).
 pub(crate) fn install(adapter: &mut PlayerAdapter) {
     adapter.install_uri_probe(Box::new(Probe));
 }
@@ -64,7 +64,7 @@ impl ProbeLaunch for Launch {
 /// boundary so the machine under it stays pure. All-empty (printed as `-`) when the boot probe
 /// could not read it.
 fn running_firmware() -> Firmware {
-    let info = plx_platform::tv::device::info();
+    let info = plx_os::tv::device::info();
     Firmware { release: info.release.clone(), build: info.build.clone() }
 }
 

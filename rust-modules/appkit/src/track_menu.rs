@@ -114,6 +114,7 @@ use plx_data::metadata;
 use plx_data::metadata::sub_layout::{self, LangId, OtherLang, RowBadge, RowTarget, SubHeader, SubModel, SubRow, SubTrack};
 use plx_data::metadata::track_label;
 use plx_plex::plex::session::{SubtitlePosition, SubtitleSize, SubtitleTone};
+use plx_ui::a11y::{A11y, A11yPath};
 use plx_ui::frame::Budget;
 use plx_ui::geom::IndexElem;
 use plx_machine::machine::{Canon, Cx, EntryId, FocusKey, GroupId, Host, Measure};
@@ -121,8 +122,8 @@ use plx_ui::popover::Popover;
 use plx_ui::screen::{At, Dir, DrawFrame, Focusable, GroupSpec, Part, Placed, Step};
 use plx_ui::form::{Activation, Form, FormId, FormSection, FormTable, RowKey, RowKind};
 use plx_ui::page_stack::{
-    self, popover_group_of, popover_groups, popover_neighbour, popover_place,
-    popover_register_stops, popover_seat, PageStack, PopoverPanel,
+    self, popover_a11y, popover_a11y_elems, popover_group_of, popover_groups, popover_neighbour,
+    popover_place, popover_register_stops, popover_seat, PageStack, PopoverPanel,
 };
 use plx_ui::panel_motion::PanelMotion;
 use plx_ui::table::{Badge, Row, Section, TableView};
@@ -219,8 +220,17 @@ impl StyleField {
         self as u32
     }
 
+    /// The field's name in the menu's accessibility ids ([`TrackRow::a11y_path`]).
+    fn a11y_name(self) -> &'static str {
+        match self {
+            Self::Size => "size",
+            Self::Position => "position",
+            Self::Color => "color",
+        }
+    }
+
     fn label(self) -> &'static str {
-        use plx_platform::i18n::msg;
+        use plx_os::i18n::msg;
         match self {
             Self::Size => msg::widgets_tracks_style_size(),
             Self::Position => msg::widgets_tracks_style_position(),
@@ -272,14 +282,14 @@ impl TrackPage {
     /// model, [`TrackMenuState::other`]).
     fn title(self, other: &[OtherLang]) -> String {
         match self {
-            Self::Style => plx_platform::i18n::msg::widgets_tracks_style().to_string(),
+            Self::Style => plx_os::i18n::msg::widgets_tracks_style().to_string(),
             Self::Picker(field) => field.label().to_string(),
-            Self::OtherLanguages => plx_platform::i18n::msg::widgets_tracks_other_languages().to_string(),
+            Self::OtherLanguages => plx_os::i18n::msg::widgets_tracks_other_languages().to_string(),
             Self::Language(stream) => {
                 other.iter().find(|o| o.id.stream == stream).map(|o| o.name.clone()).unwrap_or_default()
             }
-            Self::Search => plx_platform::i18n::msg::widgets_tracks_search_open().to_string(),
-            Self::SearchLanguage => plx_platform::i18n::msg::widgets_tracks_search_language().to_string(),
+            Self::Search => plx_os::i18n::msg::widgets_tracks_search_open().to_string(),
+            Self::SearchLanguage => plx_os::i18n::msg::widgets_tracks_search_language().to_string(),
         }
     }
 
@@ -325,6 +335,64 @@ impl FormId for TrackRow {
             TrackRow::SearchHit(i) => 0x000C_0000 + (i as u32).min(0xFFFF),
             TrackRow::LangChoice(i) => 0x000D_0000 + (i as u32).min(0xFFFF),
         })
+    }
+}
+
+impl TrackRow {
+    /// **Does a press of this row WRITE to the playing title on the server?** A track pick selects the part's streams on
+    /// the PMS (`route`'s `select_streams`, `PUT /library/parts/{id}`: the transcoder encodes the SELECTED audio and burns
+    /// the SELECTED subtitle) and a search result installs its subtitle on the item (`PUT /library/metadata/{rk}/subtitles`),
+    /// so the overlay screen names the title playing on those rows (the harness's `press ... --rk`). Every other row
+    /// opens a page, picks a local setting (Style, Timing, the search language) or reconfigures the live stream (Boost
+    /// dialog, Normalize loudness) and writes nothing of the title's. An exhaustive match, so a new row cannot compile
+    /// without the decision.
+    pub fn writes_title(&self) -> bool {
+        match *self {
+            TrackRow::Audio(_) | TrackRow::SubOff | TrackRow::SubForcedOnly | TrackRow::Sub(_) | TrackRow::SearchHit(_) => true,
+            TrackRow::Boost
+            | TrackRow::Loudness
+            | TrackRow::Timing
+            | TrackRow::Style
+            | TrackRow::OpenOther
+            | TrackRow::OpenLang(_)
+            | TrackRow::OpenField(_)
+            | TrackRow::Choice(..)
+            | TrackRow::OpenSearch
+            | TrackRow::SearchLang
+            | TrackRow::SearchRetry
+            | TrackRow::LangChoice(_) => false,
+        }
+    }
+
+    /// **The row's name in the menu's accessibility ids** (`plx_ui::a11y`), relative to the menu:
+    /// what the row IS, and the index it already carries when it is one of a list (`audio.<i>`,
+    /// `sub.<i>`, `hit.<i>`, `lang.<slot>`, `language.<i>`). A singleton is its word: `boost`,
+    /// `loudness`, `off`, `forced`, `timing`, `style`, `other`, `search`, `search_language`, `retry`.
+    /// The Style page's drill-ins are `field.<size|position|color>` and a picker's rungs
+    /// `<field>.<rung>`. A page shows one of these sets at a time, so no two rows of a view share
+    /// an id. An exhaustive match, so a new row cannot compile without a name, as it cannot without
+    /// a focus key ([`FormId::key`]).
+    fn a11y_path(&self) -> A11yPath {
+        let path = A11yPath::new();
+        match *self {
+            TrackRow::Audio(i) => path.name("audio").index(i),
+            TrackRow::Boost => path.name("boost"),
+            TrackRow::Loudness => path.name("loudness"),
+            TrackRow::SubOff => path.name("off"),
+            TrackRow::SubForcedOnly => path.name("forced"),
+            TrackRow::Sub(i) => path.name("sub").index(i),
+            TrackRow::Timing => path.name("timing"),
+            TrackRow::Style => path.name("style"),
+            TrackRow::OpenField(field) => path.name("field").name(field.a11y_name()),
+            TrackRow::Choice(field, i) => path.name(field.a11y_name()).index(i),
+            TrackRow::OpenOther => path.name("other"),
+            TrackRow::OpenLang(lang) => path.name("lang").index(lang.slot),
+            TrackRow::OpenSearch => path.name("search"),
+            TrackRow::SearchLang => path.name("search_language"),
+            TrackRow::SearchRetry => path.name("retry"),
+            TrackRow::SearchHit(i) => path.name("hit").index(i),
+            TrackRow::LangChoice(i) => path.name("language").index(i),
+        }
     }
 }
 
@@ -412,7 +480,7 @@ impl SubRenderer {
     /// subtitle says which of its colours the pick reaches: `takes_colour` is the media fact
     /// (`plx_media::player::subtitle_takes_colour`), so its white text follows the pick or none of it does.
     fn note(self, takes_colour: bool) -> Option<&'static str> {
-        use plx_platform::i18n::msg;
+        use plx_os::i18n::msg;
         match self {
             Self::Text => None,
             Self::Image => Some(msg::widgets_tracks_style_image_note()),
@@ -723,6 +791,19 @@ impl TrackMenuState {
         yours: Vec<String>,
         offer_search: bool,
     ) -> Self {
+        Self::new_with_preferences(ps, meta, tab, yours, offer_search,
+            plx_plex::plex::session::SubtitleSize::Medium, plx_plex::plex::session::SubtitlePosition::Low)
+    }
+
+    pub fn new_with_preferences(
+        ps: &plx_media::route::PlaybackSession,
+        meta: metadata::MetadataView<'_>,
+        tab: c_int,
+        yours: Vec<String>,
+        offer_search: bool,
+        size: plx_plex::plex::session::SubtitleSize,
+        position: plx_plex::plex::session::SubtitlePosition,
+    ) -> Self {
         let mut s = TrackMenuState {
             tab,
             active_audio: 0,
@@ -732,8 +813,8 @@ impl TrackMenuState {
             form: TrackTable::new(BAND_BASE),
             offset_ms: plx_media::player::subtitle_offset_ms(),
             tone: plx_media::player::subtitle_tone(),
-            size: plx_media::route::subtitle_size(),
-            position: plx_media::route::subtitle_position(),
+            size,
+            position,
             pages: PageStack::new(),
             renderer: SubRenderer::Text,
             takes_colour: true,
@@ -1477,7 +1558,7 @@ impl TrackMenuState {
                 let current = tracks.iter().find(|t| active >= 0 && t.i == active as usize);
                 let value = match current {
                     Some(t) => in_lang_label(t),
-                    None => plx_platform::i18n::msg::widgets_tracks_count(tracks.len() as i64),
+                    None => plx_os::i18n::msg::widgets_tracks_count(tracks.len() as i64),
                 };
                 let row = Row::new(lang.name.clone()).value(value).checked(current.is_some());
                 sec.item(TrackRow::OpenLang(lang.id), RowKind::Nav(TrackPage::Language(lang.id.stream)), (), row)
@@ -1507,7 +1588,7 @@ impl TrackMenuState {
     /// failure is ever drawn as an alarm (`ui/src/CLAUDE.md`: failure read-outs are never red).
     fn search_form(&self) -> TrackForm {
         use plx_data::subsearch::{DownloadPhase, SearchFailure, SearchStatus};
-        use plx_platform::i18n::msg;
+        use plx_os::i18n::msg;
         let Some(s) = self.search.as_ref() else { return Form::new() };
         let busy = s.download.busy();
         let lang = if s.lang.is_empty() { String::new() } else { plx_plex::plex::languages::label(&s.lang).to_string() };
@@ -1875,14 +1956,14 @@ impl TrackMenuState {
     fn enh_reason_text(reason: plx_media::route::DisabledReason) -> String {
         use plx_media::route::DisabledReason;
         match reason {
-            DisabledReason::NotAnalyzed => plx_platform::i18n::msg::widgets_tracks_enh_reason_not_analyzed(),
-            DisabledReason::DolbyVisionUnusable => plx_platform::i18n::msg::widgets_tracks_enh_reason_dv_unusable(),
-            DisabledReason::DolbyVisionSubtitle => plx_platform::i18n::msg::widgets_tracks_enh_reason_dv_subtitle(),
-            DisabledReason::NotOriginalQuality => plx_platform::i18n::msg::widgets_tracks_enh_reason_quality(),
-            DisabledReason::ForcedDirectPlay => plx_platform::i18n::msg::widgets_tracks_enh_reason_forced(),
-            DisabledReason::ServerConverting => plx_platform::i18n::msg::widgets_tracks_enh_reason_converting(),
-            DisabledReason::NotCopyable => plx_platform::i18n::msg::widgets_tracks_enh_reason_not_copyable(),
-            DisabledReason::ServerRefused => plx_platform::i18n::msg::widgets_tracks_enh_reason_refused(),
+            DisabledReason::NotAnalyzed => plx_os::i18n::msg::widgets_tracks_enh_reason_not_analyzed(),
+            DisabledReason::DolbyVisionUnusable => plx_os::i18n::msg::widgets_tracks_enh_reason_dv_unusable(),
+            DisabledReason::DolbyVisionSubtitle => plx_os::i18n::msg::widgets_tracks_enh_reason_dv_subtitle(),
+            DisabledReason::NotOriginalQuality => plx_os::i18n::msg::widgets_tracks_enh_reason_quality(),
+            DisabledReason::ForcedDirectPlay => plx_os::i18n::msg::widgets_tracks_enh_reason_forced(),
+            DisabledReason::ServerConverting => plx_os::i18n::msg::widgets_tracks_enh_reason_converting(),
+            DisabledReason::NotCopyable => plx_os::i18n::msg::widgets_tracks_enh_reason_not_copyable(),
+            DisabledReason::ServerRefused => plx_os::i18n::msg::widgets_tracks_enh_reason_refused(),
         }
         .to_string()
     }
@@ -1895,9 +1976,9 @@ impl TrackMenuState {
     ) -> Option<String> {
         use plx_media::route::{EnhancementRoute, SubtitleEffect};
         match route {
-            EnhancementRoute::Burn => Some(plx_platform::i18n::msg::widgets_tracks_enh_note_burn().to_string()),
+            EnhancementRoute::Burn => Some(plx_os::i18n::msg::widgets_tracks_enh_note_burn().to_string()),
             EnhancementRoute::Remux if subtitle_effect == SubtitleEffect::Sidecar => {
-                Some(plx_platform::i18n::msg::widgets_tracks_enh_note_sidecar().to_string())
+                Some(plx_os::i18n::msg::widgets_tracks_enh_note_sidecar().to_string())
             }
             EnhancementRoute::Remux => None,
         }
@@ -1922,7 +2003,7 @@ impl TrackMenuState {
     /// so the Audio root can be built while the menu shows Subtitles and has not stored one.
     fn audio_form_for(&self, ps: &plx_media::route::PlaybackSession, meta: metadata::MetadataView<'_>, enh: EnhState) -> TrackForm {
         let (enhance_shown, enhance_route, enhance_disabled, enhance_subtitle_effect) = enh;
-        let mut sec = FormSection::new(plx_platform::i18n::msg::widgets_tracks_audio());
+        let mut sec = FormSection::new(plx_os::i18n::msg::widgets_tracks_audio());
         let d = match tracks(meta) {
             Some(t) => t,
             None => return Form::new().section(sec),
@@ -1930,12 +2011,12 @@ impl TrackMenuState {
         let names = plx_media::player::SHARED.track_names.lock().unwrap();
         for (i, s) in d.audio.iter().enumerate() {
             let lang = if s.lang.is_empty() {
-                plx_platform::i18n::msg::widgets_tracks_unknown()
+                plx_os::i18n::msg::widgets_tracks_unknown()
             } else {
                 s.lang.as_str()
             };
             let label = if s.default {
-                plx_platform::i18n::msg::widgets_tracks_original(lang)
+                plx_os::i18n::msg::widgets_tracks_original(lang)
             } else {
                 lang.to_string()
             };
@@ -1969,13 +2050,13 @@ impl TrackMenuState {
                     TrackRow::Boost,
                     RowKind::Toggle,
                     (),
-                    Row::new(plx_platform::i18n::msg::widgets_tracks_boost_dialog()).toggle(shown.boost_dialog),
+                    Row::new(plx_os::i18n::msg::widgets_tracks_boost_dialog()).toggle(shown.boost_dialog),
                 )
                 .item(
                     TrackRow::Loudness,
                     RowKind::Toggle,
                     (),
-                    Row::new(plx_platform::i18n::msg::widgets_tracks_normalize_loudness()).toggle(shown.normalize_loudness),
+                    Row::new(plx_os::i18n::msg::widgets_tracks_normalize_loudness()).toggle(shown.normalize_loudness),
                 );
             if let Some(route) = enhance_route {
                 if let Some(note) = Self::enh_note_text(route, enhance_subtitle_effect) {
@@ -1992,13 +2073,13 @@ impl TrackMenuState {
                     TrackRow::Boost,
                     RowKind::Toggle,
                     (),
-                    Row::new(plx_platform::i18n::msg::widgets_tracks_boost_dialog()).toggle(false).dim(true),
+                    Row::new(plx_os::i18n::msg::widgets_tracks_boost_dialog()).toggle(false).dim(true),
                 )
                 .item(
                     TrackRow::Loudness,
                     RowKind::Toggle,
                     (),
-                    Row::new(plx_platform::i18n::msg::widgets_tracks_normalize_loudness()).toggle(false).dim(true),
+                    Row::new(plx_os::i18n::msg::widgets_tracks_normalize_loudness()).toggle(false).dim(true),
                 )
                 .note(Self::enh_reason_text(reason));
             form = form.section(enh);
@@ -2068,7 +2149,7 @@ impl TrackMenuState {
                 TrackRow::OpenSearch,
                 RowKind::Nav(TrackPage::Search),
                 (),
-                Row::new(plx_platform::i18n::msg::widgets_tracks_search_open()),
+                Row::new(plx_os::i18n::msg::widgets_tracks_search_open()),
             ));
         }
         (form, model)
@@ -2386,6 +2467,27 @@ where
     fn seat(&self, _g: GroupId, _from: Placed, _cx: &Cx<'_, H>) -> FocusKey<H::Elem> {
         popover_seat(self.state, self.entry)
     }
+    /// A row is its [`TrackRow::a11y_path`], relative to the menu (the overlay screen that composes
+    /// this part places the menu under its own namespace). The inverse is the default walk: a page
+    /// of a popover is a list a viewer reads, not a library.
+    fn a11y(&self, key: &H::Elem, _cx: &Cx<'_, H>) -> Option<A11y<'_>> {
+        popover_a11y(&self.state.form, key, TrackRow::a11y_path)
+    }
+    fn a11y_elems(&self, g: GroupId, _cx: &Cx<'_, H>, out: &mut Vec<H::Elem>) {
+        popover_a11y_elems(&self.state.form, g, self.group, out)
+    }
+}
+
+impl TrackMenuPart<'_> {
+    /// **Does a press of the row `key` write to the playing title** ([`TrackRow::writes_title`]), read off the form's
+    /// binding the way `a11y` reads its id. The overlay screen asks it to name the title playing on those rows.
+    pub fn writes_title_at<E: IndexElem>(&self, key: &E) -> bool {
+        let form = &self.state.form;
+        key.index()
+            .and_then(|index| form.index_of_key(RowKey(index)))
+            .and_then(|at| form.binding_at(at))
+            .is_some_and(|binding| binding.id.writes_title())
+    }
 }
 
 impl<H: Host> Part<H> for TrackMenuPart<'_>
@@ -2431,20 +2533,20 @@ fn visible_subs(ps: &plx_media::route::PlaybackSession, meta: metadata::Metadata
 /// Resolve the typed tone at the UI boundary; persisted values and technical logs stay stable.
 pub fn subtitle_tone_label(tone: SubtitleTone) -> &'static str {
     match tone {
-        SubtitleTone::White => plx_platform::i18n::msg::widgets_tracks_tone_white(),
-        SubtitleTone::Yellow => plx_platform::i18n::msg::widgets_tracks_tone_yellow(),
-        SubtitleTone::Silver => plx_platform::i18n::msg::widgets_tracks_tone_silver(),
-        SubtitleTone::LightGrey => plx_platform::i18n::msg::widgets_tracks_tone_light_grey(),
-        SubtitleTone::Grey => plx_platform::i18n::msg::widgets_tracks_tone_grey(),
-        SubtitleTone::DarkGrey => plx_platform::i18n::msg::widgets_tracks_tone_dark_grey(),
-        SubtitleTone::Charcoal => plx_platform::i18n::msg::widgets_tracks_tone_charcoal(),
+        SubtitleTone::White => plx_os::i18n::msg::widgets_tracks_tone_white(),
+        SubtitleTone::Yellow => plx_os::i18n::msg::widgets_tracks_tone_yellow(),
+        SubtitleTone::Silver => plx_os::i18n::msg::widgets_tracks_tone_silver(),
+        SubtitleTone::LightGrey => plx_os::i18n::msg::widgets_tracks_tone_light_grey(),
+        SubtitleTone::Grey => plx_os::i18n::msg::widgets_tracks_tone_grey(),
+        SubtitleTone::DarkGrey => plx_os::i18n::msg::widgets_tracks_tone_dark_grey(),
+        SubtitleTone::Charcoal => plx_os::i18n::msg::widgets_tracks_tone_charcoal(),
     }
 }
 
 /// The localized name of a caption size rung — the one place both the player's Style pages and
 /// Settings' Playback read it.
 pub fn subtitle_size_label(size: SubtitleSize) -> &'static str {
-    use plx_platform::i18n::msg;
+    use plx_os::i18n::msg;
     match size {
         SubtitleSize::Small => msg::settings_playback_subtitle_size_small(),
         SubtitleSize::Medium => msg::settings_playback_subtitle_size_medium(),
@@ -2456,7 +2558,7 @@ pub fn subtitle_size_label(size: SubtitleSize) -> &'static str {
 
 /// The localized name of a caption position rung, shared like [`subtitle_size_label`].
 pub fn subtitle_position_label(position: SubtitlePosition) -> &'static str {
-    use plx_platform::i18n::msg;
+    use plx_os::i18n::msg;
     match position {
         SubtitlePosition::Low => msg::settings_playback_subtitle_position_low(),
         SubtitlePosition::Middle => msg::settings_playback_subtitle_position_middle(),
@@ -2467,7 +2569,7 @@ pub fn subtitle_position_label(position: SubtitlePosition) -> &'static str {
 /// An offset as localized signed seconds to the tenth (`appkit::timing_capsule::offset_seconds_in`,
 /// the one offset formatter).
 fn format_offset(ms: i64) -> String {
-    crate::timing_capsule::offset_seconds_in(ms, true, plx_platform::i18n::current())
+    crate::timing_capsule::offset_seconds_in(ms, true, plx_os::i18n::current())
 }
 
 // ---- section building ----
@@ -2486,7 +2588,7 @@ use plx_data::metadata::track_label::Kind;
 /// longest label is graded against the panel by `converted_audio_sub_lines_fit_the_panel_in_every_language`.
 fn audio_sub_line(ps: &plx_media::route::PlaybackSession, sub: String, s: &metadata::Stream) -> String {
     let converted = plx_media::route::audio_converted_by_server(ps, &s.codec, s.channels, s.sampling_rate);
-    let in_app = plx_platform::devcaps::app_decode_mixes_down(s.channels)
+    let in_app = plx_os::devcaps::app_decode_mixes_down(s.channels)
         && plx_media::route::audio_decoded_in_app(ps, &s.codec, s.channels, s.sampling_rate);
     audio_sub_line_for(sub, converted, in_app)
 }
@@ -2496,9 +2598,9 @@ fn audio_sub_line_for(sub: String, converted: bool, decoded_in_app: bool) -> Str
     if sub.is_empty() {
         sub
     } else if converted {
-        plx_platform::i18n::msg::widgets_tracks_converted_by_server(&sub)
+        plx_os::i18n::msg::widgets_tracks_converted_by_server(&sub)
     } else if decoded_in_app {
-        plx_platform::i18n::msg::widgets_tracks_decoded_in_app_stereo(&sub)
+        plx_os::i18n::msg::widgets_tracks_decoded_in_app_stereo(&sub)
     } else {
         sub
     }
@@ -2511,8 +2613,8 @@ fn audio_descriptor(s: &metadata::Stream) -> String {
         channel_short(&s.layout)
     } else if s.channels > 0 {
         match s.channels {
-            1 => plx_platform::i18n::msg::widgets_tracks_mono().to_string(),
-            2 => plx_platform::i18n::msg::widgets_tracks_stereo().to_string(),
+            1 => plx_os::i18n::msg::widgets_tracks_mono().to_string(),
+            2 => plx_os::i18n::msg::widgets_tracks_stereo().to_string(),
             n => format!("{}.{}", n - 1, if n >= 6 { 1 } else { 0 }),
         }
     } else {
@@ -2530,8 +2632,8 @@ fn audio_descriptor(s: &metadata::Stream) -> String {
 fn channel_short(layout: &str) -> String {
     let base = layout.split('(').next().unwrap_or(layout).trim();
     match base {
-        "mono" => plx_platform::i18n::msg::widgets_tracks_mono().to_string(),
-        "stereo" => plx_platform::i18n::msg::widgets_tracks_stereo().to_string(),
+        "mono" => plx_os::i18n::msg::widgets_tracks_mono().to_string(),
+        "stereo" => plx_os::i18n::msg::widgets_tracks_stereo().to_string(),
         other => other.to_string(),
     }
 }
@@ -2550,7 +2652,7 @@ fn row_badge(b: &RowBadge) -> Badge {
     match b {
         RowBadge::Forced => Badge::Forced,
         RowBadge::Sdh => Badge::Sdh,
-        RowBadge::External => Badge::Text(plx_platform::i18n::msg::widgets_tracks_external_badge().to_string()),
+        RowBadge::External => Badge::Text(plx_os::i18n::msg::widgets_tracks_external_badge().to_string()),
         RowBadge::Codec(c) => Badge::Text((*c).to_string()),
     }
 }
@@ -2564,7 +2666,7 @@ fn flat_row(t: &SubTrack, active_sub: c_int) -> Row {
         parts.push(t.detail.clone());
     }
     if let Some(n) = t.ordinal {
-        parts.push(plx_platform::i18n::msg::widgets_tracks_track_ordinal(n as i64));
+        parts.push(plx_os::i18n::msg::widgets_tracks_track_ordinal(n as i64));
     }
     if !parts.is_empty() {
         row = row.detail(parts.join(" \u{b7} "));
@@ -2595,7 +2697,7 @@ fn in_lang_row(t: &SubTrack, active_sub: c_int) -> Row {
 /// A track's label inside its language: the source (+ "Track N" if needed), or the kind word for a
 /// nameless one. Also the value a language's drill-in reads out for its active variant.
 fn in_lang_label(t: &SubTrack) -> String {
-    let nth = t.ordinal.map(|n| plx_platform::i18n::msg::widgets_tracks_track_ordinal(n as i64));
+    let nth = t.ordinal.map(|n| plx_os::i18n::msg::widgets_tracks_track_ordinal(n as i64));
     if !t.detail.is_empty() {
         match &nth {
             Some(n) => format!("{} \u{b7} {}", t.detail, n),
@@ -2646,7 +2748,7 @@ fn table_form(
     memory_note: bool,
     forced_only: Option<&str>,
 ) -> TrackForm {
-    use plx_platform::i18n::msg;
+    use plx_os::i18n::msg;
     // the track the rows check: the drawn one, unless Forced only holds the checkmark
     let checked_sub = if forced_only.is_some() { -1 } else { active_sub };
     let active_other =
@@ -2917,7 +3019,7 @@ mod tests {
     /// server text and may elide; the fixture's sources are short so only app text is judged.)
     #[test]
     fn every_subtitles_row_fits_the_panel_in_every_language() {
-        use plx_platform::i18n::{language_on_this_thread_for_test, SHIPPED};
+        use plx_os::i18n::{language_on_this_thread_for_test, SHIPPED};
         let mut subs = vec![
             stream(1, 0, "Russian", "rus", "forced, DVD R5"),
             stream(2, 1, "Russian", "rus", "Netflix"),
@@ -2951,7 +3053,7 @@ mod tests {
     /// accented vowels), the fixture's own server values, or letter-free.
     #[test]
     fn every_app_owned_subtitles_string_comes_from_the_catalog() {
-        let _pseudo = plx_platform::i18n::pseudo_on_this_thread_for_test();
+        let _pseudo = plx_os::i18n::pseudo_on_this_thread_for_test();
         // a title's own "Commentary" stays its source (the mock strips no commentary word), so it
         // is server text here like the rest
         let server = ["Russian", "Spanish", "Portuguese", "Netflix", "DVD R5", "Commentary"];
@@ -3551,7 +3653,7 @@ mod enhancement_menu_tests {
         let (menu, ps) = audio_tab(EnhTestFixture { carried_capable: Some(false), ..Default::default() });
         assert_eq!(menu.enhance_disabled, Some(plx_media::route::DisabledReason::NotAnalyzed));
         let note = menu.form.table.sections[1].rows.last().unwrap();
-        assert_eq!(note.label, plx_platform::i18n::msg::widgets_tracks_enh_reason_not_analyzed());
+        assert_eq!(note.label, plx_os::i18n::msg::widgets_tracks_enh_reason_not_analyzed());
         teardown(&ps);
     }
 
@@ -3565,8 +3667,8 @@ mod enhancement_menu_tests {
         assert_eq!(menu.enhance_route, Some(plx_media::route::EnhancementRoute::Remux));
         assert!(menu.enhance_shown.is_some());
         let last = menu.form.table.sections[1].rows.last().unwrap();
-        assert_ne!(last.label, plx_platform::i18n::msg::widgets_tracks_enh_note_burn());
-        assert_ne!(last.label, plx_platform::i18n::msg::widgets_tracks_enh_note_sidecar());
+        assert_ne!(last.label, plx_os::i18n::msg::widgets_tracks_enh_note_burn());
+        assert_ne!(last.label, plx_os::i18n::msg::widgets_tracks_enh_note_sidecar());
         assert_eq!(menu.form.table.sections[1].rows.len(), 2, "the two DSP toggles and no note row");
         teardown(&ps);
     }
@@ -3581,7 +3683,7 @@ mod enhancement_menu_tests {
         assert_eq!(menu.enhance_disabled, Some(plx_media::route::DisabledReason::DolbyVisionUnusable));
         assert_eq!(menu.enhance_shown, None);
         let note = menu.form.table.sections[1].rows.last().unwrap();
-        assert_eq!(note.label, plx_platform::i18n::msg::widgets_tracks_enh_reason_dv_unusable());
+        assert_eq!(note.label, plx_os::i18n::msg::widgets_tracks_enh_reason_dv_unusable());
         teardown(&ps);
     }
 
@@ -3598,7 +3700,7 @@ mod enhancement_menu_tests {
         });
         assert_eq!(menu.enhance_disabled, Some(plx_media::route::DisabledReason::DolbyVisionSubtitle));
         let note = menu.form.table.sections[1].rows.last().unwrap();
-        assert_eq!(note.label, plx_platform::i18n::msg::widgets_tracks_enh_reason_dv_subtitle());
+        assert_eq!(note.label, plx_os::i18n::msg::widgets_tracks_enh_reason_dv_subtitle());
         teardown(&ps);
     }
 
@@ -3614,7 +3716,7 @@ mod enhancement_menu_tests {
         assert_eq!(menu.enhance_route, Some(plx_media::route::EnhancementRoute::Burn));
         assert!(menu.enhance_shown.is_some());
         let note = menu.form.table.sections[1].rows.last().unwrap();
-        assert_eq!(note.label, plx_platform::i18n::msg::widgets_tracks_enh_note_burn());
+        assert_eq!(note.label, plx_os::i18n::msg::widgets_tracks_enh_note_burn());
         teardown(&ps);
     }
 
@@ -3630,7 +3732,7 @@ mod enhancement_menu_tests {
         assert_eq!(menu.enhance_route, Some(plx_media::route::EnhancementRoute::Remux));
         assert!(menu.enhance_shown.is_some());
         let note = menu.form.table.sections[1].rows.last().unwrap();
-        assert_eq!(note.label, plx_platform::i18n::msg::widgets_tracks_enh_note_sidecar());
+        assert_eq!(note.label, plx_os::i18n::msg::widgets_tracks_enh_note_sidecar());
         teardown(&ps);
     }
 
@@ -3646,7 +3748,7 @@ mod enhancement_menu_tests {
         });
         assert_eq!(menu.enhance_disabled, Some(plx_media::route::DisabledReason::NotOriginalQuality));
         let note = menu.form.table.sections[1].rows.last().unwrap();
-        assert_eq!(note.label, plx_platform::i18n::msg::widgets_tracks_enh_reason_quality());
+        assert_eq!(note.label, plx_os::i18n::msg::widgets_tracks_enh_reason_quality());
         teardown(&ps);
     }
 
@@ -3689,8 +3791,8 @@ mod enhancement_menu_tests {
             let (menu, ps) = audio_tab(fixture);
             assert_eq!(menu.enhance_disabled, Some(plx_media::route::DisabledReason::NotCopyable));
             let note = menu.form.table.sections[1].rows.last().unwrap();
-            assert_eq!(note.label, plx_platform::i18n::msg::widgets_tracks_enh_reason_not_copyable());
-            assert_ne!(note.label, plx_platform::i18n::msg::widgets_tracks_enh_reason_quality());
+            assert_eq!(note.label, plx_os::i18n::msg::widgets_tracks_enh_reason_not_copyable());
+            assert_ne!(note.label, plx_os::i18n::msg::widgets_tracks_enh_reason_quality());
             teardown(&ps);
         }
     }
@@ -3734,7 +3836,7 @@ mod enhancement_menu_tests {
             assert_eq!(menu.enhance_route, Some(plx_media::route::EnhancementRoute::Burn));
             assert_eq!(menu.enhance_disabled, None);
             let note = menu.form.table.sections[1].rows.last().unwrap();
-            assert_eq!(note.label, plx_platform::i18n::msg::widgets_tracks_enh_note_burn());
+            assert_eq!(note.label, plx_os::i18n::msg::widgets_tracks_enh_note_burn());
             teardown(&ps);
         }
     }
@@ -3748,7 +3850,7 @@ mod enhancement_menu_tests {
         assert_eq!(menu.enhance_disabled, Some(plx_media::route::DisabledReason::ServerConverting));
         assert!(plx_media::route::original_is_converted(&ps));
         let note = menu.form.table.sections[1].rows.last().unwrap();
-        assert_eq!(note.label, plx_platform::i18n::msg::widgets_tracks_enh_reason_converting());
+        assert_eq!(note.label, plx_os::i18n::msg::widgets_tracks_enh_reason_converting());
         teardown(&ps);
     }
 
@@ -3764,7 +3866,7 @@ mod enhancement_menu_tests {
         });
         assert_eq!(menu.enhance_disabled, Some(plx_media::route::DisabledReason::ForcedDirectPlay));
         let note = menu.form.table.sections[1].rows.last().unwrap();
-        assert_eq!(note.label, plx_platform::i18n::msg::widgets_tracks_enh_reason_forced());
+        assert_eq!(note.label, plx_os::i18n::msg::widgets_tracks_enh_reason_forced());
         teardown(&ps);
     }
 
@@ -3774,7 +3876,7 @@ mod enhancement_menu_tests {
         let (menu, ps) = audio_tab(EnhTestFixture { refused: true, ..Default::default() });
         assert_eq!(menu.enhance_disabled, Some(plx_media::route::DisabledReason::ServerRefused));
         let note = menu.form.table.sections[1].rows.last().unwrap();
-        assert_eq!(note.label, plx_platform::i18n::msg::widgets_tracks_enh_reason_refused());
+        assert_eq!(note.label, plx_os::i18n::msg::widgets_tracks_enh_reason_refused());
         teardown(&ps);
     }
 
@@ -3797,8 +3899,8 @@ mod enhancement_menu_tests {
         let enh = &menu.form.table.sections[1];
         assert_eq!(enh.header, "");
         assert_eq!(enh.rows.len(), 2);
-        assert_eq!(enh.rows[0].label, plx_platform::i18n::msg::widgets_tracks_boost_dialog());
-        assert_eq!(enh.rows[1].label, plx_platform::i18n::msg::widgets_tracks_normalize_loudness());
+        assert_eq!(enh.rows[0].label, plx_os::i18n::msg::widgets_tracks_boost_dialog());
+        assert_eq!(enh.rows[1].label, plx_os::i18n::msg::widgets_tracks_normalize_loudness());
         teardown(&ps);
     }
 
@@ -4349,12 +4451,12 @@ mod enhancement_menu_tests {
     /// prose the viewer who HAS them ever reads.
     #[test]
     fn enh_locale_values_never_mention_plex_pass() {
-        use plx_platform::i18n::{language_on_this_thread_for_test, SHIPPED};
+        use plx_os::i18n::{language_on_this_thread_for_test, SHIPPED};
         for language in SHIPPED {
             let _guard = language_on_this_thread_for_test(language);
             for value in [
-                plx_platform::i18n::msg::widgets_tracks_boost_dialog(),
-                plx_platform::i18n::msg::widgets_tracks_normalize_loudness(),
+                plx_os::i18n::msg::widgets_tracks_boost_dialog(),
+                plx_os::i18n::msg::widgets_tracks_normalize_loudness(),
             ] {
                 let lower = value.to_lowercase();
                 assert!(!lower.contains("plex pass"), "{language:?}: {value:?} names the gate");
@@ -4368,7 +4470,7 @@ mod enhancement_menu_tests {
     /// never heard the word "remux" and should not need to.
     #[test]
     fn enh_notes_and_reasons_never_use_jargon() {
-        use plx_platform::i18n::{language_on_this_thread_for_test};
+        use plx_os::i18n::{language_on_this_thread_for_test};
         const BANNED: &[&str] = &[
             "remux",
             "transcode",
@@ -4380,21 +4482,21 @@ mod enhancement_menu_tests {
             "base layer",
             "hdr10",
         ];
-        for language in plx_platform::i18n::SHIPPED {
+        for language in plx_os::i18n::SHIPPED {
             let _guard = language_on_this_thread_for_test(language);
             for (name, value) in [
-                ("enh_note_sidecar", plx_platform::i18n::msg::widgets_tracks_enh_note_sidecar()),
-                ("enh_note_burn", plx_platform::i18n::msg::widgets_tracks_enh_note_burn()),
-                ("enh_reason_not_analyzed", plx_platform::i18n::msg::widgets_tracks_enh_reason_not_analyzed()),
-                ("enh_reason_dv_unusable", plx_platform::i18n::msg::widgets_tracks_enh_reason_dv_unusable()),
-                ("enh_reason_dv_subtitle", plx_platform::i18n::msg::widgets_tracks_enh_reason_dv_subtitle()),
-                ("enh_reason_quality", plx_platform::i18n::msg::widgets_tracks_enh_reason_quality()),
-                ("enh_reason_converting", plx_platform::i18n::msg::widgets_tracks_enh_reason_converting()),
-                ("enh_reason_forced", plx_platform::i18n::msg::widgets_tracks_enh_reason_forced()),
-                ("enh_reason_not_copyable", plx_platform::i18n::msg::widgets_tracks_enh_reason_not_copyable()),
-                ("enh_reason_refused", plx_platform::i18n::msg::widgets_tracks_enh_reason_refused()),
-                ("sub_burn_audio", plx_platform::i18n::msg::widgets_tracks_sub_burn_audio()),
-                ("sub_burn_quality", plx_platform::i18n::msg::widgets_tracks_sub_burn_quality()),
+                ("enh_note_sidecar", plx_os::i18n::msg::widgets_tracks_enh_note_sidecar()),
+                ("enh_note_burn", plx_os::i18n::msg::widgets_tracks_enh_note_burn()),
+                ("enh_reason_not_analyzed", plx_os::i18n::msg::widgets_tracks_enh_reason_not_analyzed()),
+                ("enh_reason_dv_unusable", plx_os::i18n::msg::widgets_tracks_enh_reason_dv_unusable()),
+                ("enh_reason_dv_subtitle", plx_os::i18n::msg::widgets_tracks_enh_reason_dv_subtitle()),
+                ("enh_reason_quality", plx_os::i18n::msg::widgets_tracks_enh_reason_quality()),
+                ("enh_reason_converting", plx_os::i18n::msg::widgets_tracks_enh_reason_converting()),
+                ("enh_reason_forced", plx_os::i18n::msg::widgets_tracks_enh_reason_forced()),
+                ("enh_reason_not_copyable", plx_os::i18n::msg::widgets_tracks_enh_reason_not_copyable()),
+                ("enh_reason_refused", plx_os::i18n::msg::widgets_tracks_enh_reason_refused()),
+                ("sub_burn_audio", plx_os::i18n::msg::widgets_tracks_sub_burn_audio()),
+                ("sub_burn_quality", plx_os::i18n::msg::widgets_tracks_sub_burn_quality()),
             ] {
                 let lower = value.to_lowercase();
                 for word in BANNED {
@@ -4419,7 +4521,7 @@ mod enhancement_menu_tests {
     /// string back; do not assume either phrase's width from the source text alone.
     #[test]
     fn enh_rows_fit_menu_cap_es_be() {
-        use plx_platform::i18n::{language_on_this_thread_for_test, SHIPPED};
+        use plx_os::i18n::{language_on_this_thread_for_test, SHIPPED};
         let mut out = Vec::new();
         for language in SHIPPED {
             let _g = plx_base::testlock::serial();
@@ -4471,9 +4573,9 @@ mod enhancement_menu_tests {
         assert_eq!(audio_sub_line_for("DTS 7.1".into(), false, true), "DTS 7.1 \u{b7} played in stereo");
         assert_eq!(audio_sub_line_for("DTS 7.1".into(), false, false), "DTS 7.1");
         let dts = |channels| metadata::Stream { codec: "dca".into(), channels, sampling_rate: 48_000, ..Default::default() };
-        let measured = std::sync::Arc::new(plx_platform::devcaps::Caps {
-            app_lossy: plx_platform::devcaps::AppLossy::Measured,
-            ..plx_platform::devcaps::Caps::assumed()
+        let measured = std::sync::Arc::new(plx_os::devcaps::Caps {
+            app_lossy: plx_os::devcaps::AppLossy::Measured,
+            ..plx_os::devcaps::Caps::assumed()
         });
         let mut ps = plx_media::route::PlaybackSession::IDLE;
         plx_media::route::begin_attempt_for_test(&mut ps, measured.clone());
@@ -4491,7 +4593,7 @@ mod enhancement_menu_tests {
         assert_eq!(audio_sub_line(&ps, "DTS 5.1".into(), &dts(6)), "DTS 5.1", "Forced on a measured set: the refusal, no mark");
         let truehd = metadata::Stream { codec: "truehd".into(), channels: 8, sampling_rate: 48_000, ..Default::default() };
         assert_eq!(audio_sub_line(&ps, "Dolby TrueHD 7.1".into(), &truehd), "Dolby TrueHD 7.1", "unmeasured: not decoded here");
-        let native = std::sync::Arc::new(plx_platform::devcaps::Caps {
+        let native = std::sync::Arc::new(plx_os::devcaps::Caps {
             audio: "aac,ac3,eac3,dts".into(),
             audio_channels: [("dts".into(), 6)].into(),
             ..(*measured).clone()
@@ -4505,7 +4607,7 @@ mod enhancement_menu_tests {
     /// (`Dolby Digital Plus 7.1`, `Dolby TrueHD 7.1`).
     #[test]
     fn converted_audio_sub_lines_fit_the_panel_in_every_language() {
-        use plx_platform::i18n::{language_on_this_thread_for_test, SHIPPED};
+        use plx_os::i18n::{language_on_this_thread_for_test, SHIPPED};
         let mut out = Vec::new();
         for language in SHIPPED {
             let _g = plx_base::testlock::serial();
@@ -4521,9 +4623,9 @@ mod enhancement_menu_tests {
             // The same track menu once the recovery's last rung put DTS in force on a measured set: the DTS
             // 7.1 track is decoded in the app, and its "played in stereo" line is graded the same way.
             plx_media::route::begin_attempt_for_test(&mut ps, std::sync::Arc::new(
-                plx_platform::devcaps::Caps {
-                    app_lossy: plx_platform::devcaps::AppLossy::Measured,
-                    ..plx_platform::devcaps::Caps::assumed()
+                plx_os::devcaps::Caps {
+                    app_lossy: plx_os::devcaps::AppLossy::Measured,
+                    ..plx_os::devcaps::Caps::assumed()
                 }
                 .with_app_lossy_for("dts"),
             ));
@@ -4576,7 +4678,7 @@ mod enhancement_menu_tests {
 
         let note_i = style_i + 1;
         assert_eq!(menu.form.id_at(note_i), None, "a note is an inert slot with no id");
-        assert_eq!(rows[note_i].label, plx_platform::i18n::msg::widgets_tracks_sub_burn_audio());
+        assert_eq!(rows[note_i].label, plx_os::i18n::msg::widgets_tracks_sub_burn_audio());
         assert!(rows[note_i].sep, "a note row is non-selectable");
 
         // The track rows themselves stay live: Off, and the embedded subtitle, neither dim.
@@ -4618,7 +4720,7 @@ mod enhancement_menu_tests {
         for (route, reason) in [
             (
                 EnhTestFixture { remux: Some(true), subtitle_effect: plx_media::route::SubtitleEffect::Embedded, ..Default::default() },
-                plx_platform::i18n::msg::widgets_tracks_sub_burn_audio(),
+                plx_os::i18n::msg::widgets_tracks_sub_burn_audio(),
             ),
             (
                 EnhTestFixture {
@@ -4627,7 +4729,7 @@ mod enhancement_menu_tests {
                     subtitle_effect: plx_media::route::SubtitleEffect::Embedded,
                     ..Default::default()
                 },
-                plx_platform::i18n::msg::widgets_tracks_sub_burn_quality(),
+                plx_os::i18n::msg::widgets_tracks_sub_burn_quality(),
             ),
         ] {
             let (mut menu, ps) = subtitles_tab(route);
@@ -4815,9 +4917,9 @@ mod enhancement_menu_tests {
     /// `enh_rows_fit_menu_cap_es_be` over the Audio panel.
     #[test]
     fn subtitles_locked_note_fits_menu_cap_es_be() {
-        use plx_platform::i18n::{language_on_this_thread_for_test};
+        use plx_os::i18n::{language_on_this_thread_for_test};
         let mut out = Vec::new();
-        for language in plx_platform::i18n::SHIPPED {
+        for language in plx_os::i18n::SHIPPED {
             let _g = plx_base::testlock::serial();
             let _guard = language_on_this_thread_for_test(language);
             // the audio-conversion reason (a remux) and the quality reason, as well as the own burn
@@ -4863,7 +4965,7 @@ mod enhancement_menu_tests {
 
         let (menu, ps) =
             subtitles_tab(EnhTestFixture { remux: Some(true), memory_note: true, ..Default::default() });
-        assert_eq!(notes(&menu), vec![plx_platform::i18n::msg::widgets_tracks_sub_remembered_note()]);
+        assert_eq!(notes(&menu), vec![plx_os::i18n::msg::widgets_tracks_sub_remembered_note()]);
         let rows = flat_rows(&menu);
         let note_i = rows.iter().position(|r| r.is_note()).expect("the note row");
         assert_eq!(menu.form.id_at(note_i), None, "a note is an inert slot with no id");
@@ -4888,7 +4990,7 @@ mod enhancement_menu_tests {
         let (with, _sid) =
             enhancement_test_session(EnhTestFixture { remux: Some(true), memory_note: true, ..Default::default() });
         menu.update(0.016, &plx_ui::fixture::FixtureMeasure, &with, store.view());
-        assert_eq!(notes(&menu), vec![plx_platform::i18n::msg::widgets_tracks_sub_remembered_note()]);
+        assert_eq!(notes(&menu), vec![plx_os::i18n::msg::widgets_tracks_sub_remembered_note()]);
 
         let (without, _sid) = enhancement_test_session(EnhTestFixture { remux: Some(true), ..Default::default() });
         menu.update(0.016, &plx_ui::fixture::FixtureMeasure, &without, store.view());
@@ -4958,7 +5060,7 @@ mod enhancement_menu_tests {
         let (mut menu, mut ps) =
             subtitles_tab(EnhTestFixture { remux: Some(true), memory_note: true, ..Default::default() });
         let store = super::tests::store_with(vec![super::tests::stream(999, 0, "English", "eng", "")]);
-        let note = vec![plx_platform::i18n::msg::widgets_tracks_sub_remembered_note()];
+        let note = vec![plx_os::i18n::msg::widgets_tracks_sub_remembered_note()];
         assert_eq!(notes(&menu), note, "setup: the note is up");
 
         plx_media::route::commit_subtitle_pick(&mut ps, -1, 0, false, None);
@@ -4977,14 +5079,14 @@ mod enhancement_menu_tests {
     /// shared menu cap and at the hugged width, with the real font measure.
     #[test]
     fn the_remembered_note_fits_the_subtitles_panel_in_every_shipped_language() {
-        use plx_platform::i18n::{language_on_this_thread_for_test, SHIPPED};
+        use plx_os::i18n::{language_on_this_thread_for_test, SHIPPED};
         let mut out = Vec::new();
         for language in SHIPPED {
             let _g = plx_base::testlock::serial();
             let _guard = language_on_this_thread_for_test(language);
             let (menu, ps) =
                 subtitles_tab(EnhTestFixture { remux: Some(true), memory_note: true, ..Default::default() });
-            assert_eq!(notes(&menu), vec![plx_platform::i18n::msg::widgets_tracks_sub_remembered_note()], "{language:?}");
+            assert_eq!(notes(&menu), vec![plx_os::i18n::msg::widgets_tracks_sub_remembered_note()], "{language:?}");
             out.extend(menu.form.table.menu_cap_failure(&plx_base::fontcov::advances::ShippedMeasure, language.tag()));
             out.extend(menu.form.table.app_fit_failures(plx_ui::table::MENU_MAX_W, language.tag()));
             out.extend(menu.form.table.app_fit_failures_hugged(language.tag()));
@@ -4997,10 +5099,10 @@ mod enhancement_menu_tests {
     /// viewer should not have to learn.
     #[test]
     fn the_remembered_note_never_uses_jargon() {
-        use plx_platform::i18n::{language_on_this_thread_for_test, SHIPPED};
+        use plx_os::i18n::{language_on_this_thread_for_test, SHIPPED};
         for language in SHIPPED {
             let _guard = language_on_this_thread_for_test(language);
-            let note = plx_platform::i18n::msg::widgets_tracks_sub_remembered_note().to_lowercase();
+            let note = plx_os::i18n::msg::widgets_tracks_sub_remembered_note().to_lowercase();
             for word in ["remux", "transcode", "burn", "re-encode", "reencode", "sidecar"] {
                 assert!(!note.contains(word), "{language:?}: {note:?} uses the banned engineering term {word:?}");
             }
@@ -5014,7 +5116,7 @@ mod enhancement_menu_tests {
         use plx_machine::machine::Measure;
         use plx_base::fontcov::advances::ShippedMeasure;
         use plx_ui::fit::HEADROOM;
-        use plx_platform::i18n::{language_on_this_thread_for_test, Preference};
+        use plx_os::i18n::{language_on_this_thread_for_test, Preference};
         let _g = plx_base::testlock::serial();
         let _guard = language_on_this_thread_for_test(Preference::Es);
         let (menu, ps) = subtitles_tab(EnhTestFixture {
@@ -5023,7 +5125,7 @@ mod enhancement_menu_tests {
             applied_burn: true,
             ..Default::default()
         });
-        let note = plx_platform::i18n::msg::widgets_tracks_sub_burn_audio();
+        let note = plx_os::i18n::msg::widgets_tracks_sub_burn_audio();
         let line = ShippedMeasure.width_str(&note, plx_ui::theme::size::CAPTION, false);
         let before = menu.form.table.measured_height();
         let pw = menu.form.table.menu_panel_width(&ShippedMeasure);
@@ -5390,7 +5492,7 @@ mod forced_only_tests {
             open(SubMode::ForcedOnly, SubtitleEffect::None, vec![audio(10, "", "")], subs);
         assert_eq!(
             row_of(&menu, TrackRow::SubForcedOnly).value.as_deref(),
-            Some(plx_platform::i18n::msg::widgets_tracks_unknown()),
+            Some(plx_os::i18n::msg::widgets_tracks_unknown()),
             "control: no fallback, nothing to name"
         );
         teardown(&ps);
@@ -5460,7 +5562,7 @@ mod forced_only_tests {
     /// and hugged.
     #[test]
     fn the_forced_only_row_with_its_readout_fits_the_panel_in_every_shipped_language() {
-        use plx_platform::i18n::{language_on_this_thread_for_test, SHIPPED};
+        use plx_os::i18n::{language_on_this_thread_for_test, SHIPPED};
         let mut out = Vec::new();
         for language in SHIPPED {
             for name in ["Portuguese (Brazil)", "Norwegian Bokm\u{e5}l", "Serbo-Croatian", "Scottish Gaelic", "Tagalog"] {
@@ -5470,7 +5572,7 @@ mod forced_only_tests {
                 let (menu, ps, _store) =
                     open(SubMode::ForcedOnly, SubtitleEffect::Embedded, vec![audio(10, name, "xxx")], subs);
                 let row = row_of(&menu, TrackRow::SubForcedOnly);
-                assert_eq!(row.label, plx_platform::i18n::msg::widgets_tracks_forced_only(), "{language:?}");
+                assert_eq!(row.label, plx_os::i18n::msg::widgets_tracks_forced_only(), "{language:?}");
                 assert!(row.value.as_deref().is_some_and(|v| !v.is_empty() && v.chars().count() <= 11), "{language:?} {name}");
                 out.extend(menu.form.table.menu_cap_failure(&plx_base::fontcov::advances::ShippedMeasure, language.tag()));
                 out.extend(menu.form.table.app_fit_failures(plx_ui::table::MENU_MAX_W, language.tag()));
@@ -5486,7 +5588,7 @@ mod forced_only_tests {
     /// which the Belarusian review (skarnik.by, verbum.by) covered once.
     #[test]
     fn the_forced_only_words_are_in_every_catalogue_and_match_the_settings_value() {
-        use plx_platform::i18n::{language_on_this_thread_for_test, msg, SHIPPED};
+        use plx_os::i18n::{language_on_this_thread_for_test, msg, SHIPPED};
         for language in SHIPPED {
             let _g = plx_base::testlock::serial();
             let _guard = language_on_this_thread_for_test(language);
@@ -5501,6 +5603,7 @@ mod forced_only_tests {
 mod focus_tests {
     use super::*;
     use plx_machine::machine::{FocusRead, InputOwner, PressRead, Tick};
+    use plx_ui::a11y::Role;
 
     /// The focus element of the `i`-th Audio row, named by identity.
     fn audio_key(i: usize) -> u32 {
@@ -5527,6 +5630,7 @@ mod focus_tests {
             focus: FocusRead::default(),
             press: PressRead::default(),
             owner: InputOwner::Entry(entry),
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
         })
     }
 
@@ -5539,6 +5643,11 @@ mod focus_tests {
         }
         let mut form = FormTable::new(plx_ui::table_screen::BAND_BASE);
         form.set(TrackForm::new().section(sec), None);
+        menu_of(form)
+    }
+
+    /// A menu showing `form`, with nothing else about it asked of a playback or a playing item.
+    fn menu_of(form: TrackTable) -> TrackMenuState {
         TrackMenuState {
             tab: 0,
             active_audio: 0,
@@ -5570,6 +5679,78 @@ mod focus_tests {
             anchor: crate::player_hud::classic::ctrl_row_hit_rect(),
             side: std::cell::Cell::new(plx_ui::popover::Side::Above),
         }
+    }
+
+    /// **The rows of the Audio tab are `audio.<i>`** and the menu conforms (every row projects,
+    /// ids are unique, the inverse finds each row, the group lists no more rows than it declares, and
+    /// some when it declares any); the title band's pointer-only key and a key of no row project nothing.
+    #[test]
+    fn audio_rows_are_named_by_their_track_index_and_conform() {
+        let e = EntryId(5);
+        let st = three_row_menu();
+        let part = TrackMenuPart { state: &st, entry: e, group: GroupId(0) };
+        with_cx(e, |cx| {
+            plx_ui::a11y::conformance(&part, cx);
+            let at = |key: u32| {
+                <TrackMenuPart as Focusable<HostFixture>>::a11y(&part, &key, cx).map(|a| (a.path.to_string(), a.role))
+            };
+            assert_eq!(at(audio_key(0)), Some(("audio.0".to_string(), Role::Row)));
+            assert_eq!(at(audio_key(2)), Some(("audio.2".to_string(), Role::Row)));
+            assert_eq!(at(plx_ui::page_stack::TITLE_KEY), None);
+            assert_eq!(at(9999), None);
+            let path = A11yPath::parse_relative("audio.1").expect("a relative path");
+            assert_eq!(<TrackMenuPart as Focusable<HostFixture>>::a11y_find(&part, &path, cx), Some(audio_key(1)));
+        });
+    }
+
+    /// **Every kind of row has a name of its own**: the root's Off, Forced only and tracks, the
+    /// DSP switches, the Style page's drill-ins and a picker's rungs, the language pages and the
+    /// search rows. One page holding one of each conforms, so no two share an id.
+    #[test]
+    fn every_kind_of_row_has_a_unique_name() {
+        use plx_data::metadata::sub_layout::LangId;
+        let nav = || RowKind::Nav(TrackPage::Style);
+        let rows: Vec<(TrackRow, RowKind<TrackPage>, &str, Role)> = vec![
+            (TrackRow::Audio(0), RowKind::Choice, "audio.0", Role::Row),
+            (TrackRow::Audio(1), RowKind::Choice, "audio.1", Role::Row),
+            (TrackRow::Boost, RowKind::Toggle, "boost", Role::Toggle),
+            (TrackRow::Loudness, RowKind::Toggle, "loudness", Role::Toggle),
+            (TrackRow::SubOff, RowKind::Choice, "off", Role::Row),
+            (TrackRow::SubForcedOnly, RowKind::Choice, "forced", Role::Row),
+            (TrackRow::Sub(0), RowKind::Choice, "sub.0", Role::Row),
+            (TrackRow::Sub(2), RowKind::Choice, "sub.2", Role::Row),
+            (TrackRow::Timing, nav(), "timing", Role::Row),
+            (TrackRow::Style, nav(), "style", Role::Row),
+            (TrackRow::OpenOther, nav(), "other", Role::Row),
+            (TrackRow::OpenLang(LangId { stream: 7, slot: 1 }), nav(), "lang.1", Role::Row),
+            (TrackRow::OpenField(StyleField::Size), nav(), "field.size", Role::Row),
+            (TrackRow::OpenField(StyleField::Position), nav(), "field.position", Role::Row),
+            (TrackRow::OpenField(StyleField::Color), nav(), "field.color", Role::Row),
+            (TrackRow::Choice(StyleField::Size, 0), RowKind::Choice, "size.0", Role::Row),
+            (TrackRow::Choice(StyleField::Position, 1), RowKind::Choice, "position.1", Role::Row),
+            (TrackRow::Choice(StyleField::Color, 3), RowKind::Choice, "color.3", Role::Row),
+            (TrackRow::OpenSearch, nav(), "search", Role::Row),
+            (TrackRow::SearchLang, nav(), "search_language", Role::Row),
+            (TrackRow::SearchRetry, RowKind::Button, "retry", Role::Button),
+            (TrackRow::SearchHit(4), RowKind::Button, "hit.4", Role::Button),
+            (TrackRow::LangChoice(2), RowKind::Choice, "language.2", Role::Row),
+        ];
+        let sec = rows
+            .iter()
+            .fold(FormSection::new("All"), |sec, (id, kind, _, _)| sec.item(*id, kind.clone(), (), Row::new("row")));
+        let mut form = FormTable::new(plx_ui::table_screen::BAND_BASE);
+        form.set(TrackForm::new().section(sec), None);
+        let st = menu_of(form);
+        let e = EntryId(5);
+        let part = TrackMenuPart { state: &st, entry: e, group: GroupId(0) };
+        with_cx(e, |cx| {
+            plx_ui::a11y::conformance(&part, cx);
+            for (id, _, name, role) in &rows {
+                let got = <TrackMenuPart as Focusable<HostFixture>>::a11y(&part, &id.key().0, cx)
+                    .map(|a| (a.path.to_string(), a.role));
+                assert_eq!(got, Some((name.to_string(), *role)), "{id:?}");
+            }
+        });
     }
 
     /// **UP/DOWN step by one row and clamp at both ends**, matching
@@ -5718,7 +5899,7 @@ mod focus_tests {
 mod localized_offset_tests {
     #[test]
     fn subtitle_timing_uses_locale_decimal_and_unit_without_changing_offset_sign() {
-        use plx_platform::i18n::{LocaleContext, Preference};
+        use plx_os::i18n::{LocaleContext, Preference};
         for (preference, region, negative, positive) in [
             (Preference::En, "en-US", "-0.1 s", "+1.3 s"),
             (Preference::Es, "es-ES", "-0,1 s", "+1,3 s"),
@@ -6052,8 +6233,8 @@ mod style_page_tests {
         let _g = plx_base::testlock::serial();
         for (codec, renderer, note) in [
             ("srt", SubRenderer::Text, None),
-            ("pgs", SubRenderer::Image, Some(plx_platform::i18n::msg::widgets_tracks_style_image_note())),
-            ("ass", SubRenderer::Styled, Some(plx_platform::i18n::msg::widgets_tracks_style_styled_note())),
+            ("pgs", SubRenderer::Image, Some(plx_os::i18n::msg::widgets_tracks_style_image_note())),
+            ("ass", SubRenderer::Styled, Some(plx_os::i18n::msg::widgets_tracks_style_styled_note())),
         ] {
             let (mut menu, ps, store) = open_with(codec, SubtitleEffect::Sidecar);
             assert_eq!(menu.renderer, renderer, "{codec}");
@@ -6115,7 +6296,7 @@ mod style_page_tests {
     /// of the session.
     #[test]
     fn a_color_the_active_subtitle_cannot_take_is_dimmed_with_its_reason_and_the_stored_pick_stays() {
-        use plx_platform::i18n::msg;
+        use plx_os::i18n::msg;
         let _g = plx_base::testlock::serial();
         let cases: [(&str, Option<bool>, bool, Option<&str>); 4] = [
             ("srt", None, true, None),
@@ -6257,9 +6438,9 @@ mod style_page_tests {
     /// notes), and each picker page, judged by the same gates as the rest of the menu.
     #[test]
     fn every_style_page_fits_the_panel_in_every_language() {
-        use plx_platform::i18n::{language_on_this_thread_for_test};
+        use plx_os::i18n::{language_on_this_thread_for_test};
         let mut out = Vec::new();
-        for language in plx_platform::i18n::SHIPPED {
+        for language in plx_os::i18n::SHIPPED {
             let _g = plx_base::testlock::serial();
             let _guard = language_on_this_thread_for_test(language);
             for codec in ["srt", "pgs", "ass"] {
@@ -6288,9 +6469,9 @@ mod style_page_tests {
     /// note wrapped to three lines in a sliver.
     #[test]
     fn the_style_note_fits_two_lines_at_the_player_menu_floor() {
-        use plx_platform::i18n::{language_on_this_thread_for_test, Preference};
+        use plx_os::i18n::{language_on_this_thread_for_test, Preference};
         let measure = plx_base::fontcov::advances::ShippedMeasure;
-        for language in plx_platform::i18n::SHIPPED {
+        for language in plx_os::i18n::SHIPPED {
             let _g = plx_base::testlock::serial();
             let _guard = language_on_this_thread_for_test(language);
             // the picture note, the styled note (white follows the pick) and the styled-with-no-white note,
@@ -6844,9 +7025,9 @@ mod language_page_tests {
     /// judged by the same gates as the rest of the menu.
     #[test]
     fn the_language_pages_fit_the_panel_in_every_language() {
-        use plx_platform::i18n::{language_on_this_thread_for_test};
+        use plx_os::i18n::{language_on_this_thread_for_test};
         let mut out = Vec::new();
-        for language in plx_platform::i18n::SHIPPED {
+        for language in plx_os::i18n::SHIPPED {
             let _g = plx_base::testlock::serial();
             let _guard = language_on_this_thread_for_test(language);
             let (mut menu, ps, store) = open(subs_with_vobsub());
@@ -6914,9 +7095,9 @@ mod motion_tests {
     /// One loop frame, as the dispatcher runs it: forget last frame's motion, then update. Returns
     /// whether a spring moved (what keeps the present gate awake).
     fn frame(menu: &mut TrackMenuState, ps: &plx_media::route::PlaybackSession, store: &plx_data::stores::metadata::MetadataStore) -> bool {
-        plx_machine::idle::frame_begin(DT);
+        plx_machine::motion::report::frame_begin(DT);
         menu.update(DT, &ShippedMeasure, ps, store.view());
-        plx_machine::idle::present_moving()
+        plx_machine::motion::report::present_moving()
     }
 
     fn run(menu: &mut TrackMenuState, ps: &plx_media::route::PlaybackSession, store: &plx_data::stores::metadata::MetadataStore, n: usize) {
@@ -7383,7 +7564,7 @@ mod motion_tests {
             let row = menu.form.table.sections.iter().flat_map(|s| &s.rows).nth(i).unwrap();
             row.value.clone().unwrap_or_default()
         };
-        assert_eq!(value_of(&menu, row_a), plx_platform::i18n::msg::widgets_tracks_search_added());
+        assert_eq!(value_of(&menu, row_a), plx_os::i18n::msg::widgets_tracks_search_added());
         assert_eq!(value_of(&menu, row_b), "", "a hit the item lacks is not marked");
         menu.focus_key(row_a.key().0);
         assert_eq!(menu.on_ok(store.view()), TrackOk::Inert);
@@ -7608,6 +7789,22 @@ mod classic_placement_tests {
     }
 
     /// The overscan audit's rect is the placer's, and sits inside SAFE.
+    #[test]
+    fn captured_preference_tracks_keep_the_opening_size_and_position() {
+        use plx_plex::plex::session::{SubtitleSize, SubtitlePosition};
+        let _serial = plx_base::testlock::serial();
+        let ps = plx_media::route::PlaybackSession::IDLE;
+        let meta = plx_data::stores::metadata::MetadataStore::default();
+        let mut a = TrackMenuState::new_with_preferences(&ps, meta.view(), 0, Vec::new(), false,
+            SubtitleSize::Large, SubtitlePosition::Low);
+        let b = TrackMenuState::new_with_preferences(&ps, meta.view(), 0, Vec::new(), false,
+            SubtitleSize::Small, SubtitlePosition::Low);
+        a.update(0.016, &plx_ui::fixture::FixtureMeasure, &ps, meta.view());
+        assert_eq!(a.size, SubtitleSize::Large);
+        assert_eq!(b.size, SubtitleSize::Small);
+        assert_eq!(a.position, SubtitlePosition::Low);
+    }
+
     #[test]
     fn the_overscan_rect_comes_from_the_placer() {
         let mut out = Vec::new();

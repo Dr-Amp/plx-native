@@ -2,17 +2,16 @@
 """`make test-hostsim` and `make check-nodef` keep their cargo trees where the disk tooling can see them.
 
 AGENTS.md used to hand out two hand recipes, a `CARGO_TARGET_DIR=/tmp/<dir> cargo test --lib -p
-plxnative-modules --features hostsim` and a `CARGO_INCREMENTAL=0 cargo check ... --no-default-features`,
+plxnative-modules --features sim` and a `CARGO_INCREMENTAL=0 cargo check ... --no-default-features`,
 and every agent that ran one picked its own `/tmp/<dir>`. Nothing tracked those: on 2026-10-19 there
 were 28 PlxNative cargo trees in `/tmp`, 45.6 GiB, none of them visible to `make disk` or
 `tools/build-gc.sh`. The two make targets replace the recipes, and this pins the property that
-matters, that neither can put a cargo tree outside the checkout:
+matters, that the default paths belong to this checkout or its configured external build directory:
 
-* `test-hostsim` builds into `rust-modules/target-hostsim` (relative, so it resolves inside the
-  checkout), whatever `CARGO_TARGET_DIR` the caller exported; it is incremental in that dir only,
+* `test-hostsim` builds into `rust-modules/target-hostsim` (a checkout-relative path), whatever `CARGO_TARGET_DIR` the caller exported; it is incremental in that dir only,
   runs `plxnative-modules` (or the `C=<crate>` named, spelled as for `test-crate`: `plx_media`,
   `media`, `app`, several allowed; the SAME recipe, so the same dir and the same rules) with
-  `--features hostsim`, gives the run a throwaway runtime dir that is removed afterwards, and FAILS
+  `--features sim`, gives the run a throwaway runtime dir that is removed afterwards, and FAILS
   when the `T=` filter matches no test (libtest says `0 passed` and exits 0, which a mistyped name
   reads exactly like a green run);
 * `check-nodef` sets no target dir of its own (so cargo's default, `rust-modules/target`, or the
@@ -31,11 +30,12 @@ from __future__ import annotations
 
 import os
 import re
+import runpy
 import subprocess
 import unittest
 from pathlib import Path
 
-from test_test_fast import FakeCargoHome, make
+from test_test_fast import FakeCargoHome, ignored_target, make
 
 ROOT = Path(__file__).resolve().parent.parent
 TDIR = "target-hostsim"
@@ -72,6 +72,14 @@ def inside_checkout(call):
         resolved = base / "target"          # cargo's own default: <workspace root>/target
     else:
         resolved = base / tdir
+    if resolved.is_symlink():
+        storage = runpy.run_path(str(ROOT / "tools/build-root.py"))
+        if storage["CONFIG"].is_file():
+            location = storage["location"](ROOT)
+            if location and resolved.parent == ROOT / "rust-modules":
+                directory, _ = location
+                if resolved.resolve() == directory / resolved.name:
+                    return Path(resolved.name)
     resolved = Path(os.path.realpath(resolved))
     root = Path(os.path.realpath(ROOT / "rust-modules"))
     return resolved.relative_to(root) if resolved == root or root in resolved.parents else None
@@ -88,7 +96,7 @@ class TestHostsim(unittest.TestCase):
             self.assertTrue(call["cwd"].endswith("rust-modules"), call["cwd"])
             self.assertEqual(inside_checkout(call), Path(TDIR))
             self.assertEqual(call["runtime_dir_set"], "yes")
-            self.assertRegex(call["args"], r"^\+\S+ test --lib -p plxnative-modules --features hostsim --no-run "
+            self.assertRegex(call["args"], r"^\+\S+ test --lib -p plxnative-modules --features sim --no-run "
                                            r"--message-format=json-render-diagnostics$")
             # One package, so one test binary, and the filter goes to it (the runner builds, then runs).
             (line,) = fake.bin_calls()
@@ -96,8 +104,8 @@ class TestHostsim(unittest.TestCase):
             self.assertIn("rust-modules/" + TDIR, out.stdout)
 
     def test_c_names_the_crate_under_test_and_changes_nothing_else(self):
-        # plx_media's own hostsim tests (player/engine.rs, pump.rs, route/decision.rs) are not in the
-        # application crate's test binary: C= is how they get the managed dir instead of a /tmp one.
+        # plx_media's tests are not in the application crate's test binary: C= is how they get the
+        # managed dir instead of a /tmp one.
         spellings = {
             "": "-p plxnative-modules",
             "C=app": "-p plxnative-modules",
@@ -118,7 +126,7 @@ class TestHostsim(unittest.TestCase):
                     self.assertEqual(call["target_dir"], TDIR)
                     self.assertEqual(inside_checkout(call), Path(TDIR))
                     self.assertRegex(call["args"], r"^\+\S+ test --lib " + re.escape(packages)
-                                     + r" --features hostsim --no-run --message-format=json-render-diagnostics$")
+                                     + r" --features sim --no-run --message-format=json-render-diagnostics$")
                     self.assertIn(packages.replace("-p ", ""), out.stdout.replace("\n", " "))
 
     def test_c_keeps_the_filter_and_the_zero_tests_failure(self):
@@ -135,7 +143,7 @@ class TestHostsim(unittest.TestCase):
     def test_c_is_one_recipe_not_a_second_one(self):
         text = (ROOT / "Makefile").read_text()
         self.assertEqual(len(re.findall(r"^test-hostsim:[ \t]*$", text, re.M)), 1)
-        self.assertEqual(len(re.findall(r"--features hostsim", recipe_body("test-hostsim"))), 1)
+        self.assertEqual(len(re.findall(r"--features sim", recipe_body("test-hostsim"))), 1)
 
     def test_the_throwaway_runtime_dir_is_removed_afterwards(self):
         with FakeCargoHome() as fake:
@@ -175,12 +183,16 @@ class TestCheckNodef(unittest.TestCase):
             env = {"CARGO_INCREMENTAL": "1", "PLX_CARGO_SEED": "off"}
             out = fake.run("check-nodef", env=env)
             self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-            (call,) = fake.calls()
+            # Two checks of the shipping set: the application, then the crate the ARM staticlib is built
+            # from (`plx_platform_webos`), which the first line does not compile.
+            call, platform = fake.calls()
             self.assertEqual(call["incremental"], "0")
             self.assertTrue(call["cwd"].endswith("rust-modules"), call["cwd"])
             # The release set is `--no-default-features` PLUS the backends: both are in the app
             # crate's `default`, so the bare flag would check a build with no playback backend.
             self.assertRegex(call["args"], r"^\+\S+ check --lib --no-default-features --features play-uri,play-feed$")
+            self.assertRegex(platform["args"], r"^\+\S+ check --lib -p plx_platform_webos --no-default-features --features play-uri,play-feed$")
+            self.assertEqual(platform["incremental"], "0")
             # No target dir of its own: cargo's default, <workspace>/target, is inside the checkout.
             self.assertIn(call["target_dir"], ("None", "", None))
             self.assertEqual(inside_checkout(call), Path("target"))
@@ -188,9 +200,11 @@ class TestCheckNodef(unittest.TestCase):
     def test_it_follows_the_target_dir_a_lane_exports_for_make_check(self):
         with FakeCargoHome() as fake:
             self.assertEqual(fake.run("check-nodef", env=LANE_ENV).returncode, 0)
-            (call,) = fake.calls()
-            self.assertEqual(call["target_dir"], "/somewhere/else")
-            self.assertEqual(call["incremental"], "0")
+            calls = fake.calls()
+            self.assertEqual(len(calls), 2)
+            for call in calls:
+                self.assertEqual(call["target_dir"], "/somewhere/else")
+                self.assertEqual(call["incremental"], "0")
 
     def test_the_backend_features_follow_playback_backends(self):
         # `RELEASE=1` passes the selected backends explicitly; check-nodef checks what it ships.
@@ -198,13 +212,15 @@ class TestCheckNodef(unittest.TestCase):
             with self.subTest(backends), FakeCargoHome() as fake:
                 out = fake.run("check-nodef", f"PLAYBACK_BACKENDS={backends}", env={"PLX_CARGO_SEED": "off"})
                 self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-                (call,) = fake.calls()
+                call, platform = fake.calls()
                 self.assertRegex(call["args"], rf"^\+\S+ check --lib --no-default-features --features {features}$")
+                self.assertRegex(platform["args"], rf"^\+\S+ check --lib -p plx_platform_webos --no-default-features --features {features}$")
         with FakeCargoHome() as fake:
             out = fake.run("check-nodef", "PLAYBACK_BACKENDS=none", env={"PLX_CARGO_SEED": "off"})
             self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-            (call,) = fake.calls()
+            call, platform = fake.calls()
             self.assertRegex(call["args"], r"^\+\S+ check --lib --no-default-features$")
+            self.assertRegex(platform["args"], r"^\+\S+ check --lib -p plx_platform_webos --no-default-features$")
 
     def test_it_shares_make_lints_third_party_units_so_it_must_not_change_their_inputs(self):
         text = recipe_body("check-nodef")
@@ -258,8 +274,7 @@ class NeverOutsideTheCheckout(unittest.TestCase):
 
 class TheDirIsManaged(unittest.TestCase):
     def test_gitignored(self):
-        out = subprocess.run(["git", "check-ignore", "-q", f"rust-modules/{TDIR}/debug/x"], cwd=ROOT)
-        self.assertEqual(out.returncode, 0, f"rust-modules/{TDIR}/ must be in .gitignore")
+        self.assertTrue(ignored_target(TDIR))
 
     def test_build_gc_sweeps_it_without_a_name_list(self):
         text = (ROOT / "tools/build-gc.sh").read_text()

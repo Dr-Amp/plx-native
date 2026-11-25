@@ -63,7 +63,7 @@ SAFE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
 REPO = re.compile(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
 # Only the dependency-graph submission needs these; the detector is this script.
 DETECTOR = {'name': 'plxnative-deps-update', 'version': '1',
-            'url': 'https://github.com/GLinnik21/plx-native/blob/main/ci/deps-update.py'}
+            'url': 'https://github.com/plxnative/plx-native/blob/main/ci/deps-update.py'}
 
 
 class BumpError(Exception):
@@ -390,6 +390,9 @@ NOTICE_ROWS = {
     'harfbuzz': ['| HarfBuzz | {version} |'],
     'libunibreak': ['| libunibreak | {version} |'],
     'sentry-native': ['**Sentry Native {version}**'],
+    # The Tizen package's statically linked SDL (THIRD-PARTY-NOTICES.md section 2.8).
+    'sdl2': ['| SDL2 | {version} |'],
+    'sdl2-ttf': ['| SDL2_ttf | {version} |'],
 }
 
 

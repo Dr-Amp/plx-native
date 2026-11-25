@@ -36,6 +36,11 @@
 //! agent session uses: drive the UI, then ask for the frame. Those are NUMBERED (`shot-1.png`,
 //! `shot-2.png`, …) so a sequence of them does not overwrite one file and race whoever is reading
 //! it, and they never exit the process — the caller is still driving.
+//!
+//! On the television the same `shot` FIFO token is the on-demand door (the token works
+//! wherever the FIFO does — the devtrig builds; `events.rs`'s dispatch arm), arming this
+//! very `ON_DEMAND` flag. The frame the agent gets is the numbered file in the instance
+//! root, fetched over SSH; the event log line is the confirmation it waits for.
 
 use std::os::raw::{c_int, c_uint, c_void};
 use std::path::PathBuf;
@@ -115,17 +120,25 @@ fn settled_due(settle: u32, after: u32, age: u32, quiet: u32, busy: bool) -> boo
     !busy && age >= after && quiet >= settle
 }
 
+fn confirm_settled(requested: bool, ready: bool, fired: &AtomicBool) -> bool {
+    if requested && !ready { fired.store(false, Ordering::Relaxed); }
+    requested && ready
+}
+
 /// Once per loop iteration, BEFORE the present decision (`app::run`): arm the settled capture when
 /// the screen has been at rest long enough. A settled screen does not present, so this invalidates
 /// to make the next frame present — and that frame, drawn from unchanged state, is the capture.
-pub(crate) fn tick(now: u32, busy: bool) {
+/// Simulator-only: the television never arms the settled capture (its one door is the on-demand
+/// `shot` token), so the loop's call is hostsim-gated too.
+#[cfg(feature = "sim")]
+pub(crate) fn tick(now: u32, busy: bool, last_change_ms: u32) -> bool {
     let cfg = cfg();
-    let Some(settle) = cfg.settle else { return };
+    let Some(settle) = cfg.settle else { return false };
     if SETTLE_FIRED.load(Ordering::Relaxed) {
-        return;
+        return false;
     }
     let first = *FIRST_TICK.get_or_init(|| now);
-    let quiet = now.wrapping_sub(plx_machine::idle::last_change_ms());
+    let quiet = now.wrapping_sub(last_change_ms);
     if settled_due(settle, cfg.after, now.wrapping_sub(first), quiet, busy) {
         SETTLE_FIRED.store(true, Ordering::Relaxed);
         SETTLED.store(true, Ordering::Relaxed);
@@ -133,11 +146,14 @@ pub(crate) fn tick(now: u32, busy: bool) {
             "shot: settled ({quiet} ms at rest, {} ms after the first frame)",
             now.wrapping_sub(first)
         ));
-        plx_machine::idle::invalidate();
+        return true;
     }
+    false
 }
 
-/// Ask for a capture of the next frame. The remote-FIFO entry point (`app.rs`'s token dispatch).
+/// Ask for a capture of the next frame — the `shot` FIFO token's one effect
+/// (`events.rs`'s dispatch arm; the command API's screenshot door in both the simulator
+/// and the devtrig televisions).
 ///
 /// Deliberately one-shot and idempotent: two `shot` tokens in a row produce one file, because the
 /// second arrives before anything has repainted and would otherwise overwrite the first with the
@@ -149,7 +165,16 @@ pub(crate) fn request() {
     // moving. So a `shot` token sent to a UI that has come to rest — which is exactly when an
     // agent wants one, after driving and waiting — would set this flag and then wait forever for a
     // frame that never comes. Observed as a token that logged nothing at all.
-    plx_machine::idle::invalidate();
+}
+
+/// Encode a read-back buffer as PNG in memory. `image::save_buffer` does the same work for a
+/// path; the on-demand capture keeps the bytes in memory so the numbered file lands with the
+/// encode and the write as one step.
+fn encode_png(rgb: &[u8], w: u32, h: u32, color: image::ColorType) -> image::ImageResult<Vec<u8>> {
+    use image::ImageEncoder;
+    let mut out: Vec<u8> = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut out).write_image(rgb, w, h, color.into())?;
+    Ok(out)
 }
 
 /// `dir/stem-N.ext`, N counting up per on-demand shot within this process.
@@ -214,7 +239,7 @@ pub(crate) fn read_flipped(vx: c_int, vy: c_int, vw: c_int, vh: c_int, ch: usize
     // **A frame over the BOUND video plane is the one exception, and it arrives already flattened.**
     // The straighten pass (`gfx/straighten.rs`) has turned its buffer into STRAIGHT colour for the
     // television's compositor, which multiplies it by alpha; the simulator stands in for that
-    // compositor (`run.rs`'s `composite_plane_under`, the decoded picture or black) before this
+    // compositor (`Present::compose_under`, `adapters::sim_present`'s: the decoded picture or black) before this
     // read, so the RGB here is the panel and the alpha is 1. Reading the straight buffer itself
     // would give a picture brighter than any panel shows.
     //
@@ -250,19 +275,28 @@ pub(crate) fn read_flipped(vx: c_int, vy: c_int, vw: c_int, vh: c_int, ch: usize
 /// the sign-in worker (`auth::mint_pin` -> libcurl) is still mid-handshake on another thread,
 /// loading the CA bundle — SIGSEGV inside libcrypto, captured by `tools/sim-smoke.py --core-dir`.
 /// Ending the run here lets the app's own shutdown run, and the simulator's `main` then leaves
-/// without `atexit` teardown (`src/bin/sim.rs`).
+/// without `atexit` teardown (`platform-desktop/src/bin/sim.rs`).
+
 #[must_use = "a headless one-shot capture asks the caller to end the run"]
-pub(crate) fn maybe_capture(vx: c_int, vy: c_int, vw: c_int, vh: c_int) -> bool {
+pub(crate) fn maybe_capture(now: u32, busy: bool, last_change_ms: u32, vx: c_int, vy: c_int, vw: c_int, vh: c_int, api_shot: bool, completed: impl FnOnce(Result<String, String>)) -> bool {
     let n = FRAMES.fetch_add(1, Ordering::Relaxed);
-    let on_demand = ON_DEMAND.swap(false, Ordering::Relaxed);
-    let settled = SETTLED.swap(false, Ordering::Relaxed);
+    let on_demand = ON_DEMAND.swap(false, Ordering::Relaxed) || api_shot;
+    let requested = SETTLED.swap(false, Ordering::Relaxed);
     let cfg = cfg();
+    let ready = cfg.settle.is_some_and(|settle| settled_due(settle, cfg.after,
+        now.wrapping_sub(*FIRST_TICK.get_or_init(|| now)), now.wrapping_sub(last_change_ms), busy));
+    let settled = confirm_settled(requested, ready, &SETTLE_FIRED);
     if !on_demand && !settled && cfg.frame != Some(n) {
         return false;
     }
     let ends_run = ends_run(cfg.exit, on_demand);
     if vw <= 0 || vh <= 0 {
         plx_base::eventlog::log("shot: viewport is empty — nothing to capture");
+        // A typed shot read parked on this request answers with the refusal (no-op for a
+        // capture nobody asked for over the socket).
+        if on_demand {
+            completed(Err("the viewport is empty — nothing to capture".to_string()));
+        }
         return ends_run;
     }
 
@@ -280,9 +314,30 @@ pub(crate) fn maybe_capture(vx: c_int, vy: c_int, vw: c_int, vh: c_int) -> bool 
     } else {
         cfg.path.clone()
     };
-    match image::save_buffer(&out, &rgb, w as u32, h as u32, color) {
-        Ok(()) => plx_base::eventlog::log(&format!("shot: wrote {}x{} to {}", w, h, out.display())),
-        Err(e) => plx_base::eventlog::log(&format!("shot: could not write {}: {e}", out.display())),
+    if on_demand {
+        // The on-demand capture keeps its encode in memory (encode, then one write) so the
+        // numbered file and the log line that names it come from the same bytes. Automatic
+        // captures (simulator) have no such pairing and keep `save_buffer`.
+        let written = encode_png(&rgb, w as u32, h as u32, color)
+            .map_err(|error| error.to_string())
+            .and_then(|png| plx_plex::plex::session::write_atomic(&out, &png)
+                .map_err(|error| format!("{error:?}")));
+        match written {
+            Ok(()) => {
+                plx_base::eventlog::log(&format!("shot: wrote {}x{} to {}", w, h, out.display()));
+                // The typed shot read parked on this request answers with the numbered file.
+                completed(Ok(out.display().to_string()));
+            }
+            Err(e) => {
+                plx_base::eventlog::log(&format!("shot: could not write {}: {e}", out.display()));
+                completed(Err(format!("could not write {}: {e}", out.display())));
+            }
+        }
+    } else {
+        match image::save_buffer(&out, &rgb, w as u32, h as u32, color) {
+            Ok(()) => plx_base::eventlog::log(&format!("shot: wrote {}x{} to {}", w, h, out.display())),
+            Err(e) => plx_base::eventlog::log(&format!("shot: could not write {}: {e}", out.display())),
+        }
     }
 
     ends_run
@@ -304,6 +359,57 @@ mod tests {
         assert!(!settled_due(800, 3_000, 2_999, 5_000, false), "not before AFTER");
         assert!(!settled_due(800, 0, 9_000, 799, false), "not before the quiet has elapsed");
         assert!(!settled_due(800, 0, 9_000, 5_000, true), "not while work is queued");
+    }
+
+    #[test]
+    fn fresh_input_motion_and_content_restart_the_settle_window() {
+        use plx_machine::present::{Present, PresentEvent, Provenance};
+        use plx_machine::motion::report::FrameReport;
+        for (event, motion) in [
+            (Some(PresentEvent::Damage(Provenance::Input)), false),
+            (None, true),
+            (Some(PresentEvent::Damage(Provenance::Landing(plx_machine::machine::MachineId::Cache))), false),
+        ] {
+            let mut present = Present::new();
+            present.take(0);
+            present.acknowledge(0);
+            assert!(settled_due(500, 0, 1500, 1500 - present.last_change_ms(), false));
+            if let Some(event) = event { present.note(event); }
+            present.collect(1500, FrameReport { moving: motion, page_moving: motion, ..Default::default() });
+            assert!(!settled_due(500, 0, 1500, 1500 - present.last_change_ms(), false),
+                "current-frame activity must restart quiet time before the one-shot latch is set");
+        }
+    }
+
+    #[test]
+    fn a_draw_change_rearms_the_settled_capture_instead_of_exiting() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fired = AtomicBool::new(true);
+        assert!(!super::confirm_settled(true, false, &fired));
+        assert!(!fired.load(Ordering::Relaxed), "the next quiet interval must be allowed to schedule again");
+        fired.store(true, Ordering::Relaxed);
+        assert!(super::confirm_settled(true, true, &fired));
+        assert!(fired.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn the_loop_collects_current_frame_changes_before_testing_the_settled_shot() {
+        let source = include_str!("app/run.rs").replace("\r\n", "\n");
+        let window = source.split("fn publish_resources(").nth(1).expect("publication port exists")
+            .split("fn admit_frame(").next().unwrap();
+        let collect = window.find("plx_machine::motion::report::collect_into(").expect("current frame capture");
+        let shot = window.find("crate::shot::tick(").expect("settled screenshot decision");
+        assert!(collect < shot, "settled capture uses this frame's collected changes");
+        let dispatch = include_str!("../ui/src/dispatch.rs");
+        let owner = dispatch.split("pub fn product_frame(").nth(1).expect("product protocol exists")
+            .split("pub fn begin_product_turn(").next().unwrap();
+        let ordered = |text: &str| match (text.find("runtime.publish();"), text.find("owner.present.take(now)")) {
+            (Some(publish), Some(admit)) => publish < admit,
+            _ => false,
+        };
+        assert!(ordered(owner), "publication and screenshot wake precede owner admission");
+        assert!(!ordered(&owner.replace("runtime.publish();", "")), "missing publication must fail");
+        assert!(!ordered("owner.present.take(now); runtime.publish();"), "stale admission must fail");
     }
 
     #[test]

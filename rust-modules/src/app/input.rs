@@ -18,7 +18,7 @@
 //! consumes only the Session owner's committed Ready handoff.
 
 use super::*;
-
+use super::platform::Shell;
 
 /// The Magic Remote POINTER, as one value: which input mode the remote is in, what the
 /// cursor is doing, and the two gestures that outlive a single event (a scrub drag and the
@@ -63,6 +63,18 @@ struct BackCursorOwner {
 }
 
 impl Pointer {
+    /// **Enter D-pad mode** — the one place its state is written, for the arrow keys and PLAY
+    /// alike. Each caller keeps its own decision to hide the pointer (`Shell::hide_pointer`); this
+    /// is the state half: the cursor reads hidden, Back no longer owns it, motion is counted afresh against
+    /// `DPAD_MOTION_GATE` and the edge glide stops.
+    pub(crate) fn enter_dpad(&mut self) {
+        self.dpad_mode = true;
+        self.cur_hidden = true;
+        self.back_cursor = None;
+        self.mot_accum = 0.0;
+        self.edge.stop();
+    }
+
     /// Pointer mode, cursor shown, nothing held or dragging — where the loop starts.
     pub(crate) const IDLE: Pointer = Pointer {
         dpad_mode: false,
@@ -82,9 +94,9 @@ impl Pointer {
         self.back_cursor.is_some()
     }
 
-    pub(crate) fn note_cursor_motion(&mut self) {
+    pub(crate) fn note_cursor_motion(&mut self, shell: &dyn Shell) {
         if self.cur_hidden && !self.back_cursor_active() {
-            unsafe { super::boot::show_cursor_after_motion(); }
+            shell.show_pointer_after_motion();
             self.cur_hidden = false;
         }
     }
@@ -96,12 +108,13 @@ impl Pointer {
 
     pub(crate) fn sync_back_cursor(
         &mut self,
+        shell: &dyn Shell,
         current: Option<BackCursorTarget>,
         request: Option<(BackCursorTarget, plx_screens::registry::BackCursorChange)>,
     ) {
         use plx_screens::registry::BackCursorChange;
         if self.back_cursor.as_ref().is_some_and(|owner| Some(owner.target) != current) {
-            self.release_back_cursor(false);
+            self.release_back_cursor(shell, false);
         }
         let Some((target, change)) = request.filter(|(target, _)| Some(*target) == current) else {
             return;
@@ -109,20 +122,20 @@ impl Pointer {
         match change {
             BackCursorChange::Hide => {
                 let installed = !self.cur_hidden || self.back_cursor.as_ref().is_some_and(|owner| owner.installed);
-                unsafe { hide_cursor(); }
+                shell.hide_pointer();
                 self.cur_hidden = true;
                 self.back_cursor = Some(BackCursorOwner { target, installed });
             }
-            BackCursorChange::Wake => self.release_back_cursor(true),
-            BackCursorChange::Release => self.release_back_cursor(false),
+            BackCursorChange::Wake => self.release_back_cursor(shell, true),
+            BackCursorChange::Release => self.release_back_cursor(shell, false),
         }
     }
 
-    fn release_back_cursor(&mut self, motion: bool) {
+    fn release_back_cursor(&mut self, shell: &dyn Shell, motion: bool) {
         if self.back_cursor.take().is_some_and(|owner| motion || owner.installed) {
             // On LG's backend this is a no-op. Only a blank cursor installed by
             // this app can be restored here.
-            unsafe { super::boot::show_cursor_after_motion(); }
+            shell.show_pointer_after_motion();
             self.cur_hidden = false;
         }
     }
@@ -305,7 +318,7 @@ impl EdgeScroll {
 /// **Is this pointer click really the remote's OK button?**
 ///
 /// On a set without LG's `SDL_webOSCursorVisibility` (webOS 3.9.3's SDL 2.0.4, issue #642) the
-/// app hides the pointer by swapping in a transparent cursor (`boot::hide_cursor`). The system
+/// app hides the pointer by swapping in a transparent cursor (`Shell::hide_is_cursor_swap`). The system
 /// still believes its pointer is up, so the Magic Remote's OK arrives as a CLICK at wherever that
 /// invisible pointer sits, never as an OK key: the viewer arrows to the `…` disc, presses OK, and
 /// the click lands on the picture and toggles pause. (Measured on an OLED55B7V-Z, 3.9.3,
@@ -369,6 +382,8 @@ pub(crate) struct MenuPlayAwait {
     /// A miss logs and leaves the stack as it is instead of opening the page: a launch link's key
     /// came from outside the app, so a page for it may not exist (`app::deeplink`).
     stay_on_miss: bool,
+    #[cfg(feature = "devtriggers")]
+    api: bool,
 }
 
 /// Which asynchronous load a [`MenuPlayAwait`] is waiting on. Both phases are polled by the one
@@ -392,6 +407,8 @@ impl MenuPlayAwait {
         Self {
             sid, expect, season_index, hud_ms, deadline: now.wrapping_add(12_000), phase: MenuPlayPhase::Detail,
             open: false, stay_on_miss: false,
+            #[cfg(feature = "devtriggers")]
+            api: false,
         }
     }
 
@@ -399,6 +416,15 @@ impl MenuPlayAwait {
     pub(crate) fn for_link(sid: plx_plex::plex::ServerId, rk: String, open: bool, now: u32) -> Self {
         Self { open, stay_on_miss: true, ..Self::new(sid, rk, None, plx_screens::player::input::HUD_LINGER_MS, now) }
     }
+
+    #[cfg(feature = "devtriggers")]
+    pub(super) fn for_api(sid: plx_plex::plex::ServerId, rk: String, now: u32) -> Self {
+        Self { api: true, hud_ms: plx_screens::player::input::HUD_HEADLESS_MS, ..Self::for_link(sid, rk, false, now) }
+    }
+
+    #[cfg(feature = "devtriggers")]
+    pub(super) fn is_api(&self) -> bool { self.api }
+
 }
 
 /// **What a card ACTIVATION does, once its screen has decided whether the press means PLAY.**
@@ -544,14 +570,20 @@ pub(crate) unsafe fn menu_play_tick(
     let Some(wait) = menu_play_await.clone() else {
         return;
     };
-    let MenuPlayAwait { sid, ref expect, season_index, hud_ms, deadline, phase, open, stay_on_miss } = wait;
+    let MenuPlayAwait { sid, ref expect, season_index, hud_ms, deadline, phase, open, stay_on_miss, .. } = wait;
     // Something else already moved the app onto the player this frame (a different press, an
     // auto-advance) — the wait is moot and must not fire a second Play on top of it.
+    let expired = now.wrapping_sub(deadline) < u32::MAX / 2;
     if super::bridge::player(pages).is_some() {
+        // An explicit replacement has asked the shared exit to pop the old player.
+        // Its navigation commit may still be pending on this frame.
+        #[cfg(feature = "devtriggers")]
+        if wait.is_api() && !expired {
+            return;
+        }
         *menu_play_await = None;
         return;
     }
-    let expired = now.wrapping_sub(deadline) < u32::MAX / 2;
     if let MenuPlayPhase::Season { gen, idx } = phase {
         // The season fetch is still ours only while its generation stands and the item it hangs
         // off is still the loaded one: another season press, a new detail request or a page's
@@ -712,8 +744,9 @@ unsafe fn play_loaded_hero(
 /// [`menu_play_tick`], never resolved on the press frame.
 ///
 /// Runs in the default feature set too: `menu_play_tick`'s landed arm reaches `start_playback` and
-/// the video sink, but `port.rs` installs `tv::sink::NoSink` under `cfg(test)`, so the sink a bare
-/// `cargo test --lib` meets answers every verb with nothing (the native sink is compiled, and never reached).
+/// the video sink, but a test installs no `tv::Services`, so `tv::sink::installed()` is the host-test
+/// default (`tv::sink::NoSink`) and a bare `cargo test --lib` meets a sink that answers every verb with nothing
+/// (the native sink lives in the webOS platform crate, and is never linked here).
 #[cfg(test)]
 mod activate_card_tests {
     use super::*;
@@ -730,19 +763,16 @@ mod activate_card_tests {
         let mt = unsafe { plx_base::task::MainThread::assume() };
         let mut pa = plx_media::player::adapter::PlayerAdapter::new(mt);
         let mut pages = plx_ui::dispatch::Dispatcher::<super::bridge::AppHost>::new();
-        let mut bridge = super::bridge::Bridge::for_test(|| 0);
-        let mut menu_play_await = None;
-
-        struct Cleanup(*mut super::bridge::Bridge);
+        struct Cleanup(crate::app::runtime_owners::Harness);
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                // SAFETY: captured from `bridge` just above, which outlives this guard for the
-                // whole test body.
-                unsafe { &mut *self.0 }.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::Clear);
+                self.0.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::Clear);
                 plx_plex::plex::reset_servers_for_test();
             }
         }
-        let _cleanup = Cleanup(&mut bridge as *mut _);
+        let mut cleanup = Cleanup(crate::app::runtime_owners::Harness::new(|| 0));
+        let mut bridge = cleanup.0.bridge();
+        let mut menu_play_await = None;
         plx_plex::plex::reset_servers_for_test();
         let sid = plx_plex::plex::register_for_test("press-frame", "127.0.0.1", 1, "t", "c-press-frame");
         let mm = plx_data::pms::PmsMovie { sid, rk: "show-1".into(), kind: 1, ..Default::default() };
@@ -792,17 +822,17 @@ mod activate_card_tests {
         let mt = unsafe { plx_base::task::MainThread::assume() };
         let mut pa = plx_media::player::adapter::PlayerAdapter::new(mt);
         let mut pages = plx_ui::dispatch::Dispatcher::<super::bridge::AppHost>::new();
-        let mut bridge = super::bridge::Bridge::for_test(|| 0);
+        let harness = crate::app::runtime_owners::Harness::new(|| 0);
 
-        struct Cleanup(*mut super::bridge::Bridge);
+        struct Cleanup(crate::app::runtime_owners::Harness);
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                // SAFETY: captured from `bridge` just below, which outlives this guard.
-                unsafe { &mut *self.0 }.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::Clear);
+                self.0.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::Clear);
                 plx_plex::plex::reset_servers_for_test();
             }
         }
-        let _cleanup = Cleanup(&mut bridge as *mut _);
+        let mut cleanup = Cleanup(harness);
+        let mut bridge = cleanup.0.bridge();
         plx_plex::plex::reset_servers_for_test();
         let sid = plx_plex::plex::register_for_test("menu-play", "127.0.0.1", 1, "t", "c-menu-play");
 
@@ -837,7 +867,8 @@ mod activate_card_tests {
         let mt = unsafe { plx_base::task::MainThread::assume() };
         let mut pa = plx_media::player::adapter::PlayerAdapter::new(mt);
         let mut pages = plx_ui::dispatch::Dispatcher::<super::bridge::AppHost>::new();
-        let mut bridge = super::bridge::Bridge::for_test(|| 0);
+        let mut harness = crate::app::runtime_owners::Harness::new(|| 0);
+        let mut bridge = harness.bridge();
         let mut menu_play_await = None;
         let collection = plx_data::pms::PmsMovie { rk: "50001".into(),
             kind: plx_data::pms::KIND_COLLECTION, ..Default::default() };
@@ -1151,7 +1182,7 @@ pub(super) unsafe fn apply_item_action<R: super::playback::PlaybackResources>(
 #[path = "menu_play_season_tests.rs"]
 mod menu_play_season_tests;
 
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(all(test, feature = "sim"))]
 #[path = "item_menu_player_return_tests.rs"]
 mod item_menu_player_return_tests;
 
@@ -1177,14 +1208,10 @@ mod item_menu_player_return_tests;
 // fingerprint each press produces against a recorded table.
 
 /// A key-up: the reliable release (this remote sends exactly one per press). Retires this sym from
-/// the physically-down slot and springs a deferred grid-card press back.
+/// the physically-down slot. Gesture release belongs exclusively to the dispatcher.
 ///
-/// It cleared a second slot — `HeldKey::sym`, the client-side hold-repeat's own — until phase 10
-/// deleted that timer with its last consumer (the item menu). What is left is `down_sym`, which is
-/// a fact about the PHYSICAL key rather than about whoever read it, and the press machine's
-/// release, which is a fact about the LOOP's own deferred press. **Both are why this still runs
-/// unconditionally, above the tree-ownership question**: a key the ladders never saw go down would
-/// otherwise look held for as long as a surface was up.
+/// This runs unconditionally: physical-key bookkeeping is independent of input ownership.
+/// The forwarded event releases the dispatcher press exactly once.
 ///
 /// **The scrub half is gone** (restructure phase 12, PX-PLAYER). It ran on
 /// `PlayerScreen::scrub` — a field of a screen that has owned the whole gesture since it began
@@ -1192,45 +1219,17 @@ mod item_menu_player_return_tests;
 /// `Edge::Up` — so the two together issued TWO seeks for one tap. The commit, the debounce and
 /// the reveal-cancel are `screens::player::PlayerScreen::key_scrub_release`'s now, and
 /// the commit reaches `commit_seek` through `PlayerReq::CommitSeek` instead of through here.
-pub(crate) fn on_key_up(
-    sym: c_uint,
-    ok_armed: bool,
-    down_sym: &mut u32,
-    press: &mut plx_ui::press::Press,
-) {
+pub(crate) fn on_key_up(sym: c_uint, down_sym: &mut u32) {
     if sym == *down_sym {
         *down_sym = 0;
     }
-    if is_ok(sym) && ok_armed {
-        // OK released over a grid card: start the spring-back; the deferred
-        // activation commits from the per-frame loop once the bounce has shown.
-        press.release(clock::now());
-    }
 }
 
-/// A hardware AUTO-REPEAT (held key). **All that is left of it is the deferred press's liveness
-/// beat** — the dropped-key-up net in `ui::press`, which is the loop's own machine and belongs to
-/// no screen.
-///
-/// The client-side hold-repeat timer went in phase 10: every discrete focus list in the app — the
-/// home grid, detail, the Settings family, the player's four panels and, last of them, the item
-/// context menu — is an owned screen or a surface on the dispatcher, so a repeat reaching one is
-/// an `InputEvent` carrying `Edge::Repeat` handed over before this function is reached, and the
-/// cadence is applied THERE (`RepeatGate`, to the DIRECTIONS only).
-///
-/// The player's continuous scrub was the last thing this drove directly, and it went the same way
-/// in phase 12 (PX-PLAYER): `PlayerScreen::key_scrub_repeat` engages the ramp off its own
-/// `Edge::Repeat`, which is the same event one layer down, and the per-frame advance is that
-/// screen's `Tick`. Nothing about the gesture is read or written from here any more, which is what
-/// makes `PlayerScreen::scrub` a field with ONE owner.
-pub(crate) fn on_auto_repeat(sym: c_uint, ok_armed: bool, press: &mut plx_ui::press::Press) {
-    if ok_armed && is_ok(sym) {
-        press.note_alive(clock::now()); // OK held: keep the dropped-key-up net honest
-    }
-}
+// Auto-repeat liveness, press cancellation and gesture ticks belong to Dispatcher.input.
+
 
 /// What EVERY fresh press does before the ladder sees it: remember the sym as physically down,
-/// un-dismiss the HUD, abort an armed click that a non-OK key slid off, and — the LG pointer
+/// un-dismiss the HUD, and — the LG pointer
 /// convention, global to every screen including the onboarding ones the ladder dispatches first —
 /// let the first D-pad press dismiss the Magic-Remote cursor and put input in D-pad mode. Pointer
 /// motion brings it back.
@@ -1273,33 +1272,29 @@ pub(crate) unsafe fn begin_fresh_press(
     down_sym: &mut u32,
     hud: Option<&mut HudState>,
     ptr: &mut Pointer,
-    ok_armed: &mut bool,
-    press: &mut plx_ui::press::Press,
+    shell: &dyn Shell,
 ) {
     *down_sym = sym;
-    note_global_press(ps, sym, wcode, now, viewer_paused, hud, ok_armed, press);
+    note_global_press(ps, sym, wcode, now, viewer_paused, hud);
     if matches!(
         key,
         Key::Up | Key::Down | Key::Left { alt: false } | Key::Right { alt: false }
     ) {
         if !ptr.dpad_mode || !ptr.cur_hidden {
-            hide_cursor();
+            shell.hide_pointer();
         }
-        ptr.dpad_mode = true;
-        ptr.cur_hidden = true;
-        ptr.back_cursor = None;
-        ptr.mot_accum = 0.0;
-        ptr.edge.stop();
+        ptr.enter_dpad();
     }
 }
 
-/// **The two GLOBAL effects of a fresh press, and the guard that decides whether they happen** —
+/// **The global HUD wake of a fresh press, and the guard that decides whether it happens** —
 /// the half of [`begin_fresh_press`] that LG checklist item 40 is about, and its only caller.
 ///
-/// Split out for one blunt reason: `begin_fresh_press` calls `hide_cursor`, which acts on whatever
-/// pointer calls the process's SDL exports (resolved at run time, `app/boot.rs`), so a host test
-/// that reached it would be grading the host's SDL rather than the press. This half touches no SDL
-/// at all, so the invariant is gradeable by `make check` instead of only by a television.
+/// Split out for one blunt reason: `begin_fresh_press` hides the pointer through the platform's
+/// shell, which on a television calls whatever pointer functions the process's SDL exports (resolved
+/// at run time, `system.rs`), so a test that reached the television's shell would be grading the
+/// host's SDL rather than the press. This half touches no shell at all, so the invariant is
+/// gradeable by `make check` instead of only by a television.
 pub(crate) fn note_global_press(
     ps: &plx_media::route::PlaybackSession,
     sym: c_uint,
@@ -1307,8 +1302,7 @@ pub(crate) fn note_global_press(
     now: u32,
     viewer_paused: bool,
     hud: Option<&mut HudState>,
-    ok_armed: &mut bool,
-    press: &mut plx_ui::press::Press,
+
 ) {
     if !is_bound(sym, wcode) {
         return; // an unsupported key is not input the app acted on — see `begin_fresh_press`
@@ -1319,59 +1313,47 @@ pub(crate) fn note_global_press(
     if let Some(hud) = hud {
         hud.note_fresh_press(ps, now, viewer_paused);
     }
-    // a fresh non-OK key (navigation / BACK) while a click is armed aborts the press — spring the
-    // card back to rest WITHOUT activating (you "slid off" the control). A key the app does not
-    // bind is not sliding off anything: nothing moved, so nothing is abandoned.
-    if *ok_armed && !is_ok(sym) {
-        press.cancel();
-        *ok_armed = false;
-    }
+    // Release and cancellation are owned by the dispatcher's InputMachine.
 }
 
-/// **The unsupported-key invariant, graded.** `tools/keytable.py` grades the other half — that an
-/// unbound press moves no focus on any screen — and cannot see either of these two, because neither
-/// appears in a focus fingerprint.
+/// **The unsupported-key invariant, graded.** `tools/keytable.py` grades one half — that an unbound
+/// press moves no focus on any screen — and cannot see the HUD wake this module grades, because it
+/// appears in no focus fingerprint. The press half is graded on the real press, in the loop's tests.
 #[cfg(test)]
 mod unsupported_key_tests {
     use super::*;
 
-    /// Drive one fresh press through [`note_global_press`] and report what it left behind:
-    /// `(a click is still armed, the HUD is still dismissed)`. `press::*`, `hud_until()` and
-    /// The caller supplies the viewer's pause goal at the input boundary; the press is this
-    /// test's own `Press`.
-    fn press(ps: &plx_media::route::PlaybackSession, sym: c_uint, wcode: c_uint) -> (bool, bool) {
+    /// Drive one fresh press through [`note_global_press`] and report whether the HUD is still
+    /// dismissed afterwards. The caller supplies the viewer's pause goal at the input boundary.
+    ///
+    /// This used to report a second thing, "a click is still armed", by arming a `Press` of its own
+    /// beside the call. `note_global_press` no longer touches any press (the dispatcher's input
+    /// machine owns it, "Release and cancellation are owned by the dispatcher's InputMachine"), so
+    /// that local `Press` was never reachable from the code under test and the `armed` assertions
+    /// could not fail. They are gone, and what they meant to guard is observed on the real press, armed
+    /// by a click and left alone by an unbound key through the loop's key ingress:
+    /// `run::lifecycle_regression_tests::an_unbound_key_leaves_the_press_a_click_armed_live_and_a_direction_key_abandons_it`.
+    fn press(ps: &plx_media::route::PlaybackSession, sym: c_uint, wcode: c_uint) -> bool {
         let mut hud = HudState::IDLE;
-        let mut ok_armed = true; // a click is in flight, as if OK were still down on a card
         hud.dismissed = true; // …and the transport was hidden by hand (UP from the control row)
-        let mut p = plx_ui::press::Press::new();
-        p.begin(1_000);
-        note_global_press(ps, sym, wcode, 1_000, false,
-            Some(&mut hud), &mut ok_armed, &mut p);
-        let out = (p.is_active() && ok_armed, hud.dismissed);
-        p.cancel();
-        out
+        note_global_press(ps, sym, wcode, 1_000, false, Some(&mut hud));
+        hud.dismissed
     }
 
-    /// A key the app binds behaves exactly as it always has: it un-dismisses the HUD and aborts the
-    /// click it slid off. BACK is the case to use — it is not OK, so it takes the abort branch.
+    /// Bound keys wake the HUD.
     #[test]
-    fn a_bound_key_still_wakes_the_hud_and_aborts_the_click() {
+    fn a_bound_key_still_wakes_the_hud() {
         let ps = plx_media::route::PlaybackSession::IDLE;
         let _g = plx_base::testlock::serial();
-        let (armed, dismissed) = press(&ps, SDLK_ESCAPE, 0);
-        assert!(
-            !armed,
-            "BACK slides off the control — the press is cancelled"
-        );
-        assert!(!dismissed, "…and any key un-dismisses the transport");
+        assert!(!press(&ps, plx_ui::consts::SDLK_ESCAPE, 0), "any bound key un-dismisses the transport");
     }
 
-    /// **The regression.** An unsupported key must do NEITHER — it is not input the app acted on,
-    /// so it may not raise the transport over playback and it may not abandon a press in flight.
-    /// 269 is HOME (`SDL_SCANCODE_AC_HOME`, evdev 172 `KEY_HOMEPAGE`); every other unbound
-    /// scancode takes the same branch.
+    /// **The regression.** An unsupported key must not raise the transport over playback, it is not
+    /// input the app acted on (nor may it abandon a press in flight: that half is observed on the
+    /// real press, see [`press`]). 269 is HOME (`SDL_SCANCODE_AC_HOME`, evdev 172 `KEY_HOMEPAGE`);
+    /// every other unbound scancode takes the same branch.
     #[test]
-    fn an_unsupported_key_wakes_nothing_and_abandons_nothing() {
+    fn an_unsupported_key_wakes_nothing() {
         let ps = plx_media::route::PlaybackSession::IDLE;
         let _g = plx_base::testlock::serial();
         for (sym, wcode, what) in [
@@ -1379,9 +1361,7 @@ mod unsupported_key_tests {
             (0, 270, "AC_BACK"),
             (b'a' as c_uint, 4, "a letter"),
         ] {
-            let (armed, dismissed) = press(&ps, sym, wcode);
-            assert!(armed, "{what} must not cancel the armed click");
-            assert!(dismissed, "{what} must not un-dismiss the HUD");
+            assert!(press(&ps, sym, wcode), "{what} must not un-dismiss the HUD");
         }
     }
 
@@ -1392,9 +1372,63 @@ mod unsupported_key_tests {
     fn a_number_key_counts_as_bound_because_the_pin_keypad_types_from_it() {
         let ps = plx_media::route::PlaybackSession::IDLE;
         let _g = plx_base::testlock::serial();
-        let (armed, dismissed) = press(&ps, b'5' as c_uint, 34);
-        assert!(!armed);
-        assert!(!dismissed);
+        assert!(!press(&ps, b'5' as c_uint, 34));
+    }
+
+    /// The native pair as the loop reads it: decoded from the SDL bytes a television sends, then
+    /// handed to [`press`]. Returns the decoded action too.
+    fn native(ps: &plx_media::route::PlaybackSession, sym: c_uint, wcode: c_uint)
+        -> (Option<plx_ui::consts::Action>, bool) {
+        let (key, _) = crate::app::events::native_key_input(sym, wcode, true, plx_machine::machine::Tick::default());
+        let pair = key.pair();
+        assert_eq!((pair.sym, pair.wcode), (sym, wcode), "the decoder keeps the raw pair");
+        (key.action(), press(ps, pair.sym, pair.wcode))
+    }
+
+    /// **A native key that no action names wakes nothing, and a bound one still wakes the HUD.** Both halves through the decoder, each pair a literal, in one test so the bound
+    /// keys are the positive control for the unbound ones: the colour button (504), HOME (269),
+    /// and the wcode-only press in 48..=57. That last one is the keypad's: `pin_digit` reads the
+    /// wcode, `is_remote_bound` reads the sym only (`action_of`'s number-key arm), so a scancode that
+    /// is punctuation (`;` is 51) is no number key to this predicate and has no action.
+    #[test]
+    fn native_key_effect_an_unbound_press_wakes_nothing_and_a_bound_one_wakes_the_hud() {
+        use plx_ui::consts::Action;
+        let ps = plx_media::route::PlaybackSession::IDLE;
+        let _g = plx_base::testlock::serial();
+        let mut unbound: Vec<(c_uint, c_uint)> = vec![(0, 504), (0, 269), (0, 270), (b'a' as c_uint, 4), (0, 0)];
+        unbound.extend((48..=57).map(|wcode| (0, wcode)));
+        for (sym, wcode) in unbound {
+            let (action, dismissed) = native(&ps, sym, wcode);
+            assert_eq!(action, None, "({sym}, {wcode}) names no action");
+            assert!(dismissed, "({sym}, {wcode}) must not un-dismiss the HUD");
+        }
+        for (sym, wcode, action) in [
+            (0x4000_0051, 0, Action::Down), (13, 0, Action::Ok), (27, 0, Action::Back),
+            (0, 450, Action::Play), (0, 72, Action::Pause), (0, 452, Action::Rewind),
+            (0x4000_004e, 0, Action::PageDown), (0, 300, Action::PageUp),
+            (8, 42, Action::Backspace), (53, 34, Action::Digit(5)),
+        ] {
+            let (decoded, dismissed) = native(&ps, sym, wcode);
+            assert_eq!(decoded, Some(action), "({sym}, {wcode}) decodes to its action");
+            assert!(!dismissed, "{action:?} is bound, so it un-dismisses the HUD");
+        }
+    }
+
+    /// **The lab trigger is not a key this build has.** `labcfg::is_trigger_key` is `false` at
+    /// compile time without `lab-diagnostics` (every build the suite runs: the hostsim and default
+    /// feature sets), so no test here can arm one; the type-check of `lab-diagnostics` is `make
+    /// check`'s third feature set and compiles no test. What this build does is pinned instead: no
+    /// native pair is a trigger, and `is_bound` is exactly "has an action" for all of them, so the
+    /// fifth source of `is_bound`'s doc contributes nothing and the lab arm of the loop's ladder
+    /// never takes a key.
+    #[cfg(not(feature = "lab-diagnostics"))]
+    #[test]
+    fn native_key_effect_no_lab_trigger_exists_without_lab_diagnostics() {
+        for (sym, wcode) in [(0, 504), (0, 450), (0, 72), (0x4000_0051, 0), (13, 0), (0, 300), (8, 42), (53, 34), (0, 55), (0, 0)] {
+            let (key, _) = crate::app::events::native_key_input(sym, wcode, true, plx_machine::machine::Tick::default());
+            assert!(!plx_os::labcfg::is_trigger_key(sym, wcode), "({sym}, {wcode}) is no trigger here");
+            assert_eq!(plx_ui::consts::is_bound(sym, wcode), key.action().is_some(), "({sym}, {wcode}) is bound iff it has an action");
+        }
     }
 }
 
@@ -1477,27 +1511,139 @@ pub(crate) fn enter_profiles_from_onboard(pages: &mut plx_ui::dispatch::Dispatch
 /// property of the SURFACE, not of this function: presenting `AppArg::FirstRunConsent` mounts a
 /// `ConsentPage` holding a draft, and only its two answer pills reach `ConsentCmd::Record`.
 ///
-/// Phase 5b: the screen is the tree's, so this presents rather than opens. `bridge::open_*` is
-/// itself idempotent while the surface is up (any phase), which is what lets the three per-frame
-/// routing call sites go on simply asking.
-pub(crate) fn maybe_ask_consent(pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>) {
+/// Phase 5b: the screen is the tree's, so this presents rather than opens. Where the question is
+/// in its lifecycle is [`ConsentAsk`], the Bridge's one field for it, and this is its only writer.
+pub(crate) fn maybe_ask_consent(pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
+    ask: &mut ConsentAsk) {
     let c = plx_telemetry::telemetry::consent::current().unwrap_or_default();
-    // dev: /tmp/plxnative-consent[=<crash|product>] forces either first-run purpose even on an
-    // automated boot. This screen is suppressed BY the presence of any trigger, so without an
-    // override it cannot be reached headlessly at all. Selecting Product changes display state
-    // only; no answer is stored by a harness boot — the stage byte is where the surface STARTS,
-    // and reaching stage 1 that way skips the crash question rather than answering it.
-    if let Some(target) = crate::dev::scenarios::consent_override() {
-        // `screens::consent`'s `STAGE_PRODUCT`, spelled here because it is that module's private
-        // encoding of `SettingsPage::ConsentStage` and this is its only outside caller. The
-        // companion bit (`ERRORS_SHARED`, 0x10) is deliberately NOT set: a dev boot has answered
-        // nothing, so the product stage opens with the crash answer at its default.
-        let stage = u8::from(target.trim() == "product");
+    let facts = AskFacts {
+        // dev: /tmp/plxnative-consent[=<crash|product>] forces either first-run purpose even on an
+        // automated boot. This screen is suppressed BY the presence of any trigger, so without an
+        // override it cannot be reached headlessly at all. Selecting Product changes display state
+        // only; no answer is stored by a harness boot — the stage byte is where the surface STARTS,
+        // and reaching stage 1 that way skips the crash question rather than answering it.
+        // `screens::consent`'s `STAGE_PRODUCT` is spelled here as `1` because it is that module's
+        // private encoding of `SettingsPage::ConsentStage` and this is its only outside caller.
+        override_stage: crate::dev::scenarios::consent_override().map(|target| u8::from(target.trim() == "product")),
+        owed: plx_screens::consent::should_show(&c, crate::dev::any_trigger_present()),
+        answered: c.answered(),
+        shown: super::bridge::first_run_consent_up(pages),
+    };
+    let (next, present) = ask.step(facts);
+    *ask = next;
+    if let Some(stage) = present {
         super::bridge::open_first_run_consent_at(pages, stage);
-        return;
     }
-    if plx_screens::consent::should_show(&c, crate::dev::any_trigger_present()) {
-        super::bridge::open_first_run_consent(pages);
+}
+
+/// **Where the first-run consent question is** (implicit-state audit 2026-11-17, finding 2). It
+/// used to be no state at all: "owed" was the persisted decision, "presented" was whether a surface
+/// happened to exist, and the dev override bypassed both, so on the picker path (asked every frame)
+/// it presented the question again on the frame after each answer, forever.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum ConsentAsk {
+    /// Not presented since the last time it was owed.
+    #[default]
+    NotAsked,
+    /// The surface was presented; `overridden` when the dev override asked rather than the
+    /// persisted decision (an override answer is display-only and records nothing).
+    Presented { overridden: bool },
+    /// Answered (or the override's one presentation is spent). Asked again only if the decision is
+    /// owed again — the account signed out and `forget` cleared it.
+    Done,
+}
+
+/// What [`ConsentAsk::step`] decides from, read by its one caller.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AskFacts {
+    /// The dev override's stage, if armed.
+    pub(crate) override_stage: Option<u8>,
+    /// The persisted decision is owed on this boot (`consent::should_show`).
+    pub(crate) owed: bool,
+    /// A decision for the current policy is recorded.
+    pub(crate) answered: bool,
+    /// The first-run surface is up (any phase but Hidden).
+    pub(crate) shown: bool,
+}
+
+impl ConsentAsk {
+    /// The next state, and the stage to present at when the question must be put now. A surface
+    /// that went away is judged first: answered (or overridden) is done; lost unanswered is asked
+    /// again. The override is honoured once per process, from `NotAsked` only.
+    pub(crate) fn step(self, f: AskFacts) -> (Self, Option<u8>) {
+        let settled = match self {
+            Self::Presented { .. } if f.shown => return (self, None),
+            Self::Presented { overridden: true } => Self::Done,
+            Self::Presented { overridden: false } if f.answered => Self::Done,
+            Self::Presented { overridden: false } => Self::NotAsked,
+            other => other,
+        };
+        match settled {
+            Self::NotAsked => match (f.override_stage, f.owed) {
+                (Some(stage), _) => (Self::Presented { overridden: true }, Some(stage)),
+                (None, true) => (Self::Presented { overridden: false }, Some(0)),
+                (None, false) => (Self::NotAsked, None),
+            },
+            Self::Done if f.owed => (Self::Presented { overridden: false }, Some(0)),
+            other => (other, None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod consent_ask_tests {
+    use super::{AskFacts, ConsentAsk};
+
+    fn facts(override_stage: Option<u8>, owed: bool, answered: bool, shown: bool) -> AskFacts {
+        AskFacts { override_stage, owed, answered, shown }
+    }
+
+    /// The simulator recording's loop: the dev override on the picker path, asked every frame.
+    /// The question is presented once; after it is answered (display-only, nothing recorded) and
+    /// the surface is gone, it is never presented again.
+    #[test]
+    fn the_dev_override_presents_the_question_once() {
+        let mut ask = ConsentAsk::NotAsked;
+        let mut presented = 0;
+        for frame in 0..120 {
+            // up from the first presentation until frame 60, when the product answer prunes it
+            let shown = presented > 0 && frame < 60;
+            let (next, present) = ask.step(facts(Some(0), false, false, shown));
+            presented += usize::from(present.is_some());
+            ask = next;
+        }
+        assert_eq!(presented, 1, "the override feeds the question once");
+        assert_eq!(ask, ConsentAsk::Done);
+    }
+
+    #[test]
+    fn an_owed_question_is_presented_once_while_it_is_up() {
+        let (ask, present) = ConsentAsk::NotAsked.step(facts(None, true, false, false));
+        assert_eq!((ask, present), (ConsentAsk::Presented { overridden: false }, Some(0)));
+        assert_eq!(ask.step(facts(None, true, false, true)), (ask, None), "up: nothing more to do");
+    }
+
+    #[test]
+    fn an_answered_question_is_done_and_a_lost_one_is_asked_again() {
+        let up = ConsentAsk::Presented { overridden: false };
+        assert_eq!(up.step(facts(None, false, true, false)), (ConsentAsk::Done, None), "answered");
+        assert_eq!(up.step(facts(None, true, false, false)), (ConsentAsk::Presented { overridden: false }, Some(0)),
+            "the surface went away unanswered: put it again");
+    }
+
+    #[test]
+    fn a_question_owed_again_after_sign_out_is_asked_again() {
+        assert_eq!(ConsentAsk::Done.step(facts(None, true, false, false)),
+            (ConsentAsk::Presented { overridden: false }, Some(0)));
+        assert_eq!(ConsentAsk::Done.step(facts(Some(1), false, false, false)), (ConsentAsk::Done, None),
+            "a spent override does not come back");
+        assert_eq!(ConsentAsk::NotAsked.step(facts(None, false, false, false)), (ConsentAsk::NotAsked, None),
+            "nothing owed, no override: nothing asked");
+    }
+
+    #[test]
+    fn the_override_names_the_stage_it_starts_at() {
+        assert_eq!(ConsentAsk::NotAsked.step(facts(Some(1), false, false, false)).1, Some(1));
     }
 }
 
@@ -1566,7 +1712,7 @@ pub(crate) fn delete_outcome(leftovers: usize) -> DeleteOutcome {
 /// A leftover is a file that is still THERE. The candidate lists name `/media/internal`, which
 /// some jails mount read-only, and Linux answers EROFS from the parent's mount before it looks the
 /// child up — so an unlink refusal alone does not say a file remains. The shared rule
-/// ([`plx_platform::storage::remove_file_or_prove_absent`]) counts a refusal whose no-follow lookup finds
+/// ([`plx_os::storage::remove_file_or_prove_absent`]) counts a refusal whose no-follow lookup finds
 /// no entry as removed; a file that exists, or cannot be looked at, stays a leftover.
 fn remove_local_file(path: &std::path::Path) -> Result<(), String> {
     remove_or_prove_absent(path).map_err(|e| format!("{}: {e}", path.display()))
@@ -1575,13 +1721,13 @@ fn remove_local_file(path: &std::path::Path) -> Result<(), String> {
 /// The erase sweeps' removal rule as a plain `fn`, for the sweeps `ui/` owns
 /// ([`plx_ui::rec::erase_owned_artifacts`]), which may not name the storage layer themselves.
 pub(crate) fn remove_or_prove_absent(path: &std::path::Path) -> std::io::Result<()> {
-    plx_platform::storage::remove_file_or_prove_absent(path).map(|_| ())
+    plx_os::storage::remove_file_or_prove_absent(path).map(|_| ())
 }
 
 fn erase_runtime_logs(root: &std::path::Path) -> Vec<String> {
     let mut failures = Vec::new();
     for name in plx_base::paths::runtime_file::LOGS {
-        if name == plx_platform::storage::diagnostics::NAME {
+        if name == plx_os::storage::diagnostics::NAME {
             continue;
         }
         if let Err(error) = remove_local_file(&root.join(name)) {
@@ -1609,7 +1755,9 @@ fn sweep_local_files(persistent: impl IntoIterator<Item = std::path::PathBuf>,
 pub(crate) fn delete_all_local_data(meta: &mut plx_data::stores::metadata::MetadataStore,
     mut failures: Vec<String>) -> Vec<String> {
     // Retire the writer before the privacy sweep unlinks its log files.
-    plx_platform::playback_trace::retire();
+    plx_os::playback_trace::retire();
+    #[cfg(feature = "devtriggers")]
+    super::api::retire_state_file();
     failures.extend(sweep_local_files(
         plx_base::paths::obsolete_last_place_candidates()
             .into_iter()
@@ -1674,7 +1822,7 @@ mod delete_all_tests {
     fn absent_files_behind_a_read_only_mount_are_not_leftovers() {
         let _serial = plx_base::testlock::serial();
         let tv = Tv::new("absent-erofs");
-        let _erofs = plx_platform::storage::UnlinkFaultForTest::install(&tv.0, libc::EROFS);
+        let _erofs = plx_os::storage::UnlinkFaultForTest::install(&tv.0, libc::EROFS);
         let leftovers = sweep_local_files(tv.persistent(), &tv.runtime());
         assert!(leftovers.is_empty(), "absent files reported as leftovers: {leftovers:?}");
     }
@@ -1693,7 +1841,7 @@ mod delete_all_tests {
         let rec = tv.runtime().join("plxnative-rec");
         std::fs::write(&log, b"x").unwrap();
         std::fs::write(&rec, b"x").unwrap();
-        let _erofs = plx_platform::storage::UnlinkFaultForTest::install(&tv.0, libc::EROFS);
+        let _erofs = plx_os::storage::UnlinkFaultForTest::install(&tv.0, libc::EROFS);
         let leftovers = sweep_local_files(persistent.clone(), &tv.runtime());
         assert_eq!(leftovers.len(), persistent.len() + 2, "{leftovers:?}");
         assert!(persistent.iter().chain([&log, &rec]).all(|p| p.exists()));
@@ -1705,7 +1853,7 @@ mod delete_all_tests {
         struct Restore;
         impl Drop for Restore {
             fn drop(&mut self) {
-                plx_platform::storage::diagnostics::reset_for_test();
+                plx_os::storage::diagnostics::reset_for_test();
             }
         }
         let _restore = Restore;
@@ -1719,10 +1867,10 @@ mod delete_all_tests {
             std::fs::write(root.join(name), name.as_bytes()).unwrap();
         }
         let event = root.join(plx_base::paths::runtime_file::EVENTS);
-        let diagnostics = root.join(plx_platform::storage::diagnostics::NAME);
+        let diagnostics = root.join(plx_os::storage::diagnostics::NAME);
 
-        plx_platform::storage::diagnostics::disable();
-        plx_platform::storage::diagnostics::finish_disable(&root).unwrap();
+        plx_os::storage::diagnostics::disable();
+        plx_os::storage::diagnostics::finish_disable(&root).unwrap();
         assert!(erase_runtime_logs(&root).is_empty());
         assert!(plx_base::paths::runtime_file::LOGS
             .iter()
@@ -1854,8 +2002,8 @@ pub(crate) fn key_back(
 /// That is why the old `/tmp/plxnative-noexitconfirm` bypass went with the alert: it existed to let
 /// a headless caller quit by pressing BACK, and BACK is no longer a quit for anybody.
 pub(crate) fn back_at_root() {
-    if plx_platform::tv::home::take_root_press() {
-        plx_platform::tv::home::go_home();
+    if plx_os::tv::home::take_root_press() {
+        plx_os::tv::home::go_home();
     }
 }
 
@@ -1919,6 +2067,77 @@ mod click_is_ok_tests {
             (true, 0.0, false, false),
         ] {
             assert!(!click_is_ok(dpad, motion, on_control, transparent), "{dpad} {motion} {on_control} {transparent}");
+        }
+    }
+}
+
+/// **The pointer's hide and show reach the shell, and only when they should.** The machine owns the
+/// decision (`cur_hidden`, the D-pad mode, Back's ownership); the shell owns the act. Counted on a
+/// shell that says what it was asked, with no loop and no feature gate, so the default build grades
+/// the same calls the hostsim loop tests do.
+#[cfg(test)]
+mod pointer_hide_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    fn press_down(ptr: &mut Pointer, shell: &dyn Shell) {
+        let ps = plx_media::route::PlaybackSession::IDLE;
+        let mut down_sym = 0;
+        unsafe {
+            begin_fresh_press(&ps, Key::Down, plx_ui::consts::SDLK_DOWN, 0, 0, false, &mut down_sym, None, ptr, shell)
+        };
+    }
+
+    /// The first direction key hides (and enters the D-pad's mode), a second while the pointer is
+    /// still hidden asks for nothing, a motion shows it once and a second motion nothing more, and the
+    /// next direction key hides it again. A key that is no direction hides nothing.
+    #[test]
+    fn a_direction_key_hides_once_and_a_motion_shows_once() {
+        let _g = plx_base::testlock::serial();
+        let (platform, counted) = crate::app::platform::SwapShell::platform();
+        let shell = platform.shell;
+        let counts = || (counted.hides.load(Relaxed), counted.shows.load(Relaxed));
+        let mut ptr = Pointer::IDLE;
+        ptr.note_cursor_motion(shell);
+        assert_eq!(counts(), (0, 0), "a pointer that was never hidden is not shown");
+        let ps = plx_media::route::PlaybackSession::IDLE;
+        let mut down_sym = 0;
+        unsafe { begin_fresh_press(&ps, Key::Ok, 13, 0, 0, false, &mut down_sym, None, &mut ptr, shell) };
+        assert_eq!(counts(), (0, 0), "OK is no direction: nothing hides");
+        press_down(&mut ptr, shell);
+        assert_eq!(counts(), (1, 0), "the first direction key hides");
+        assert!(ptr.dpad_mode && ptr.cur_hidden);
+        press_down(&mut ptr, shell);
+        assert_eq!(counts(), (1, 0), "a second one, with the pointer already hidden, asks for nothing");
+        ptr.note_cursor_motion(shell);
+        assert_eq!(counts(), (1, 1), "a motion shows it");
+        assert!(!ptr.cur_hidden);
+        ptr.note_cursor_motion(shell);
+        assert_eq!(counts(), (1, 1), "...once");
+        press_down(&mut ptr, shell);
+        assert_eq!(counts(), (2, 1), "and the next direction key hides it again");
+    }
+
+    /// Back's cursor owns what it hid: a motion does not show it while Back holds it (`Wake` does),
+    /// and handing it back restores the pointer only if Back's own `Hide` was what hid it.
+    #[test]
+    fn backs_cursor_is_hidden_through_the_shell_and_restored_only_if_back_hid_it() {
+        use plx_machine::machine::{InstanceId, MachineId};
+        use plx_screens::registry::BackCursorChange;
+        let target = (MachineId::Instance(InstanceId(1)), 7);
+        let _g = plx_base::testlock::serial();
+        for already_hidden in [false, true] {
+            let (platform, counted) = crate::app::platform::SwapShell::platform();
+            let shell = platform.shell;
+            let mut ptr = Pointer::IDLE;
+            ptr.cur_hidden = already_hidden;
+            ptr.sync_back_cursor(shell, Some(target), Some((target, BackCursorChange::Hide)));
+            assert_eq!(counted.hides.load(Relaxed), 1, "Back's Hide hides through the shell");
+            ptr.note_cursor_motion(shell);
+            assert_eq!(counted.shows.load(Relaxed), 0, "a motion does not undo Back's hide while Back holds it");
+            ptr.sync_back_cursor(shell, Some(target), Some((target, BackCursorChange::Release)));
+            assert_eq!(counted.shows.load(Relaxed), usize::from(!already_hidden),
+                "release shows the pointer only if Back's own Hide had hidden it (already hidden: {already_hidden})");
         }
     }
 }

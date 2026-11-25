@@ -536,8 +536,8 @@ pub fn attach_user(body: &mut serde_json::Value, errors_id: Option<&str>) {
 /// `playback` context sits beside these, not under them) rather than replacing it — and creates one
 /// if the body had none yet.
 pub fn attach_hardware_context(body: &mut serde_json::Value) {
-    let webos = plx_platform::tv::device::info();
-    let hw = plx_platform::tv::device::device();
+    let webos = plx_os::tv::device::info();
+    let hw = plx_os::tv::device::device();
     let contexts = body
         .as_object_mut()
         .expect("event body is always a JSON object")
@@ -545,13 +545,13 @@ pub fn attach_hardware_context(body: &mut serde_json::Value) {
         .or_insert_with(|| serde_json::json!({}));
     contexts["webos"] = serde_json::json!({
         "type": "webos",
-        "name": webos.name,
+        "name": webos.webos.name,
         "release": webos.release,
         // The exact firmware build (nyx's `core_os_release`, e.g. `6.5.3-47`), which a patch within
         // one release changes and `release` does not: what a refusal is learned against.
         "build": webos.build,
-        "codename": webos.codename,
-        "api": webos.api,
+        "codename": webos.webos.codename,
+        "api": webos.webos.api,
     });
     contexts["hardware"] = serde_json::json!({
         "type": "hardware",
@@ -561,8 +561,8 @@ pub fn attach_hardware_context(body: &mut serde_json::Value) {
         // Why the three fields above may be empty: what the boot probe found in each of nyx's
         // two files (`<os_info>/<device_info>`, each `ok` / `no_keys` / `unreadable`, or
         // `unprobed`). Four fixed words, never free text.
-        "probe": plx_platform::tv::device::probe().code(),
-        "rtkmem": plx_platform::tv::sandbox::context(),
+        "probe": plx_os::tv::device::probe().code(),
+        "rtkmem": plx_os::tv::native_video::context(),
         "install": plx_base::paths::install_kind(),
     });
 }

@@ -1270,6 +1270,55 @@ class ExtraMediaAudioSelection(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_FFMPEG_AND_FFPROBE, "no ffmpeg/ffprobe")
+class ExtraMediaVideoOnly(unittest.TestCase):
+    """`--extra-media-video-only`: a file with no audio stream is served (the Tizen emulator has no audio
+    device, so its playback runs use video-only media); without the flag the same file is refused."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.clip = pathlib.Path(cls.tmp.name) / "silent.mp4"
+        subprocess.check_call([
+            "ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=size=64x64:rate=24:duration=1",
+            "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-t", "1", str(cls.clip)])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_a_file_without_audio_is_refused_unless_the_flag_says_so(self):
+        with self.assertRaises(ValueError) as why:
+            Library(movies=0, extra_media=[self.clip])
+        self.assertIn("needs video and audio", str(why.exception))
+
+    def test_the_flag_serves_it_with_no_audio_stream_and_no_audio_fields(self):
+        lib = Library(movies=0, extra_media=[self.clip], extra_media_video_only=True)
+        media = lib.items[EXTRA_MEDIA_RK_BASE]["Media"][0]
+        self.assertEqual([s["streamType"] for s in media["Part"][0]["Stream"]], [1])
+        self.assertNotIn("audioCodec", media)
+        self.assertNotIn("audioChannels", media)
+        self.assertEqual(media["container"], "mp4")
+
+    def test_the_flag_needs_extra_media(self):
+        with self.assertRaises(ValueError) as why:
+            Library(movies=0, extra_media_video_only=True)
+        self.assertIn("--extra-media", str(why.exception))
+
+    def test_the_bytes_are_served_with_ranges(self):
+        server, pms = serve(0, movies=0, extra_media=[self.clip], extra_media_video_only=True)
+        try:
+            key = get(pms, f"/library/metadata/{EXTRA_MEDIA_RK_BASE}")["Metadata"][0]["Media"][0]["Part"][0]["key"]
+            req = urllib.request.Request(f"http://127.0.0.1:{server.server_address[1]}{key}",
+                                         headers={"Range": "bytes=0-7"})
+            with urllib.request.urlopen(req) as answer:
+                self.assertEqual(answer.status, 206)
+                self.assertEqual(len(answer.read()), 8)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+@unittest.skipUnless(HAS_FFMPEG_AND_FFPROBE, "no ffmpeg/ffprobe")
 class ExtraMediaSubtitle(unittest.TestCase):
     """`--extra-media-subtitle N`: the Nth subtitle stream of an `--extra-media` file is the server-selected
     one (`selected` on it alone), the file's `default` flag untouched: the shape PMS reports when a profile's
@@ -1812,6 +1861,74 @@ class CatalogDetailFields(unittest.TestCase):
         for job in ("Director", "Writer", "Role"):
             self.assertEqual(ep[job], show[job], job)
         self.assertEqual([c["tag"] for c in ep["Role"]], ["A Voice"])
+
+
+@unittest.skipUnless(HAS_DEMO_CACHE, "no derived demo cache (make demo-library) or no ffmpeg/ffprobe")
+class CatalogImageLists(unittest.TestCase):
+    """The demo library's rows carry a PMS-shaped `Image[]`, as a modern PMS sends one with every
+    row. Without it the app reads a row as an older server's and asks the LEGACY
+    `/library/metadata/<rk>/clearLogo` for every title, which this library answers with a 404 for
+    each title in the catalog's `logo_none_approved` (Metropolis, in the Continue Watching deck);
+    the frame dump of the site film fails closed on a failed art request, so the film's render
+    died at its fifth frame on exactly that."""
+    KINDS = ("movie", "show", "season", "episode")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.lib = CatalogLibrary(CATALOG)
+        cls.pms = MockPms(cls.lib)
+        cls.catalog = json.loads(CATALOG.read_text())
+
+    def rows(self):
+        return [it for it in self.lib.items.values() if it["type"] in self.KINDS]
+
+    def title_rk(self, it):
+        """The rating key of the TITLE a row's logo belongs to: a season's or an episode's is its show's."""
+        return {"season": it.get("parentRatingKey"), "episode": it.get("grandparentRatingKey")}.get(
+            it["type"], it["ratingKey"])
+
+    def has_logo(self, it):
+        slug = next(s for s, rk in self.lib.by_slug.items() if str(rk) == str(self.title_rk(it)))
+        rec = next(r for r in self.catalog["movies"] + self.catalog["shows"] if r["id"] == slug)
+        return "logo" in rec
+
+    def test_every_row_carries_the_background_and_a_logo_only_where_its_title_has_one(self):
+        for it in self.rows():
+            with self.subTest(rk=it["ratingKey"], title=it["title"]):
+                images = {i["type"]: i["url"] for i in it["Image"]}
+                self.assertIn("coverPoster", images)
+                self.assertIn("background", images)
+                title = self.title_rk(it)
+                if self.has_logo(it):
+                    self.assertEqual(images["clearLogo"], f"/library/metadata/{title}/clearLogo/{self.lib.now}",
+                                     "a STAMPED path naming the title's key, the show's for a season or an episode")
+                else:
+                    self.assertNotIn("clearLogo", images, "a title without a logo says so by listing none")
+                self.assertEqual("snapshot" in images, it["type"] == "episode")
+
+    def test_the_deck_has_a_list_on_every_row_and_metropolis_lists_no_logo(self):
+        deck = self.lib.continue_watching()
+        self.assertGreater(len(deck), 1)
+        for it in deck:
+            self.assertIn("Image", it, f"{it['title']}: a row with no list gets the legacy logo lookup")
+        metropolis = next(it for it in deck if it["title"] == "Metropolis")
+        self.assertIn("metropolis", self.catalog["logo_none_approved"])
+        self.assertEqual({i["type"] for i in metropolis["Image"]}, {"coverPoster", "background"})
+
+    def test_every_image_a_list_names_is_served(self):
+        for it in self.rows():
+            for image in it["Image"]:
+                with self.subTest(rk=it["ratingKey"], type=image["type"]):
+                    status, content_type, data = self.pms.handle("GET", image["url"])
+                    self.assertEqual(status, 200, image["url"])
+                    self.assertTrue(content_type.startswith("image/") and data)
+
+    def test_the_stamped_logo_is_the_logo_the_unstamped_path_served(self):
+        rk = self.lib.by_slug["sintel"]
+        stamped = self.lib.image(f"/library/metadata/{rk}/clearLogo/{self.lib.now}", 600, 240)
+        self.assertIsNotNone(stamped)
+        self.assertEqual(stamped, self.lib.image(f"/library/metadata/{rk}/clearLogo", 600, 240),
+                         "the logo the film and the stills draw is the same bytes under either path")
 
 
 class DetailFixtures(unittest.TestCase):

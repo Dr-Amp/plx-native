@@ -80,7 +80,7 @@ but a photograph could show it (`gfx.rs`, at the `glBlendFuncSeparate` call).
 
 ### Tier 1 — `make check`
 
-`cargo +$(RUST_TOOLCHAIN) test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_playback_contract -p plx_play_uri -p plx_play_feed -p plx_media_codecs -p plx_appkit -p plx_screens`, preceded by `make lint` (three **named** clippy lints —
+`cargo +$(RUST_TOOLCHAIN) test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_os -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_playback_contract -p plx_play_uri -p plx_play_feed -p plx_media_codecs -p plx_appkit -p plx_screens -p plx_shell_sdl -p plx_platform_webos -p plx_platform_desktop -p plx_platform_tizen -p plx_owp`, preceded by `make lint` (three **named** clippy lints —
 `ifs_same_cond`, `same_functions_in_if_condition`, `if_same_then_else` — the shadowed-branch gate),
 and followed by **three** host checks that are easy to forget are in here: `python3 ci/flavor.py
 --selftest` (the flavour transform, whose central assertion is that the STABLE transform is the
@@ -94,9 +94,11 @@ cargo can see a python file).
 everybody quotes is `cargo test --lib` alone, and that part is itself tens of seconds now (the per-crate test binaries, `UNIT_SUITE` in the Makefile, run side by side through
 `tools/cargo-test-parallel.py`; `make test-crate C=<crate>` runs just the one you touched); end to end the
 gate runs in MINUTES warm. The bulk of it is `python3 tests/test_harness.py`, which shells out to
-`ci/check-deps.sh` (11 s a run) once or more per self-test to prove each structure gate still
-catches a planted violation — 661 s of a 1100 s run, measured 2026-10-01 on a cold lane at load
-~5, before those self-tests moved to private tree copies and a thread pool (175 s after). The lab selftest's **~7 s is mostly two DELIBERATE rate-limit waits** — so
+`ci/check-deps.sh` to prove each structure gate still catches a planted violation: each DepGates
+self-test runs only the rule or rules it plants for (`--only <rules>`), and only the whole-script
+tests, with the one shared run over the real tree, run every rule. That was 661 s of a 1100 s run,
+measured 2026-10-01 on a cold lane at load ~5, before those self-tests moved to private tree
+copies and a thread pool (175 s after). The lab selftest's **~7 s is mostly two DELIBERATE rate-limit waits** — so
 a ten-second-plus pause there is the target working, not a hang. (That step
 also SSDP-probes the LAN to report whether a UPnP gateway is present; still no television, still no
 lock.) Do not write a new number here: measure it if you need one — this file has already carried a
@@ -106,7 +108,7 @@ lock.) Do not write a new number here: measure it if you need one — this file 
 Count it yourself if you need the number:
 
 ```sh
-cd rust-modules && cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_playback_contract -p plx_play_uri -p plx_play_feed -p plx_media_codecs -p plx_appkit -p plx_screens -- --list | grep -c ': test'
+cd rust-modules && cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_os -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_playback_contract -p plx_play_uri -p plx_play_feed -p plx_media_codecs -p plx_appkit -p plx_screens -p plx_shell_sdl -p plx_platform_webos -p plx_platform_desktop -p plx_platform_tizen -p plx_owp -- --list | grep -c ': test'
 ```
 
 **Run it on the pinned toolchain.** `make check` uses `cargo +$(RUST_TOOLCHAIN)`, the `channel` of

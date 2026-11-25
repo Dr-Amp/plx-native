@@ -635,7 +635,7 @@ impl SessionAdapter {
         let cancelled = Arc::clone(&pending.cancelled);
         pending.ticket = plx_base::storage_worker::submit(move || {
             let result = if cancelled.load(Ordering::Acquire) { Err(()) } else { write_credentials(&plan, &cancelled) };
-            plx_machine::idle::wake();
+
             plx_machine::present::wake_from_worker();
             result
         }).ok();
@@ -853,7 +853,7 @@ impl SessionAdapter {
             let diagnostics = all_local;
             #[cfg(test)]
             let diagnostics = diagnostics && self.resource_test_io.is_none();
-            if diagnostics { plx_platform::storage::diagnostics::disable(); }
+            if diagnostics { plx_os::storage::diagnostics::disable(); }
             self.erasures.push_back(PendingErase {
                 epoch, all_local, diagnostics, ticket: None, retry_at: crate::app::clock::now(), incomplete: 0,
                 kept: None,
@@ -881,7 +881,7 @@ impl SessionAdapter {
             }
             plx_plex::plex::session::revoke_cached_session();
             let mut failures: Vec<String> = if diagnostics {
-                plx_platform::storage::diagnostics::finish_disable(plx_base::paths::runtime_dir())
+                plx_os::storage::diagnostics::finish_disable(plx_base::paths::runtime_dir())
                     .err()
                     .into_iter()
                     .collect()
@@ -889,7 +889,7 @@ impl SessionAdapter {
                 Vec::new()
             };
             if all_local { failures.extend(erasure.preference_failures); }
-            plx_machine::idle::wake();
+
             plx_machine::present::wake_from_worker();
             EraseWorkerOutcome { complete, failures, kept: erasure.retained }
         }).ok();
@@ -916,7 +916,7 @@ impl SessionAdapter {
                 return None;
             }
             Ok(outcome) => {
-                plx_platform::i18n::set_saved_preference(outcome.kept.language);
+                plx_os::i18n::set_saved_preference(outcome.kept.language);
                 outcome.failures
             }
         };
@@ -938,7 +938,7 @@ impl SessionAdapter {
                         super::super::input::remove_or_prove_absent).len())
                     } else { 0 }; // Other host cache/runtime sweeps remain disabled in resource tests.
                 }
-                plx_platform::imgcache::clear();
+                plx_os::imgcache::clear();
                 if all_local {
                     let leftovers = super::super::input::delete_all_local_data(meta, worker_failures);
                     if super::super::input::delete_outcome(leftovers.len()).report_leftovers {
@@ -1048,7 +1048,7 @@ impl SessionAdapter {
     pub(crate) fn claim_root_press(&mut self) -> bool {
         if self.controlled_home { return false; }
         match &mut self.resources {
-            Resources::Live { .. } => plx_platform::tv::home::take_root_press(),
+            Resources::Live { .. } => plx_os::tv::home::take_root_press(),
             #[cfg(test)]
             Resources::Fixture(resources) => std::mem::replace(&mut resources.root_press_available, false),
         }
@@ -1059,8 +1059,8 @@ impl SessionAdapter {
         match &mut self.resources {
             Resources::Live { .. } => {
                 match super::super::input::after_cancel(resumed) {
-                    super::super::input::AfterCancel::BackedOut => plx_platform::tv::home::release_root_press(),
-                    super::super::input::AfterCancel::Home => plx_platform::tv::home::go_home(),
+                    super::super::input::AfterCancel::BackedOut => plx_os::tv::home::release_root_press(),
+                    super::super::input::AfterCancel::Home => plx_os::tv::home::go_home(),
                 }
             }
             #[cfg(test)]
@@ -1479,11 +1479,11 @@ mod tests {
     /// The webOS 4.10.2 mount: the session candidate does not exist and every unlink in its
     /// directory answers EROFS. Returns the fault guard and the adapter.
     fn erase_behind_a_read_only_mount(session: &plx_plex::plex::session::TempSession,
-        mt: &plx_base::task::MainThread) -> (plx_platform::storage::UnlinkFaultForTest, SessionAdapter) {
+        mt: &plx_base::task::MainThread) -> (plx_os::storage::UnlinkFaultForTest, SessionAdapter) {
         plx_plex::plex::session::save(&plx_plex::plex::session::Session {
             client_id: "install".into(), account_token: "old".into(), ..Default::default() });
         std::fs::remove_file(session.path()).unwrap();
-        let erofs = plx_platform::storage::UnlinkFaultForTest::install(session.path().parent().unwrap(), libc::EROFS);
+        let erofs = plx_os::storage::UnlinkFaultForTest::install(session.path().parent().unwrap(), libc::EROFS);
         (erofs, SessionAdapter::live_resources_for_test(mt, false))
     }
 
@@ -1534,22 +1534,22 @@ mod tests {
     /// next-launch preference the Language screen shows.
     #[test]
     fn signout_keeps_the_install_language_and_only_delete_all_resets_it() {
-        use plx_platform::i18n::Preference;
+        use plx_os::i18n::Preference;
         use plx_plex::plex::session::UiResolution;
         let _serial = plx_base::testlock::serial();
         let session = plx_plex::plex::session::TempSession::new("erase-language");
         struct Restore(Preference);
         impl Drop for Restore {
-            fn drop(&mut self) { plx_platform::i18n::set_saved_preference(self.0); }
+            fn drop(&mut self) { plx_os::i18n::set_saved_preference(self.0); }
         }
-        let _restore = Restore(plx_platform::i18n::saved_preference());
+        let _restore = Restore(plx_os::i18n::saved_preference());
         plx_plex::plex::session::save(&plx_plex::plex::session::Session {
             client_id: "install".into(), account_token: "old".into(), ..Default::default() }
             .with_ui_resolution(UiResolution::Hd720));
         assert!(plx_plex::plex::session::set_language(Preference::Be), "setup: a durable language");
         let relaunch = || {
             plx_plex::plex::session::redirect_for_test(Some(session.path()));
-            plx_platform::i18n::set_saved_preference(Preference::System);
+            plx_os::i18n::set_saved_preference(Preference::System);
             plx_plex::plex::session::load()
         };
         let mt = unsafe { plx_base::task::MainThread::assume() };
@@ -1560,7 +1560,7 @@ mod tests {
         plx_base::storage_worker::drain_for_test();
         assert!(matches!(adapter.take_erased(&mut meta),
             Some(plx_session::auth::owner::SessionEvent::Erased { epoch: 1, .. })));
-        assert_eq!(plx_platform::i18n::saved_preference(), Preference::Be,
+        assert_eq!(plx_os::i18n::saved_preference(), Preference::Be,
             "sign-out must not change the confirmed next-launch language");
         let signed_out = relaunch();
         assert!(signed_out.account_token.is_empty(), "sign-out still revokes the credential");
@@ -1569,12 +1569,12 @@ mod tests {
         assert_eq!(signed_out.ui_resolution(), UiResolution::Hd720,
             "and the install-wide Interface resolution");
 
-        plx_platform::i18n::set_saved_preference(Preference::Be);
+        plx_os::i18n::set_saved_preference(Preference::Be);
         assert!(adapter.begin_erase(2, true, &mut meta).is_none());
         plx_base::storage_worker::drain_for_test();
         assert!(matches!(adapter.take_erased(&mut meta),
             Some(plx_session::auth::owner::SessionEvent::Erased { epoch: 2, .. })));
-        assert_eq!(plx_platform::i18n::saved_preference(), Preference::System,
+        assert_eq!(plx_os::i18n::saved_preference(), Preference::System,
             "Delete all local data resets the confirmed next-launch language");
         assert_eq!(relaunch().language, Preference::System,
             "Delete all local data must not leave the language behind on disk");
@@ -1718,7 +1718,8 @@ mod tests {
         plx_plex::plex::session::revoke_cached_session();
         let mut init = SessionInit::captured((*disk).clone());
         init.epoch = 1;
-        init.pending.insert(1, Pending { key: SessionWorkKey { epoch: 1, op: SessionOp::Ready },
+        // Generic adapter/OCC/durability fixtures use background correlation, not a Ready handoff.
+        init.pending.insert(1, Pending { key: SessionWorkKey { epoch: 1, op: SessionOp::ServerRoster },
             expected: Identity::of(&disk), lifecycle: None, last_arrival: Some(0),
             phase: StreamPhase::Running, capture: None,
             admission: plx_session::auth::owner::AdmissionState::NotRequested });
@@ -1757,7 +1758,7 @@ mod tests {
         let disk = plx_plex::plex::session::peek();
         let mut init = SessionInit::captured((*disk).clone());
         init.epoch = 1;
-        init.pending.insert(1, Pending { key: SessionWorkKey { epoch: 1, op: SessionOp::Ready },
+        init.pending.insert(1, Pending { key: SessionWorkKey { epoch: 1, op: SessionOp::ServerRoster },
             expected: Identity::of(&disk), lifecycle: None, last_arrival: Some(0),
             phase: StreamPhase::Running, capture: None,
             admission: plx_session::auth::owner::AdmissionState::NotRequested });
@@ -1826,7 +1827,7 @@ mod tests {
         let disk = plx_plex::plex::session::peek();
         let mut init = SessionInit::captured((*disk).clone());
         init.epoch = 1;
-        init.pending.insert(1, Pending { key: SessionWorkKey { epoch: 1, op: SessionOp::Ready },
+        init.pending.insert(1, Pending { key: SessionWorkKey { epoch: 1, op: SessionOp::ServerRoster },
             expected: Identity::of(&disk), lifecycle: None, last_arrival: Some(0),
             phase: StreamPhase::Running, capture: None,
             admission: plx_session::auth::owner::AdmissionState::NotRequested });
@@ -2016,7 +2017,7 @@ mod tests {
         struct ClearInjectedFailure;
         impl Drop for ClearInjectedFailure {
             fn drop(&mut self) {
-                plx_platform::storage::clear_injected_commit_failure_for_test();
+                plx_os::storage::clear_injected_commit_failure_for_test();
             }
         }
         let _clear_injected_failure = ClearInjectedFailure;
@@ -2044,7 +2045,7 @@ mod tests {
         let disk = plx_plex::plex::session::peek();
         let mut init = SessionInit::captured((*disk).clone());
         init.epoch = 1;
-        init.pending.insert(1, Pending { key: SessionWorkKey { epoch: 1, op: SessionOp::Ready },
+        init.pending.insert(1, Pending { key: SessionWorkKey { epoch: 1, op: SessionOp::ServerRoster },
             expected: Identity::of(&disk), lifecycle: None, last_arrival: Some(0),
             phase: StreamPhase::Running, capture: None,
             admission: plx_session::auth::owner::AdmissionState::NotRequested });
@@ -2064,7 +2065,7 @@ mod tests {
         // the record has actually been renamed into place (the real production seam; see
         // `storage::JsonStore::commit`), so `save_locked_with_authority` takes the `!durable`
         // branch and falls through to the legacy write, which succeeds.
-        plx_platform::storage::inject_next_commit_failure_for_test(plx_platform::storage::CommitStage::ParentSync);
+        plx_os::storage::inject_next_commit_failure_for_test(plx_os::storage::CommitStage::ParentSync);
 
         let reply = adapter.commit(owner.commit_permit(1, 1, 0).unwrap(), &plan);
         // The registry/admission bookkeeping is unrelated to this finding; only the completion's
@@ -2076,7 +2077,7 @@ mod tests {
         assert!(
             matches!(completion.outcome,
                 plx_plex::plex::session::async_persistence::CompletionOutcome::Uncertain {
-                    stage: plx_platform::storage::CommitStage::ParentSync, ..
+                    stage: plx_os::storage::CommitStage::ParentSync, ..
                 }),
             "an Uncertain canonical commit must surface as Uncertain even though the legacy \
              fall-through write succeeded — it must NEVER be reported as Durable: {:?}",
@@ -2111,8 +2112,8 @@ mod tests {
     /// `client_id` makes `update_with_outcome` refuse before `edit` ever runs.
     #[test]
     fn a_fresh_sign_in_over_an_unopenable_envelope_is_persisted_for_the_next_launch() {
-        use plx_session::auth::owner::{CommitAdmission, CommitDelta, CredentialPatch, Identity, Pending,
-            PendingCommit, SessionInit, SessionMachine, StreamPhase};
+        use plx_session::auth::owner::{CommitAdmission, Command, CredentialPatch, Identity, SessionEvent, SessionFx,
+            SessionInit, SessionMachine};
         use plx_plex::plex::session::async_persistence::PersistencePurpose;
         let _serial = plx_base::testlock::serial();
 
@@ -2184,15 +2185,21 @@ mod tests {
 
         let disk = plx_plex::plex::session::peek();
         let mut init = SessionInit::captured((*disk).clone());
-        init.epoch = 1;
-        init.pending.insert(1, Pending { key: SessionWorkKey { epoch: 1, op: SessionOp::Login },
-            expected: Identity::of(&disk), lifecycle: None, last_arrival: Some(0),
-            phase: StreamPhase::Running, capture: None,
-            admission: plx_session::auth::owner::AdmissionState::NotRequested });
-        init.pending_commit = Some(PendingCommit { req: 1, epoch: 1, arrival: 0, terminal: true,
-            writes_credentials: true, receipt: None, delta: CommitDelta::default(),
-            admitted_revision: None, purpose: Some(PersistencePurpose::Final), fresh: true });
-        let owner = SessionMachine::from_init(init);
+        // Capture the completed fresh sign-in, retaining the Locked disk identity as its OCC fence.
+        init.phase = plx_session::auth::Phase::Ready;
+        init.apply_pending = true;
+        init.authorized_in_flow = true;
+        init.persisted.client_id = "cid-fresh".into();
+        init.persisted.account_token = "acct".into();
+        init.persisted.server.address = "127.0.0.1".into();
+        init.persisted.server.port = 32400;
+        init.persisted.server.token = "synthetic-pms".into();
+        init.persisted.user.token = "synthetic-pms".into();
+        let mut owner = SessionMachine::from_init(init);
+        let effects = plx_session::auth::owner::scenarios::step(&mut owner, SessionEvent::Command(Command::TakeReady));
+        assert!(matches!(effects.as_slice(), [SessionFx::Commit { req: 1, epoch: 1, arrival: 0, plan }]
+            if plan.purpose == PersistencePurpose::Final
+                && plan.authority == plx_plex::plex::session::SaveAuthority::FreshReauthentication));
 
         let mut next = (*disk).clone();
         next.client_id = "cid-fresh".into();
@@ -2256,7 +2263,7 @@ mod tests {
             let expected = Identity::of(&disk);
             let mut init = SessionInit::captured((*disk).clone());
             init.epoch = 1;
-            init.pending.insert(1, Pending { key: SessionWorkKey { epoch: 1, op: SessionOp::Ready },
+            init.pending.insert(1, Pending { key: SessionWorkKey { epoch: 1, op: SessionOp::ServerRoster },
                 expected: expected.clone(), lifecycle: None, last_arrival: Some(0),
                 phase: StreamPhase::Running, capture: None,
                 admission: plx_session::auth::owner::AdmissionState::NotRequested });
@@ -2286,12 +2293,35 @@ mod tests {
     }
 
     #[test]
+    fn fixture_adapter_has_no_permit_for_a_forged_idle_ready_commit() {
+        use plx_session::auth::owner::{AdmissionState, CommitDelta, Identity, Pending, PendingCommit,
+            SessionInit, SessionMachine, StreamPhase};
+        let disk = plx_plex::plex::session::Session { client_id: "synthetic-client".into(), ..Default::default() };
+        let mut init = SessionInit::captured(disk.clone());
+        init.pending.insert(1, Pending { key: SessionWorkKey { epoch: 1, op: SessionOp::Ready },
+            expected: Identity::of(&disk), lifecycle: None, last_arrival: Some(0), phase: StreamPhase::Running,
+            capture: None, admission: AdmissionState::NotRequested });
+        let mut delta = CommitDelta::default();
+        delta.ready = Some(false);
+        init.pending_commit = Some(PendingCommit { req: 1, epoch: 1, arrival: 0, terminal: true,
+            writes_credentials: true, receipt: None, delta, admitted_revision: None, purpose: None, fresh: false });
+        let expected = serde_json::to_value(&init).unwrap();
+        let owner = SessionMachine::from_init(init);
+        let mut adapter = SessionAdapter::fixture_with(disk);
+        assert!(owner.commit_permit(1, 1, 0).is_none());
+        assert_eq!(serde_json::to_value(owner.snapshot_init()).unwrap(), expected);
+        assert!(adapter.fixture_resources().disk.account_token.is_empty());
+        assert!(adapter.fixture_resources().profile.is_none());
+        assert!(adapter.fixture_resources().registry_writes.is_empty());
+    }
+
+    #[test]
     fn fixture_commit_uses_latest_preferences_and_never_writes_another_adapter() {
         use plx_session::auth::owner::{CommitDelta, CredentialPatch, Identity, Pending, PendingCommit,
             SessionInit, SessionMachine, StreamPhase};
         let disk = plx_plex::plex::session::Session { client_id: "synthetic-client".into(), ..Default::default() };
         let mut init = SessionInit::captured(disk.clone());
-        init.pending.insert(1, Pending { key: SessionWorkKey { epoch: 1, op: SessionOp::Ready },
+        init.pending.insert(1, Pending { key: SessionWorkKey { epoch: 1, op: SessionOp::ServerRoster },
             expected: Identity::of(&disk), lifecycle: None, last_arrival: Some(0),
             phase: StreamPhase::Running, capture: None, admission: plx_session::auth::owner::AdmissionState::NotRequested });
         init.pending_commit = Some(PendingCommit { req: 1, epoch: 1, arrival: 0, terminal: true,

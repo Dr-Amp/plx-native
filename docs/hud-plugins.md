@@ -186,7 +186,7 @@ Captions
   (`player_hud.rs:155-164`). Readers of the band: `player_hud.rs:15`, `:155-163`, `:304-322`, `:477`;
   `text_style.rs:68`, `:192-195`; `screens/src/player/ass_subtitles.rs:271` (test `:398`);
   `media/src/player/ass/tests/synth.rs:443-447`; `plex/src/plex/session.rs:1076` (doc). Media cannot name
-  appkit (`ci/module-layers.ini` `[media] uses = base machine platform gfx net plex telemetry data`).
+  appkit (`ci/module-layers.ini` `[media] uses = base machine os gfx net plex telemetry data`).
   Captions drew first and the HUD over them (`screens/src/player/mod.rs:1513-1525`, `:1539-1541`), so
   an open Info card (top 668) or strip (684) covered a caption lifted to 780 until PR17, which lifts the
   caption clear of it and draws it above the section (section "Captions").
@@ -195,7 +195,7 @@ Captions
   What must be inside is what the viewer has to read or press" (`:88-93`).
 
 Layers, Sans-IO, settings, replay
-- F30. `ci/module-layers.ini`: `[ui] uses = base machine platform gfx`; `[data]` members by name;
+- F30. `ci/module-layers.ini`: `[ui] uses = base machine os gfx`; `[data]` members by name;
   `[appkit] members = appkit`; a new top-level module "fails the gate until it is placed here"; `[data]
   uses` has no `ui` (`:120`). `ui/src/CLAUDE.md:279`: the ui library is "never an application type".
 - F31. `docs/sans-io.md:12-17`: a machine "starts no worker, makes no network, storage or LS2 call, and
@@ -249,7 +249,7 @@ Other subsystems the plan touches
   reader exists, private (`ui/src/rec/strict_json.rs`, `mod strict_json;` at `ui/src/rec.rs:40`); no JSON
   Schema crate (`grep -c 'name = "schemars"\|name = "jsonschema"' Cargo.lock` prints 0); `plx_ui` already
   depends on `serde_json` (`ui/Cargo.toml:50`). The lint host is the existing `plxnative-sim` bin
-  (`Cargo.toml:64-67`, `required-features = ["hostsim"]`); dev triggers are the default `devtriggers`
+  (`Cargo.toml:64-67`, `required-features = ["sim"]`); dev triggers are the default `devtriggers`
   feature, absent from the shipping `--no-default-features` set (`Cargo.toml:73`, `:88`).
 
 ## Decisions (with reasons)
@@ -1496,7 +1496,7 @@ the television's. `plxnative-sim --hud-lint` prints every state's cost beside it
 ## Storage per install mode
 
 New `paths::hud_candidates()` on F39's pattern, keyed by `app_id()`:
-0. a steerable (hostsim) build: `in_runtime_dir("huds")` FIRST, so simulators never share one store;
+0. a steerable (`sim`) build: `in_runtime_dir("huds")` FIRST, so simulators never share one store;
 1. `/media/developer/{id}-huds/` (Dev Mode: rw, survives reinstall);
 2. `/media/internal/.{id}-huds/` (the HBC/cryptofs jail's persistent rw location);
 3. `/media/developer/temp/{id}-huds/` if (1) is refused, created owner-only like the image cache;
@@ -1906,11 +1906,11 @@ in `hudpacks/address.rs`, the store's Fetch / Fetched / InstallOffer / DeclineOf
 row and the offer prompt. Verified on the host (parser, store, runner and page tests; the bounded door against a local
 server). STILL OWED on the set: a real GitHub release fetch and the CA question.
 
-PR12. Registry repository (shipped): [plxnative-huds](https://github.com/GLinnik21/plxnative-huds) with CI
+PR12. Registry repository (shipped): [plxnative-huds](https://github.com/plxnative/plxnative-huds) with CI
 (lint, xvfb previews, diff), the publisher (index, original-byte packs, revoked list),
 [Pages](https://huds.plxnative.com/), and the authoring kit (`AGENTS.md`, `llms.txt`, `AUTHORING.md`,
 examples, schema mirror and schema/parser agreement test); this repo publishes the `plxnative-sim` artifact.
-[Seeded PR #1](https://github.com/GLinnik21/plxnative-huds/pull/1) passed 70 Reference and 32 Minimal native Linux
+[Seeded PR #1](https://github.com/plxnative/plxnative-huds/pull/1) passed 70 Reference and 32 Minimal native Linux
 states, all eleven languages, and the two-iteration authoring exercise. Public readback matched all 87 catalog files.
 Immutable per-release pins select the oldest compatible app. App-release dispatch and the weekly re-lint backstop
 record `unfit` and `app.max` and deduplicate author issues; incompatible executable protocol fixtures exercise failure
@@ -1918,7 +1918,7 @@ and recovery. A live app probe triggered the registry receiver and its green, la
 actual stable app release carrying the SDK remains a future observation; the current bootstrap is a source-bound
 development utility. The real TV/Linux corpus measures 12,276 widths and sets per-rung registry-only skew margins
 of 4–9 px, leaving TV admission unchanged. The registry's
-[acceptance record](https://github.com/GLinnik21/plxnative-huds/blob/main/IMPLEMENTATION.md) links the exact runs,
+[acceptance record](https://github.com/plxnative/plxnative-huds/blob/main/IMPLEMENTATION.md) links the exact runs,
 source pins and verification evidence.
 
 PR13. Gallery (shipped, behind a flavour gate until PR14): a Settings FormTable page with preview art through the image cache, the refresh policy, updates by
@@ -1958,8 +1958,15 @@ editor stays later. Verified on the host (the store, the page, the tool against 
 client).
 On a debug build on the television, with a dev-source install seeded by hand, Play on its row fetched the next
 `tools/hud-dev` build over the home network and showed the install offer as a development source; Install replaced it,
-the store kept the address, and the Remove row took it out. Not verified on the set: typing an address into "Install
-from address", because the remote harness cannot type into that field (its text token reaches only Search).
+the store kept the address, and the Remove row took it out. Typing an address into "Install from address" was verified
+on the set too (debug build, 2026-11-19): the remote harness's `txt:` token goes to any page whose keyboard is up
+(`bridge::text_owner`, PR #1428), and sent one character per token in a FIFO batch after the one carrying the OK that
+raised the keyboard, the typed `http://` address on the Mac's RFC 1918 address showed in the row; OK fetched it and
+showed the install offer as a development source. In the same batch as that OK a token finds no owner yet and lands in
+`textinput`'s unread queue. While the fetch was held open, the HUD-folder row below it was disabled and OK on it opened
+nothing; it was enabled again once the fetch ended. Opened again, the field still holds the address typed before, so the
+harness sends `clear` before a new one. Not determined on the set: text typed on the LG system keyboard itself (its
+`SDL_TEXTINPUT`), which the harness cannot press.
 
 PR16. `fuzz/`, a `cargo fuzz` package outside the `rust-modules` workspace: one libFuzzer target per untrusted-input
 parser (`admit`, `bundle::read`, `bundle::archive::read`, `svg_subset::check_asset`, `address::parse`,

@@ -125,7 +125,7 @@ copy a tile opens is chosen current server first, then owned, then shared, Reach
 **The other direction.** A `PmsMovie` carries `guid` and `show_guid` (an episode's `grandparentGuid`, a season's `parentGuid`: the server sends a season no `grandparentGuid`),
 each decoded once to `[u8; 12]`. The Detail and Home hero discs and the hold-menu rows use them to name the catalog
 id. `resolve_catalog_hex(known, fetch)` (`plex/models.rs`) is the helper for a row that lacks one: it
-fetches `client.metadata(rk or show_rk).guid` only when the id is not already known. A hold-menu card
+fetches `client.metadata_background(rk or show_rk).guid` only when the id is not already known. A hold-menu card
 whose row carries no guid asks for it (`WatchlistStore::want_hex`, a worker reading the item's own
 server record, an episode's SHOW record): the menu being opened omits the row, the next one offers it
 once the record named a portable id (tests in `app/watchlist_press_tests.rs`). The Detail disc reads
@@ -192,8 +192,9 @@ open. The plan's `{hex}` keying for all three is not implemented; the owner has 
 the difference. The Remove row's wording is `Remove Show...` for an episode (plan 1.8), not the
 brief's `Remove Show from Watchlist`.
 
-**plex.tv unreachable.** The page shows the full-screen read-out with Retry (a populated list is never
-blanked). Detail, Home hero and catalog controls draw the outline face when membership is unknown, the item-menu
+**plex.tv unreachable.** With no list landed, the page shows the full-screen read-out with Retry. A list that
+has landed, populated or empty, is never blanked: an empty Watchlist keeps its empty read-out and its item-menu
+rows. Detail, Home hero and catalog controls draw the outline face when membership is unknown, the item-menu
 row is omitted when there is no face to offer, and a press flips then reverts. Reproduce with
 `/tmp/plxnative-nowan` or the failing-closure tests.
 
@@ -258,10 +259,12 @@ loaded yet (a matched copy whose facts have not arrived) leaves the wash on its 
 the flat surface is for a page that has no key and for a title that has none.
 
 **The menus' glass (DS6).** The Sort & Filter panel and the hold menu are glass on frozen ground
-(`ui::popover_glass`): the panel's body shows the modal dim's latched field and its rim refracts the
-host snapshot taken once when the hold menu opened (the Sort & Filter panel's is retaken once when the
-reflow a click started has stopped, below), with the frame's dim applied to both. Nothing behind
-the hold menu is re-rendered or re-blurred while it opens, stands or closes, and the page under it
+(`ui::popover_glass`): the panel's body is a frost of the page (one blur of the host snapshot with the
+modal dim baked in, built once per snapshot; the modal dim's latched field is the fallback body) and
+its rim refracts the host snapshot taken once when the hold menu opened, with the frame's dim applied
+to the rim's snapshot at composite. The Sort & Filter panel's snapshot is retaken once when the
+reflow a click started has stopped (below), and its frost is rebuilt once after that retake. Nothing
+behind the hold menu is re-rendered while it opens, stands or closes, and the page under it
 does not move until it has let go (the Remove landing above). **The Sort & Filter menu shows each
 click**: its value reaches the grid at once and the cards reflow under the open panel (a card that
 changes slot in its row slides, one that changes row crossfades, the longest mover on top, a new
@@ -323,8 +326,10 @@ What the PMS notification feed (`docs/pms-api.md` section 9) does and does not c
   `filters=playing,timeline`; a finished movie or show create or delete (`TimelineEntry` state 5 with no `metadataState`, and
   state 9, which is UNVERIFIED: no delete has been captured) owes the Watchlist one re-match of that server (`stores::notify_map`, plan §1.11 B(a)):
   a delete of the item a tile is matched to asks again about that guid, a create asks again about the
-  titles of that kind the server was not seen to hold (40 guids to a request). It is made at most once
-  per quiet-refetch spacing per server and kind, only once the list has loaded and only when a re-read
+  titles of that kind the server was not seen to hold (40 guids to a request). It is made once the
+  server's feed has gone quiet (no library entry for 10 s, or 60 s since the oldest unspent one, so a
+  scan that never stops still refreshes about once a minute; #1458), at most once per quiet-refetch
+  spacing per server and kind, only once the list has loaded and only when a re-read
   is allowed, and the tile flips when the answer lands, with the page open or not. A feed that came back
   after a gap re-asks the server's titles whole. The `timeline` frame shape was captured from an owned server
   (`docs/pms-api.md` section 9, with the measured frame rates); this path is tested against frames

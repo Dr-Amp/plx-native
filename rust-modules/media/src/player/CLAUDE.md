@@ -27,7 +27,7 @@ set, not production source, control or release coverage. Boot now installs a pro
 and source qualification port. The port's production qualifier returns Unknown (but for a viewer's own
 Playback engine opt-in, `OriginalRequest::uri_opt_in`, below) and the evidence it reports has no certified
 capabilities, so ordinary routes still choose Feed. The driver itself is configured with what an opted-in
-viewer certifies (`ProductEvidence::opted_in`), and only a qualification ever offers it a source. Host fixtures inject qualified source
+viewer certifies (`ProductEvidence::opt_in_certifies`, which `ProductEvidence::opted_in` applies to the evidence's own pair), and only a qualification ever offers it a source. Host fixtures inject qualified source
 and firmware evidence to exercise source, control and release logic.
 
 The product driver also carries the ACB plane binding the probe proved (`Binding::Acb` in
@@ -44,11 +44,16 @@ accepted pause/resume to the plane once the bind has completed. Release is `UNLO
 plane owner's fence on that call's completion callback, pumped from the backend's `poll`
 (`docs/measurements/acb-release-fence-2026-11-04.md`); a quarantine until process exit is only the
 outcome of a failed fence, not the normal one. `plx_play_uri::backend::product_binding` selects it at
-composition (ACB display mode and the URI engine's own boot handle, initialized, player type 0: the boot creates it beside Feed's player type 10 handle, each once and never destroyed, and the plane owner binds one at a time across both); media's `uri_preflight` only receives the result as
-`ProductEvidence::unqualified_on(.., binding)`. `ProductEvidence::permits` and
-`ResolvePort::could_qualify_pms` accept `Binding::Acb` as an offerable display path beside an exported
-canvas, but only through `certified` capabilities: the production evidence certifies nothing and
-`ProductQualifier` answers `Unknown`, which is what keeps the ACB binding from being offered a source.
+composition (an ACB display; the URI engine's own handle, player type 0, is created ON DEMAND when the first source is OFFERED (`UriDriver::ready_to_start`, asked by `offer_qualified_uri`, runs `PlaneOwner::ensure_handle`; the driver's gate `Op::Check` makes it if nothing did), while the boot creates only Feed's player type 10 handle, each created once and never destroyed, and the plane owner binds one at a time across both; a create or initialize that fails DECLINES the offer, `uri: original declined (the ACB handle for the URI engine could not be created)` (the driver's own reason, `UriNotReady::Driver`), and Feed plays the title; the failure is recorded, so a later offer declines without a new attempt, and the Start's own gate stays the backstop); media's `uri_preflight` never sees the binding.
+The driver reports the display path it can show a source on as `DisplayEvidence` (`UriDriver::display`: whether
+the display is ready, whether it can place a preview rectangle, and an opaque tag the boot log prints; the
+exported window, the ACB plane and the window mode that exports it are the LG driver's own detail, compared
+only inside `plx_play_uri`), and the composition joins it to the product's callable and certified
+capabilities as `ProductEvidence { display, callable, certified }`. `ProductEvidence::permits` and
+`ResolvePort::could_qualify_pms` read only whether that display is ready, and offer a source only through
+`certified` capabilities: the production evidence certifies nothing and the product's `ProductQualifier`
+(`app/adapters/backends.rs`, which also holds LG's one display rule, a Part with several audio tracks stays
+on Standard on the exported window) answers `Unknown`, which is what keeps the ACB binding from being offered a source.
 The one exception is a viewer who turned on Settings > Video & playback > Playback engine > Experimental
 (`UriEngine::On`, per profile, off by default): the route snapshots it into `ResolveEnv::uri_engine`,
 `OriginalRequest::uri_opt_in` carries it to the worker, `ProductQualifier` then answers the original
@@ -60,7 +65,10 @@ that original: the plan carries its own verdicts in `OriginalRequest::standard` 
 certifies a DV record only where the frozen decision admitted it. So a codec or raster the caps refuse, a
 Profile 5 file on a set without Dolby Vision, an audio track only the app decodes or the set cannot decode,
 and a container Standard hands the server to remux (anything but .mkv/.mp4/.m4v) play exactly as in Standard.
-The gate is Standard's own verdicts for the video, Dolby Vision, audio and container, and nothing more: it is
+The gate is Standard's own verdicts for the video, Dolby Vision, audio and container, plus one check of the
+TV's pipeline: an original Standard plays as Dolby Vision is declined where the TV's own demuxer would show
+only its base layer (`pipeline_carries_dolby_vision`: a Profile 7 Feed converts, or an MKV before webOS 10.3).
+It is
 NOT the server's decision, which the URI offer is made before (no Media Decision Engine round trip), so a
 file that clears these checks but that the server would still convert is offered all the same. A converted PMS output
 (`qualify_pms`) and any file whose Part carries a subtitle stream, whether or not a subtitle is on (the
@@ -192,11 +200,11 @@ and seeks by time via `av_seek_frame` (libavformat's own Cues index).
   the session reset the readout does not: the teardown records it as the terminal
   `AttemptFacts::load_abandoned`.
 
-**The main-thread rule is compiler-enforced.** The seam is the `VideoSink` trait in `plx_platform::tv::sink` (`rust-modules/platform/src/tv/sink.rs`)
-(Starfish-shaped: one method per verb, reached through `PlayerAdapter::display_sink`). `platform/src/webos/video_sink.rs`'s `extern "C"`
+**The main-thread rule is compiler-enforced.** The seam is the `VideoSink` trait in `plx_os::tv::sink` (`rust-modules/os/src/tv/sink.rs`)
+(Starfish-shaped: one method per verb, reached through `PlayerAdapter::display_sink`). `platform-webos/src/webos/video_sink.rs`'s `extern "C"`
 declarations are private to that module and only `StarfishSink` there implements the trait on the
 television; `HostSink` (`play-feed/src/ffi_host.rs`, `plx_play_feed::ffi_host`) is the simulator's. Every verb but `load` and `unload`
-takes a `task::MainThread` (the constant queries `feed_abi_is_cow`, `window_mode` and `window_id`
+takes a `task::MainThread` (the constant queries `feed_abi_is_cow`, `lacks_video_path`, `window_mode` and `window_id`
 take nothing); `unload` takes an `UnloadTicket`, which only a `&MainThread` can issue and which is
 `Send`, so the main thread decides when an Unload happens and a worker may carry it out.
 `MainThread` is a `!Send` ZST the application mints once. Since phase 9 it mints exactly one
@@ -229,12 +237,19 @@ something.
   probe's own capability (for read-outs) + that gated presentation decision, and every
   Load/reload/recovery consumes the
   stored presentation rather than re-reading the later cache; `dvnonode` is the logged diagnostic
-  exception, and the Feed's `dv_start` guard (`play-feed/src/dv_start.rs`, reached only through `FeedLoad::dv_landing_due`) is the one mid-play change (#1166): at a landing the firmware's
+  exception, and the Feed's `dv_start` guard (`play-feed/src/dv_start.rs`, reached only through `FeedLoad::dv_landing_due`) is one of the two mid-play changes (#1166): at a landing the firmware's
   Dolby Vision splitter would skip, or after 4 s with no position update, it takes the declaration
   out of the route for the rest of that play request (`route::withdraw_dv_presentation`: what DV Off
   would have planned, the probed capability kept, on the installed route, the file's own declaration
   and the stored Auto Original candidate, so a trip to HLS and back to Original stays base-layer)
-  and reloads once. Atmos routing and ACB forwarding are independent and unchanged. The payload evidence,
+  and reloads once. The other goes the opposite way: a stream whose container has no Dolby Vision
+  configuration record but whose RPUs say Profile 5 or Profile 8 over PQ/HLG (a remux that dropped
+  the record; the server then reports no Dolby Vision) is reported by the demuxer
+  (`ff::RpuOnlyScan`, `FeedRaw::rpu_dovi`), and once the Load has returned the pump has the route
+  declare it (`route::declare_rpu_dovi`: direct play only, outside an unconfirmed Original trial,
+  with the Dolby Vision setting frozen at the resolve, so DV Off and a set without confirmed support
+  change nothing) and reloads once with the node.
+  Atmos routing and ACB forwarding are independent and unchanged. The payload evidence,
   Profile 5 one-tick fix and instrument traps live in that document.
 - **The Load's `adaptiveStreaming` ceiling is derived per session (`plx_play_feed::sink_envelope`), and
   it was a 4K60 constant for EVERY codec until 2026-09-03 — which on webOS 10 refused every H.264
@@ -431,6 +446,50 @@ something.
     `Prepared` (the candidate's projection and remux follow the rebuilt stream), a refusal as
     `OriginalTrial(Failed)`, a second suspend as `Prepared`; a failed open of the rebuilt Original
     still rolls back to the retained HLS. A trial that is `Starting` or `AwaitingFrame` is refused.
+- **A starved direct-play (progressive) stream at Quality=Original is HELD and reads Buffering, like
+  a starved HLS one** (`feed_pump::maybe_begin_rebuffer`; the pump passes the Feed a
+  `HoldRoute` built from `route::is_segmented_hls`, `is_preview` and `is_progressive_original`).
+  Direct play has no rungs and no segments, so nothing but the sink's late-frame drop used to
+  answer a link that stopped delivering: on a link slower than the file the picture played in slow
+  motion, and when the link recovered Starfish caught up at about 1.3x by dropping frames. The hold
+  is the HLS hold's own machine (`ClockHold::ProgressiveRebuffer`, the same Pause,
+  `hls_rebuffering` mirror and `try_prime` Play) with its own certificate. It begins on one of two
+  arms. The CLOCK DEBT (`plx_playback_contract::clock_debt::ClockDebt`, a pure value step stepped
+  once per native position callback with the callback's wall ms and position: the Page CUSUM
+  `S <- max(0, S + (dwall - dpos) - k * dwall)`, k = 0.05, fires at `S >= h`, h = 100 ms, and resets
+  whenever the app video queue holds more than 1 MiB) is the slow-motion arm: it counts only while
+  the queue is empty, so it is what a link slower than the file looks like and not a healthy stream's
+  jitter, and a firing costs about 3.6 dropped frames at the resume. A stopped native clock over a
+  remnant it will never spend (`native_clock_stopped`, 1005 ms of silence over `progressive_reserve_ns`,
+  the FURTHER lane) is the dead-link arm: the callbacks stop when the clock stops, so the debt step
+  sees nothing there. Its silence runs from the later of the last callback and the last restart of
+  the clock watch (`silence_between`, as for HLS), so a link that dies before the first callback
+  after a Resume or a hold's Play is held too; the reserve test keeps a resume that leaves a full
+  queue from reading as dead. There is no reserve floor, no arming latch and no headroom grant (the AU queue
+  sizes are unchanged). Both arms are disarmed (`ProgressiveStall`) while a prime owns the clock,
+  during a seek or a Dolby Vision landing, before the first picture, under the viewer's Pause, once
+  the demuxer is done and while a video or audio queue is at its byte cap (the hold's own release is
+  already true: it would Pause and Play in one tick); a non-1x rate disarms only the clock-debt arm (the position then
+  advances at the rate, not at the wall), because a stopped clock is a stopped clock at any rate.
+  It releases on the first of the end of the stream
+  (`reason=eof`; `pushEOS` follows once the video lane drains) or a video OR audio queue at its byte
+  cap (`reason=full`: the capped queue is the reserve the stream played with when healthy, and the
+  demuxer is parked on it). The hold line is `feed: progressive rebuffer hold n= arm= S= debt= ...`
+  and the resume line `feed: progressive rebuffer resume n= reason= held=`. A viewer Pause inside a
+  hold marks the clock user-held and the Play undoes it through the same driver path as under an HLS
+  rebuffer (`held_prime_play_tests.rs`); the hold keeps its own certificate across both, and a seek
+  takes the clock from it at once (`seek_takes_hold`). **Never held: a trailer preview, the looped
+  `Source::Sample`, a progressive re-encode under a fixed quality ceiling, and any playback
+  Quality=Auto's Original supervisor watches** (`cur_auto_original_watched`): Auto's Original -> HLS
+  exit (`auto_original_watch`) is the answer to a starved link there, and a hold standing in front of
+  it could hold the exit off; Auto's behaviour is exactly what it was. Under Quality=Original the
+  only answer to a link that cannot carry the file is the hold (duty `1 - delivered/required`,
+  indefinitely), not smooth 1x play. `progressive_rebuffer_pump_tests.rs` drives the whole chain
+  through the real `pump()` over the host sink (its rig stamps the position callbacks with a virtual
+  wall, `Rig::with_virtual_wall`; the dead-link arm reads the real clock, so its test leaves the wall
+  alone and stops ticking the sink). The Buffering read-out is the facts level there
+  (`player::rebuffering`); that the TV shows the Buffering UI during a hold is not yet verified on the
+  device.
 - **The k5lp/k3lp sandbox preflight refuses native playback when `/dev/rtkmem` is unreadable.**
   The device fact is cached at boot, while the refusal belongs to `PlaybackSession` and clears
   on exit. Explicit Repair confirmation spends `Player.repair` once for the whole app lifetime;

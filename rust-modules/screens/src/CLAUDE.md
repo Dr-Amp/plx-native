@@ -63,6 +63,21 @@ A screen mounted as a modal surface is the same trait with a different `Style`; 
 instantiates the same screens a second time for its own inner stack, which is how one
 `OnboardScreen` mounts twice (§6.2).
 
+## A page reports what it draws that changed under a cover
+
+A glass menu or Sheet freezes the page under it, and the host retakes that snapshot on typed page
+damage (`Present::page_damaged()`, read by `popover::host::begin_frame`; page motion also does once
+every surface is fading), the close's first frame included: a page that returns from under a cover (`Uncover`, `Enter(Restored)`, a focus
+restored onto the key it already holds) should raise none of its own, and one that does it
+unconditionally costs the close a dropped frame. So a page draws from a user setting only if it keeps the value it
+last drew from and compares it at the head of `step`, on whichever event comes first
+(`registry::moved(&mut self.field, now)`, then `fx.invalidate(Provenance::Nav)`): Home, Library,
+Recommended, the collection, person, Search, Detail and Watchlist pages do so for the Under posters
+policy (and Library's sort value line, the Continue Watching press the deck draws). A page that
+reads the catalog or a store compares its revision the same way (Home's `sync_catalog_changed`, the
+Watchlist's `rev`). The collection and person pages are not narrowed yet: both still damage on every
+`Uncover`/`Enter` (over-damage, safe: the host may retake their page when nothing changed).
+
 ## A landing must not move ground somebody is looking at
 
 The Library's seven reported bugs in 2026-09 had one cause, and the shape recurs on every screen
@@ -84,7 +99,22 @@ that mixes async content with a live cursor:
   block that lands late). A restore is only what the reader chose: the engine remembers
   the page's own seats too, so the page keeps their provenance (`LibraryScreen::placed`). Home already has this shape (the hero seats when its action row
   arrives, while focus is still on the strip); Search seats its field, which never arrives async,
-  and Person and Detail keep no self-seat for a landing to strand.
+  and Person keeps no self-seat for a landing to strand. Detail keeps none while a playback driver
+  is composed (Play is its first seat and the landing does not move it); with none composed its
+  first seat, before the item lands, is the watched toggle, which writes to the account once the
+  item is there. The page owns that seat the way the Library owns its grid's
+  (`DetailScreen::provisional`, set by a fresh open's `Enter`): every frame's `reconcile` answers
+  `DetailScreen::default_elem` until the viewer acts at it: a key that moves focus, the pointer
+  moving it, an activation (`activate`: OK or a click) on a landed page, a hold that opens the item
+  menu, or, once the item has landed and the page has placed its seat (focus is on `default_elem`),
+  any key-down, pointer, click, drag or wheel (the Library's rule, since a wheel or a hover on the
+  focused control moves no focus for a `FocusMoved` to report). The item's
+  landing, a later Also available landing and a restore that waits on a season or retires all move the
+  seat by that one rule, so account safety never depends on a restore firing in the landing frame.
+  Before the item lands, and in the landing frame before `reconcile` has moved focus off the toggle,
+  only a focus move ends it: an OK there would let its press commit on the watched toggle, so an OK,
+  a key that moves nothing, a wheel, a drag and a hover on the control already focused leave it the
+  page's.
 - **The grid absorbs an index landing, the page shifts its scroll.** The Library's grid is a
   `cards::Grid` in `ScrollMode::External`: when the focused element's index changes with no
   `FocusMoved` (an insert or reorder before it) the grid moves its pop with the element and
@@ -209,7 +239,7 @@ Captures are the check — see the `ui-sim` and `which-tier` skills, and `../../
 `SettingsPage::UnderPosters` (ScreenId 113, `settings_under_posters.rs`) is pushed from Settings >
 Libraries, which now has two rows (Favorite libraries, Under posters). The page has five rows (Title, Movie details ›, TV show details ›, Sort value, Reset), with Reset disabled when all values are at their defaults. Each details row carries its ticked parts on the right (their names joined with " · " in the line's fixed order, "Nothing", or a count such as "4 details" once the joined names pass `NAMES_BUDGET_CHARS`). The page draws the shared picture slot (`RootPicture`, also drawn on the Settings root and on both pickers): one movie poster on the left and one show poster on the right (250 x 375 tiles, 410 apart), each demonstrating the stored selections and each the first poster of its kind (with a poster path) in the WIDEST cache the Browse store holds (`DirectoryView::kind_poster`: the current library's listing and shelves, then every other library's retained rows and shelves), so a last-opened Movies library still shows a real show (a kind the cache has none of is asked for as its library's hubs by `PosterAsk`, from this page and from the Settings root while its Under posters row has focus, until the poster is there or `DirectoryView::kind_shelves_published`); a kind with no art anywhere draws `widgets::absent_card` (the never-sentinel absence ground, uncounted), never `Art::Poster(None)`, which is a skeleton the frame-dump harness refuses; each tile wears its KIND over it ("MOVIE", "TV SHOW": the catalog's `browse.kind.movie` / `browse.kind.tv_show` drawn by `plx_ui::table::draw_caps_label_aligned`, the section header's caps, centred over the tile in `TEXT_READING`), a bold title line above the details line when Title is On, and details in the 380 px preview column, wrapping to two lines if needed. The picker and the picture both use an example for a selected fact the poster lacks. A focused library poster still uses the focused-title marquee (`card_row.rs`); **the column of the kind that is not being chosen is dimmed to the design's `dim`** (`plx_ui::follow_copy::DIM`, 0.45, from `Sv2s-P2-Details`: on the page the kind of the OTHER details row, in a picker the other kind, both at 1 on the root and on Title / Sort value / Reset), caption, tile and lines together as one group on the shared appear spring (`ColumnDims`); it is not the disabled control state. No frame, no clipping and no caption such as "Sorted by Year" or "The library you last opened" (those locale keys were deleted). Each details row pushes `SettingsPage::UnderPostersDetails(PosterKind)` (ScreenId 114, `DetailsPage` in the same file, shared by both kinds), the picker of that kind's details parts: one section, "Show under posters", with a row per part (a movie: Year, Length, Genre, Video quality, Age rating, Score; a show: Year, Seasons, Genre, Age rating, Score), a check mark on the ticked ones and a sample of the part on the right. OK ticks or unticks the row and STAYS on the page (the write goes through `PreferenceCmd::Choose`); at most four are ticked (`DetailParts::MAX`) and with four ticked the unticked rows are DISABLED through the shared `FormSection::disabled` (focusable, inert to OK), their sentence beside the table saying why. The parts are `plx_base::detail_parts::{DetailPart, DetailParts}` (fixed line order, kept to what a kind offers by `for_movies` / `for_shows`); the stored setting keeps the retired single-choice ladder only as the migration source and as the downgrade key (`UnderPostersLadder`). The caption band stays shut only when Title is Off and BOTH part sets are empty (`CaptionPolicy::show_details` is the show's own set). `settings::caption_policy_of`
 maps the stored `UnderPosters` to the ui `CaptionPolicy`. **EVERY poster tile reads that one policy through
-`registry::captions`** (`policy()` with the one `TEST_UNDER_POSTERS` test override, `label()` the one builder of a focused
+`registry::captions`** (`policy_for(&ScreenInputs)` from the host's effective frame capture; `TEST_UNDER_POSTERS` is a fixture input only, `label()` the one builder of a focused
 poster's `[title, details]`, `shelf_label()` for Home's and Recommended's shelves): the Library grid, the Collections page, the Watchlist,
 Home's shelves, Recommended's poster shelves, **Search's poster rows** (Movies, Shows, Collections; a result from a server that is not the
 household's own is credited after its details line, `CaptionFacts::source`), **the person page's filmography**, **Detail's Related and
