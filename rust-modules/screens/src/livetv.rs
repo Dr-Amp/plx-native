@@ -127,9 +127,15 @@ impl<H: LiveTvLike> CardSource<H> for Cards<'_> {
     }
 
     fn subject(&self, i: usize) -> Option<std::borrow::Cow<'_, str>> {
+        use std::fmt::Write as _;
         let tile = self.view.tiles.get(self.channel_index(i)?)?;
         // Two servers may advertise the same DVR and channel. A press names the exact source.
-        Some(format!("{}:{}", tile.sid.raw(), tile.rk).into())
+        // Hex preserves that key without punctuation the remote subject grammar rejects.
+        let mut subject = format!("live-{}-", tile.sid.raw());
+        for byte in tile.rk.bytes() {
+            write!(subject, "{byte:02x}").expect("writing to a String succeeds");
+        }
+        Some(subject.into())
     }
 }
 

@@ -39,7 +39,7 @@ pub(crate) fn livetv_conforms() -> plx_ui::a11y::Namespaces {
         let path = A11yPath::new().name(section).name("card").index(0);
         let elem = h.screen.a11y_find(&path, &cx).expect("the first card in each shelf");
         let card = h.screen.a11y(&elem, &cx).expect("the card projects accessibility attributes");
-        let subject = format!("{}:livetv:1:c0", plx_plex::plex::ServerId::UNSET.raw());
+        let subject = format!("live-{}-6c69766574763a313a6330", plx_plex::plex::ServerId::UNSET.raw());
         assert_eq!(card.subject.as_deref(), Some(subject.as_str()));
     }
     vec![namespace]
