@@ -1178,7 +1178,7 @@ pub fn failure_context_captured(ps: &crate::route::PlaybackSession, diagnostic_f
     FailureContext {
         forced: crate::route::forced_direct_play(ps) || diagnostic_forced,
         can_retry: crate::route::can_retry_current_play(ps),
-        quality_carriable: ps.quality_pick_carriable(),
+        quality_carriable: !crate::route::is_live(ps) && ps.quality_pick_carriable(),
         repair_idle: ps.repair_status == plx_os::tv::native_video::State::Idle,
     }
 }

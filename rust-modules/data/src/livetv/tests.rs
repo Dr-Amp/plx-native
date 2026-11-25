@@ -16,7 +16,8 @@ fn take(stores: &mut Stores) -> (Job<LiveTvReq>, LiveTvPort) {
 fn guide(numbers: &[&str], end: i64) -> Guide {
     Guide { dvr: "7".into(), provider: "tv.plex.providers.epg.xmltv:7".into(), refresh_at: end, retry_cd: 0, strikes: 0, channels: numbers.iter()
         .map(|number| LiveChannel { dvr: "7".into(), channel: format!("C{number}"), vcn: number.to_string(),
-            name: "Channel".into(), thumb: "/logo".into(), now: "Show".into(), now_thumb: "/show".into(), ends_at: end }).collect() }
+            name: "Channel".into(), thumb: "/logo".into(), now: "Show".into(),
+            now_thumb: "/show".into(), now_summary: String::new(), begins_at: 0, ends_at: end }).collect() }
 }
 fn complete(guides: Vec<Guide>) -> ReadResult { ReadResult { guides, roster: None, complete: true, retry: false } }
 fn answer(stores: &mut Stores, result: Option<Vec<Guide>>) {

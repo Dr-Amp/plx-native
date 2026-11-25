@@ -4624,7 +4624,7 @@ pub unsafe fn hls_demux_segment(
         }
         (video_width, video_height) = (w, h);
         plx_base::eventlog::log(&format!(
-            "hls: segment={} carries no SPS; raster {w}x{h} and parameter sets from the previous segment",
+            "hls: using previous parameter sets and raster {w}x{h} for segment {} without SPS",
             segment.sequence
         ));
     }

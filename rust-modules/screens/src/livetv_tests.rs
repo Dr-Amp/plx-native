@@ -83,7 +83,7 @@ fn step_handled(s: &mut LiveTvScreen, view: LiveTvView<'_>, focus: Option<u32>, 
 fn channel(vcn: &str, name: &str) -> Channel {
     Channel { sid: plx_plex::plex::ServerId::UNSET, dvr: "7".into(), channel: format!("C{vcn}"),
         vcn: vcn.into(), name: name.into(), thumb: format!("/logos/{vcn}.jpg"), now: "Family Show".into(),
-        now_thumb: format!("/programmes/{vcn}.jpg"), ends_at: 100 }
+        now_thumb: format!("/programmes/{vcn}.jpg"), now_summary: String::new(), begins_at: 20, ends_at: 100 }
 }
 
 fn seeded() -> (LiveTvStore, LiveTvScreen) {

@@ -11,7 +11,8 @@ use plx_ui::dispatch::Tap;
 fn channel(vcn: &str, name: &str) -> Channel {
     Channel { sid: plx_plex::plex::ServerId::from_raw(0), dvr: "7".into(),
         channel: format!("C{vcn}.242.ersatztv.org"), vcn: vcn.into(), name: name.into(),
-        thumb: String::new(), now: "Family Show".into(), now_thumb: String::new(), ends_at: 0 }
+        thumb: String::new(), now: "Family Show".into(), now_thumb: String::new(),
+        now_summary: String::new(), begins_at: 0, ends_at: 0 }
 }
 
 #[derive(Default)]
@@ -147,7 +148,13 @@ fn live_banner_uses_the_existing_caption_and_tracks_the_airing() {
         let mut ch = channel(number, "Family Channel");
         ch.channel = "C101.242.ersatztv.org".into();
         ch.now = programme.into();
+        ch.now_summary = format!("About {programme}");
+        ch.begins_at = 1_792_523_168;
+        ch.ends_at = 1_792_524_417;
         crate::app::playback::publish_live_banner(&mut app.player.session, &[ch]);
+        let info = plx_media::route::live_info(&app.player.session).expect("the tuned channel's facts");
+        assert_eq!(info.channel.now_summary, format!("About {programme}"));
+        assert!(info.local_airing.is_some());
         // SAFETY: the session owns the NUL-terminated banner for this assertion.
         assert_eq!(unsafe { std::ffi::CStr::from_ptr(plx_media::route::ctxline_cptr(&app.player.session)) }.to_str().unwrap(), expected);
     }

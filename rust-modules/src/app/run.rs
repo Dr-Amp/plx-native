@@ -750,7 +750,10 @@ fn hud_model(
         || plx_media::player::seek_pending(ps).is_some();
     let scrub_ns = plx_media::player::TX.scrub_ns.load(Relaxed);
     let advancing = plx_media::player::state(ps) == plx_media::player::PlaybackState::Playing;
-    let (is_episode, is_movie) = meta.now_playing().map_or((false, false), |n| (n.is_real_episode, n.is_movie));
+    let is_live = plx_media::route::is_live(ps);
+    let (is_episode, is_movie) = if is_live { (false, false) } else {
+        meta.now_playing().map_or((false, false), |n| (n.is_real_episode, n.is_movie))
+    };
     let projected_end_time = if plx_appkit::player_hud::model::end_time_is_eligible(
         plx_appkit::player_hud::model::EndTimeEligibility {
             enabled: live_clock_and_lane && plx_media::route::hud_end_time(),
@@ -781,6 +784,7 @@ fn hud_model(
         covered: false,
         skip_progress: None,
         is_episode,
+        is_live,
         end_time: projected_end_time,
         scrub_ns,
         playpos_ns,
@@ -792,8 +796,8 @@ fn hud_model(
         sub_tone: plx_media::player::subtitle_tone(),
         sub_sel: plx_media::player::desired_sub_idx(),
         controls: plx_appkit::player_hud::Controls::now(ps),
-        chapters: plx_appkit::chapters_panel::has_chapters(meta),
-        detail: plx_appkit::info_panel::detail_rk(meta).is_some(),
+        chapters: !is_live && plx_appkit::chapters_panel::has_chapters(meta),
+        detail: !is_live && plx_appkit::info_panel::detail_rk(meta).is_some(),
         skip_secs: u32::try_from(plx_media::route::skip_interval().ns() / 1_000_000_000).unwrap_or(10),
         stats: crate::app::diagnostics::enabled(),
         bitmap_key: plx_media::player::active_bitmap_key(playpos_ns),

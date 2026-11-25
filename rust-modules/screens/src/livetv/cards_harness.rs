@@ -51,7 +51,7 @@ impl Harness {
         store.install_for_test((0..n).map(|i| plx_data::livetv::Channel {
             sid: plx_plex::plex::ServerId::UNSET, dvr: "1".into(), channel: format!("c{i}"),
             vcn: i.to_string(), name: format!("Channel {i}"), thumb: String::new(),
-            now: format!("Programme {i}"), now_thumb: String::new(), ends_at: 0,
+            now: format!("Programme {i}"), now_thumb: String::new(), now_summary: String::new(), begins_at: 0, ends_at: 0,
         }).collect());
         let mut h = Self { store, screen: LiveTvScreen::new(ENTRY), focus: None, press: 1.0, ms: 0, n };
         h.step(ScreenEvent::Tick(Tick { ms: 0, dt_us: 16_667 }));

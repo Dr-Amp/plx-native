@@ -504,7 +504,16 @@ fn live_channel<'a>(ps: &plx_media::route::PlaybackSession, channels: &'a [plx_d
 
 /// Refresh the existing HUD caption from the current guide, including a programme rollover.
 pub(super) fn publish_live_banner(ps: &mut plx_media::route::PlaybackSession, channels: &[plx_data::livetv::Channel]) {
-    let Some((_, ch)) = live_channel(ps, channels) else { return };
+    let Some((_, ch)) = live_channel(ps, channels) else {
+        plx_media::route::set_live_info(ps, None);
+        plx_media::route::set_live_context(ps, "");
+        return;
+    };
+    if plx_media::route::live_info(ps).is_some_and(|info| &info.channel == ch) { return; }
+    let local_airing = (ch.begins_at > 0 && ch.ends_at > ch.begins_at).then(|| {
+        Some((super::clock::local_end_time(ch.begins_at)?, super::clock::local_end_time(ch.ends_at)?))
+    }).flatten();
+    plx_media::route::set_live_info(ps, Some(plx_media::route::LiveInfo { channel: ch.clone(), local_airing }));
     let context = match (ch.vcn.is_empty(), ch.now.is_empty()) {
         (false, false) => plx_os::i18n::msg::widgets_live_channel_context(&ch.vcn, &ch.now),
         (false, true) => ch.vcn.clone(),
@@ -923,6 +932,7 @@ pub(crate) fn player_requests(
             // present a panel immediately rather than through the row's deferred press. The
             // tabs row is not an asker: it asks `ToggleSection` (Info and Chapters are sections).
             PlayerReq::OpenOverlay(kind) => {
+                if plx_media::route::is_live(&player.session) { continue; }
                 seed_menu_anchor(pages, bridge, kind);
                 super::bridge::open_player_overlay(&mut player.session, bridge.metadata_view(), pages, kind);
             }
@@ -1494,6 +1504,7 @@ pub(crate) fn perform_hud_command(
     use plx_appkit::player_hud::command::HudCommand;
     use plx_media::route::QueueStep;
     use plx_screens::player::overlay::OverlayKind;
+    if plx_media::route::is_live(&player.session) && !command.shown_live() { return; }
     match command {
         HudCommand::TogglePlay | HudCommand::Seek(_) => {
             super::bridge::send_player_message(pages,

@@ -216,6 +216,7 @@ pub struct PlaybackSession {
     /// The Live TV session this playback watches, `None` for every library item. The timeline
     /// reports under it and its `stopped` ([`scrobble_stop`]) is what frees the server's tuner.
     cur_live: Option<plx_plex::plex::livetv::LiveSession>,
+    live_info: Option<std::sync::Arc<LiveInfo>>,
     /// The server's PRE-FLIGHT refusal for the last resolve, or None.
     ///
     /// `Some(sentence)` means `/decision` answered "neither direct play nor conversion is
@@ -1910,6 +1911,7 @@ impl PlaybackSession {
         url: String::new(),
         tsession: String::new(),
         cur_live: None,
+        live_info: None,
         play_verdict: None,
         pms_decline: None,
         resolve_failed: false,
@@ -2020,6 +2022,7 @@ impl PlaybackSession {
             url,
             tsession,
             cur_live,
+            live_info,
             play_verdict,
             pms_decline,
             resolve_failed,
@@ -2112,6 +2115,7 @@ impl PlaybackSession {
             url: url.clone(),
             tsession: tsession.clone(),
             cur_live: cur_live.clone(),
+            live_info: live_info.clone(),
             play_verdict: play_verdict.clone(),
             pms_decline: *pms_decline,
             resolve_failed: *resolve_failed,
@@ -10981,7 +10985,7 @@ pub fn request_live(
 }
 
 /// Make `ps` a playback of a Live TV channel, for a pump rig that installs no tune.
-#[cfg(any(all(test, feature = "sim"), feature = "test-support"))]
+#[cfg(any(test, feature = "test-support"))]
 pub fn mark_live_for_test(ps: &mut PlaybackSession) {
     ps.cur_live = Some(plx_plex::plex::livetv::LiveSession {
         key: "/livetv/sessions/9b9fe727-0000-46db-b94c-ef512e3e61d2".into(), rating_key: String::new() });
@@ -10996,6 +11000,22 @@ pub fn is_live(ps: &PlaybackSession) -> bool {
 pub fn live_request(ps: &PlaybackSession) -> Option<(ServerId, &LiveTune)> {
     let request = ps.request.as_ref()?;
     Some((request.sid, request.live.as_ref()?))
+}
+
+/// Guide facts the app publishes for the channel this player is tuned to.
+pub struct LiveInfo {
+    pub channel: plx_data::livetv::Channel,
+    pub local_airing: Option<([i32; 2], [i32; 2])>,
+}
+
+pub fn live_info(ps: &PlaybackSession) -> Option<&LiveInfo> {
+    let (sid, tune) = live_request(ps)?;
+    ps.live_info.as_deref().filter(|info| info.channel.sid == sid
+        && info.channel.dvr == tune.dvr && info.channel.channel == tune.channel)
+}
+
+pub fn set_live_info(ps: &mut PlaybackSession, info: Option<LiveInfo>) {
+    ps.live_info = info.map(std::sync::Arc::new);
 }
 
 /// Publish the lineup's current programme through the ordinary HUD pair and retry descriptor.
@@ -12182,6 +12202,7 @@ fn apply_plan(ps: &mut PlaybackSession, meta: &mut plx_data::stores::metadata::M
             url: plan.url,
             tsession: plan.tsession,
             cur_live: plan.live,
+            live_info: s.live_info.take(),
             // Installed on EVERY landing, not only a refusing one: a plan that resolved is itself
             // the statement that the last refusal is over, and assigning unconditionally is what
             // makes that true without a second clear anyone can forget.

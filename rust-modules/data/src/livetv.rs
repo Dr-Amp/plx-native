@@ -30,6 +30,8 @@ pub struct Channel {
     pub thumb: String,
     pub now: String,
     pub now_thumb: String,
+    pub now_summary: String,
+    pub begins_at: i64,
     pub ends_at: i64,
 }
 
@@ -37,7 +39,7 @@ impl Channel {
     fn of(sid: ServerId, ch: &LiveChannel) -> Self {
         Self { sid, dvr: ch.dvr.clone(), channel: ch.channel.clone(), vcn: ch.vcn.clone(),
             name: ch.name.clone(), thumb: ch.thumb.clone(), now: ch.now.clone(),
-            now_thumb: ch.now_thumb.clone(), ends_at: ch.ends_at }
+            now_thumb: ch.now_thumb.clone(), now_summary: ch.now_summary.clone(), begins_at: ch.begins_at, ends_at: ch.ends_at }
     }
 }
 

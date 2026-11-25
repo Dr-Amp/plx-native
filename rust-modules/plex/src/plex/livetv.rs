@@ -35,6 +35,9 @@ pub struct LiveChannel {
     pub now: String,
     /// Airing artwork, falling back to the channel logo.
     pub now_thumb: String,
+    /// The current programme's guide description and start time.
+    pub now_summary: String,
+    pub begins_at: i64,
     /// Unix seconds the current airing ends; 0 when nothing is airing. The row is stale after it.
     pub ends_at: i64,
 }
@@ -317,7 +320,7 @@ pub fn lineup(dvr: &Dvr, channels: &[EpgChannel], on_now: &[Metadata]) -> Vec<Li
         .filter(|ch| is_path_id(&ch.grid_key))
         .map(|ch| LiveChannel { dvr: dvr.key.clone(), channel: ch.grid_key.clone(),
             vcn: ch.vcn.clone(), name: channel_name(ch), thumb: ch.thumb.clone(),
-            now: String::new(), now_thumb: ch.thumb.clone(), ends_at: 0 }).collect();
+            now: String::new(), now_thumb: ch.thumb.clone(), now_summary: String::new(), begins_at: 0, ends_at: 0 }).collect();
     update_on_now(&mut rows, on_now);
     rows.sort_by(|a, b| vcn_order(&a.vcn, &b.vcn));
     rows
@@ -343,9 +346,11 @@ pub fn update_on_now(rows: &mut [LiveChannel], on_now: &[Metadata]) {
         let airing = on_now.iter().find_map(|m| m.media.iter().find(|media| {
             if media.channel_identifier.is_empty() { media.channel_vcn == ch.vcn }
             else { media.channel_identifier == ch.channel }
-        }).map(|media| (m, media.ends_at)));
+        }).map(|media| (m, media)));
         ch.now = airing.map_or_else(String::new, |(m, _)| airing_label(m).to_owned());
-        ch.ends_at = airing.map_or(0, |(_, ends)| ends);
+        ch.now_summary = airing.map_or_else(String::new, |(m, _)| m.summary.clone());
+        ch.begins_at = airing.map_or(0, |(_, media)| media.begins_at);
+        ch.ends_at = airing.map_or(0, |(_, media)| media.ends_at);
         ch.now_thumb = airing.and_then(|(m, _)| [&m.thumb, &m.grandparent_thumb, &m.art]
             .into_iter().find(|art| !art.is_empty())).unwrap_or(&ch.thumb).clone();
     }
@@ -499,6 +504,7 @@ mod tests {
     const ON_NOW: &[u8] = br#"{"MediaContainer":{"size":2,"Metadata":[
         {"ratingKey":"tv%2Eplex%2Exmltv%3A%2F%2Fepisode%2FFamily%2F3%2F23","type":"episode",
          "title":"Family - S03E23 - Placeholder","grandparentTitle":"Family Show","onAir":true,
+         "summary":"A synthetic guide description.",
          "Media":[{"id":48,"channelVcn":"101","channelIdentifier":"C101.242.ersatztv.org",
            "protocol":"livetv","beginsAt":1792523168,"endsAt":1792524417,"onAir":true}],
          "Channel":[{"id":2,"filter":"channel=2","tag":"101 101 Family Channel"}]},
@@ -554,6 +560,9 @@ mod tests {
         assert!(rows.iter().all(|r| r.dvr == "7"));
         assert_eq!(rows[0].channel, "C101.242.ersatztv.org", "the tune names the guide's id");
         assert_eq!(rows[0].thumb, "http://192.0.2.10:8409/iptv/logos/gen?text=Family");
+        assert_eq!(rows[0].begins_at, 1_792_523_168);
+        assert_eq!(rows[0].now_summary, "A synthetic guide description.");
+        assert_eq!((rows[1].begins_at, rows[1].now_summary.as_str()), (0, ""));
     }
 
     #[test]
