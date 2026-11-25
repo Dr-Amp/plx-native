@@ -1045,7 +1045,9 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Machine<H> for PlayerScreen 
                                 self.back_cursor(crate::registry::BackCursorChange::Release, fx);
                             }
                         }
-                        if let Some(direction) = consts::page_dir(*sym, *wcode) {
+                        if let Some(direction) = consts::page_dir(*sym, *wcode)
+                            .filter(|_| plx_media::route::is_live(ps))
+                        {
                             if *edge == Edge::Down && !at_edge {
                                 self.end_jump_gesture();
                                 self.hud.extend(input.at.ms, input::HUD_LINGER_MS);
@@ -3986,21 +3988,35 @@ pub(crate) mod step_ladder_tests {
     }
 
     #[test]
+    fn channel_keys_leave_the_non_live_hud_untouched() {
+        let _g = plx_base::testlock::serial();
+        let mut page = PlayerScreen::new(ENTRY, plx_appkit::player_hud::loaded::classic_for_test());
+        let until = page.hud.until;
+        for (sym, wcode) in [(consts::SDLK_PAGEUP, 0), (0, consts::WCODE_CH_DOWN_KEY)] {
+            let (_, reqs) = press(&mut page, sym, wcode, Edge::Down);
+            assert!(reqs.is_empty(), "ordinary playback asks for no channel");
+            assert_eq!(page.hud.until, until, "the channel rocker does not extend the HUD");
+        }
+    }
+
+    #[test]
     fn channel_keys_ask_for_the_next_higher_or_lower_channel_and_wake_the_hud() {
         let _g = plx_base::testlock::serial();
+        let mut session = plx_media::route::PlaybackSession::IDLE;
+        plx_media::route::mark_live_for_test(&mut session);
         for (sym, wcode, direction) in [
             (consts::SDLK_PAGEUP, 0, 1), (consts::SDLK_PAGEDOWN, 0, -1),
             (0, consts::WCODE_CH_UP_KEY, 1), (0, consts::WCODE_CH_DOWN_KEY, -1),
         ] {
             let mut page = PlayerScreen::new(ENTRY, plx_appkit::player_hud::loaded::classic_for_test());
             page.hud.dismissed = true;
-            let (handled, reqs) = press(&mut page, sym, wcode, Edge::Down);
+            let (handled, reqs) = press_over(&session, &mut page, sym, wcode, Edge::Down);
             assert_eq!(handled, Handled::Yes);
             assert_eq!(reqs, vec![PlayerReq::Channel(direction)]);
             assert!(page.hud.until >= 1_000 + input::HUD_LINGER_MS);
             assert!(!page.hud.dismissed);
             for edge in [Edge::Repeat, Edge::Up] {
-                assert_eq!(press(&mut page, sym, wcode, edge), (Handled::Yes, Vec::new()));
+                assert_eq!(press_over(&session, &mut page, sym, wcode, edge), (Handled::Yes, Vec::new()));
             }
         }
     }

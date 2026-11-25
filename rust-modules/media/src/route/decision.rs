@@ -10981,8 +10981,8 @@ pub fn request_live(
 }
 
 /// Make `ps` a playback of a Live TV channel, for a pump rig that installs no tune.
-#[cfg(all(test, feature = "sim"))]
-pub(crate) fn mark_live_for_test(ps: &mut PlaybackSession) {
+#[cfg(any(all(test, feature = "sim"), feature = "test-support"))]
+pub fn mark_live_for_test(ps: &mut PlaybackSession) {
     ps.cur_live = Some(plx_plex::plex::livetv::LiveSession {
         key: "/livetv/sessions/9b9fe727-0000-46db-b94c-ef512e3e61d2".into(), rating_key: String::new() });
 }
