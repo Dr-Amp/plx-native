@@ -1818,6 +1818,42 @@ fn a_live_channel_s_conversion_restarts_playback_through_the_feed_door() {
     drop(rx);
 }
 
+/// **A live conversion gets no rung control.** Maintainer's review of `b35a7aaf4` (PR #993): the
+/// converted channel's HLS worker was handed an ABR controller, and every candidate it primed asked
+/// PMS for a decision on `/library/metadata/` (a live session has no rating key), was refused and
+/// stopped, every ~1.8 s. The same installed route with the channel taken away does get control, so
+/// this fails if the live gate goes.
+#[test]
+fn a_live_conversion_gets_no_abr_rung_control() {
+    use std::time::Duration;
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let (port, rx) = live_pms(false);
+    let sid = plx_plex::plex::register_for_test("route-live-abr", "127.0.0.1", port, "tok-live", "cid-live");
+    let mut meta = plx_data::stores::metadata::MetadataStore::default();
+    assert!(request_live(&mut ps, &mut meta, plx_os::devcaps::caps(), sid, "7",
+        "C101.242.ersatztv.org", "Channel one"));
+    assert!(wait_resolve_workers_for_test(Duration::from_secs(10)));
+    let plan = pump_play(&mut ps, &mut meta).expect("the tune lands");
+    settle_plan_start_in_unit_test(&mut ps, plan.route_start);
+    assert!(matches!(dispatch_live_refusal_conversion(&mut ps), RecoveryDispatch::Flying { .. }));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(landing) = take_ready_recovery_flight(&mut ps) {
+            assert!(matches!(landing.verdict, RecoveryVerdict::Install), "the conversion installs its route");
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the conversion never landed");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(hls_abr_control(&ps).is_none(), "a live conversion must not start rung control");
+
+    ps.cur_live = None;
+    if let Some(request) = ps.request.as_mut() { request.live = None; }
+    assert!(hls_abr_control(&ps).is_some(), "premise: the same converted route off a channel gets rung control");
+    drop(rx);
+}
+
 /// **The converted channel's master opens.** Maintainer's webOS 4.5 retest of `d430c7e61` (PR #993):
 /// the conversion passed the Feed door, then the reader refused PMS's master with `invalid playlist
 /// URI: empty path component`, because the flight sent the DVR path as `session=` too and PMS names

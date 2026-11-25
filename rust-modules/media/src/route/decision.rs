@@ -5352,6 +5352,10 @@ fn auto_original_features(ps: &PlaybackSession) -> crate::abr::SourceFeatures {
 /// Main-thread capture immediately before spawning the HLS demux worker.
 pub fn hls_abr_control(ps: &PlaybackSession) -> Option<(HlsAbrControl, WorkerTicket)> {
     if forced_direct_play(ps) { return None; }
+    // A Live TV channel has no rating key, so each rung candidate's decision asks PMS for
+    // `/library/metadata/` with nothing after it: refused (400), then stopped, every ~1.8 s. Rung
+    // switching on a live conversion is a later iteration; until then it keeps the rung it opened on.
+    if is_live(ps) { return None; }
     let seconds_per_segment = match cur_delivery(ps) {
         plx_plex::plex::TranscodeDelivery::FixedHls {
             seconds_per_segment,
