@@ -316,3 +316,23 @@ fn the_live_tv_tab_tracks_the_store_and_an_open_empty_page_stays_open() {
     bridge.livetv_run(plx_data::livetv::LiveTvCmd::Reset);
     assert!(!bridge.search_tab_available(HomeTab::LiveTv));
 }
+
+#[test]
+fn losing_feed_hides_the_tab_but_does_not_prevent_an_identity_reset() {
+    let _serial = plx_base::testlock::serial();
+    let mut owner = crate::app::runtime_owners::Harness::new(|| 0);
+    let mut bridge = owner.bridge();
+    bridge.stores.livetv.install_for_test(vec![channel("101", "Family Channel")]);
+    assert!(bridge.livetv_available());
+
+    let mut session = plx_media::route::PlaybackSession::IDLE;
+    session.install_backends(plx_media::route::BackendSet::NONE);
+    bridge.publish_player_presentation(&session);
+    assert!(!bridge.livetv_available());
+    assert!(!bridge.livetv_pump());
+    assert!(!bridge.livetv_run(plx_data::livetv::LiveTvCmd::Retry));
+
+    assert!(bridge.livetv_run(plx_data::livetv::LiveTvCmd::Reset));
+    assert!(bridge.livetv_view().channels.is_empty());
+    bridge.assert_no_store_jobs_left_for_test();
+}

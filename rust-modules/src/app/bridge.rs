@@ -2174,7 +2174,10 @@ impl Bridge<'_> {
     }
 
     pub(crate) fn livetv_run(&mut self, cmd: plx_data::livetv::LiveTvCmd) -> bool {
-        if !self.retained.screen_inputs.backends.feed { return false; }
+        if !self.retained.screen_inputs.backends.feed {
+            return matches!(cmd, plx_data::livetv::LiveTvCmd::Reset)
+                && self.stores.livetv_run(cmd, &Default::default(), 0);
+        }
         super::adapters::stores::refill_client_keys(&mut self.retained.client_keys);
         let now = super::clock::unix_ms().unwrap_or(0) / 1_000;
         let changed = self.stores.livetv_run(cmd, &self.retained.client_keys, now);
