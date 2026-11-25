@@ -287,7 +287,6 @@ impl LiveTvState {
         self.channels = channels;
         self.status = status;
         self.revision = self.revision.wrapping_add(1);
-        plx_machine::idle::invalidate();
         true
     }
     #[cfg(any(test, feature = "test-support"))]

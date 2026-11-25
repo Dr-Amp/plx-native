@@ -3384,9 +3384,8 @@ fn build_live_stream(
     let mode = env.direct_play_mode;
     // The session's own playlist with no encoder behind it: the original route's identity, so a
     // later failure of this playlist still has the channel's conversion to try.
-    const LIVE_VIDEO_CODEC: &str = "h264";
     let as_recorded = |plan: &mut Plan| {
-        plan.vcodec = LIVE_VIDEO_CODEC.into();
+        plan.vcodec = "h264".into();
         plan.acodec = "aac".into();
         plan.src_vcodec = plan.vcodec.clone();
         plan.src_acodec = plan.acodec.clone();
@@ -3399,14 +3398,7 @@ fn build_live_stream(
         return;
     }
     if mode == DirectPlayMode::Forced {
-        // A half-described decision is judged on the lane it did name (an unnamed video is
-        // read as the H.264 every measured session carried).
-        let named_video = if plan.src_vcodec.is_empty() { LIVE_VIDEO_CODEC } else { plan.src_vcodec.as_str() };
-        let failure = if !plan.src_vcodec.is_empty() && !video { Some(ForcedFailure::Video) }
-            else if !plan.src_acodec.is_empty() && !(audio && hls_accepts_codecs(named_video, Some(&plan.src_acodec))) {
-                Some(ForcedFailure::Audio { codec: plx_data::metadata::friendly_codec(&plan.src_acodec) })
-            } else { None };
-        if let Some(failure) = failure {
+        if let Some(failure) = forced_live_failure(plan, video, audio) {
             crate::player::log(&format!(
                 "playback_policy: Force Direct Play refused the live cut {}/{}", plan.src_vcodec, plan.src_acodec));
             plan.verdict = Some(PlayVerdict::Forced(failure));
@@ -3451,6 +3443,18 @@ fn build_live_stream(
     plan.vcodec = video;
     plan.acodec = audio_declaration(&audio);
     plan.url = client.transcode_start_url(&spec).to_url();
+}
+
+fn forced_live_failure(plan: &Plan, video_supported: bool, audio_supported: bool) -> Option<ForcedFailure> {
+    // Judge a half-described decision by the lane it named. The measured fallback video is H.264.
+    let video = if plan.src_vcodec.is_empty() { "h264" } else { plan.src_vcodec.as_str() };
+    if !plan.src_vcodec.is_empty() && !video_supported {
+        return Some(ForcedFailure::Video);
+    }
+    let audio = &plan.src_acodec;
+    (!audio.is_empty() && !(audio_supported
+        && plx_playback_contract::demux::hls_accepts_codecs(video, Some(audio))))
+        .then(|| ForcedFailure::Audio { codec: plx_data::metadata::friendly_codec(audio) })
 }
 
 /// The Load audio declaration as the pipeline names it.

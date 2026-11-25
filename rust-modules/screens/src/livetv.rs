@@ -118,7 +118,7 @@ impl<H: LiveTvLike> CardSource<H> for Cards<'_> {
     fn label(&self, i: usize) -> TileLabel {
         let Some(index) = self.channel_index(i) else { return TileLabel::default() };
         let Some(item) = self.view.tiles.get(index) else { return TileLabel::default() };
-        if !self.now { return captions::shelf_label(&captions::policy(), item, false); }
+        if !self.now { return captions::shelf_label(&captions::live_tv_policy(), item, false); }
         let channel = &self.view.channels[index];
         let mut facts = tile_facts::caption_facts(item);
         facts.title = Some(channel.now.clone());
@@ -145,7 +145,9 @@ impl<H: LiveTvLike> StackPage<H> for Page {
         (view.status == LiveTvStatus::Ready && matches!(k, Sec::Channels | Sec::Now)).then_some(Cards { view, airings: &self.airings, now: k == Sec::Now })
     }
     fn card_has_menu(&self, _cx: &Cx<'_, H>, _k: Sec, _elem: &u32) -> bool { false }
-    fn caption_policy(&self, k: Sec) -> Option<plx_ui::caption_policy::CaptionPolicy> { matches!(k, Sec::Channels | Sec::Now).then(captions::live_tv_policy) }
+    fn caption_policy(&self, _cx: &Cx<'_, H>, k: Sec) -> Option<plx_ui::caption_policy::CaptionPolicy> {
+        matches!(k, Sec::Channels | Sec::Now).then(captions::live_tv_policy)
+    }
     fn elem_of(&self, k: Sec) -> Option<u32> { (k == Sec::Status).then_some(RETRY_ELEM) }
     fn plain_group(&self, _cx: &Cx<'_, H>, _k: Sec, id: GroupId, extent: Rect) -> GroupSpec {
         GroupSpec { id, kind: GroupKind::Free, seat: Seat::First, reachable: AxisMask::VERTICAL,
@@ -158,7 +160,7 @@ impl<H: LiveTvLike> StackPage<H> for Page {
     fn custom_draw(&self, k: Sec, f: &mut DrawFrame<'_, '_, H>, r: Rect, _scroll: f32) {
         if k == Sec::Head {
             let p = f.painter.alpha(f.page_alpha).alpha(self.handoff.head_alpha(r.y));
-            self.header_row(f.measure).draw(p, r.y, &self.header_capsules, self.header_pop.scale_with(0, f.press.scale), None);
+            self.header_row(f.measure).draw(p, r.y, &self.header_capsules, self.header_pop.scale_with(0, f.press), None);
         } else if k == Sec::Status && self.status != LiveTvStatus::Ready {
             self.status_overlay(f.cx.tick.ms).focused(f.focus.current.is_some_and(|k| k.entry == self.entry && k.elem == RETRY_ELEM))
                 .draw_measured(&Env::inert(), f.painter.alpha(f.page_alpha), f.measure);

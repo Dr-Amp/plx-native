@@ -5691,7 +5691,7 @@ mod recording_erasure_tests;
 #[cfg(test)]
 #[path = "consent_owner_tests.rs"]
 mod consent_owner_tests;
-#[cfg(all(test, feature = "hostsim", feature = "play-feed"))]
+#[cfg(all(test, feature = "sim", feature = "play-feed"))]
 #[path = "livetv_routing_tests.rs"]
 mod livetv_routing_tests;
 #[cfg(test)]

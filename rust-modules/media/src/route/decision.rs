@@ -10979,7 +10979,7 @@ pub fn request_live(
 }
 
 /// Make `ps` a playback of a Live TV channel, for a pump rig that installs no tune.
-#[cfg(all(test, feature = "hostsim"))]
+#[cfg(all(test, feature = "sim"))]
 pub(crate) fn mark_live_for_test(ps: &mut PlaybackSession) {
     ps.cur_live = Some(plx_plex::plex::livetv::LiveSession {
         key: "/livetv/sessions/9b9fe727-0000-46db-b94c-ef512e3e61d2".into(), rating_key: String::new() });
@@ -11605,7 +11605,7 @@ pub fn restore_uri_original(ps: &mut PlaybackSession,
     } else if !owned.is_empty() && active.encoder() == owned && replace_active_encoder_for(&active, "").is_some() {
         let mut identities = vec![owned.clone()];
         if !ps.sess.is_empty() && ps.sess != owned { identities.push(ps.sess.clone()); }
-        retire_plan_resources(AbandonedPlanResources { sid: cur_sid(ps), identities });
+        retire_plan_resources(AbandonedPlanResources { sid: cur_sid(ps), identities, live: None });
         ps.tsession.clear();
     }
     let mut retry = current_retry_context(ps, resume_ns.max(0));
