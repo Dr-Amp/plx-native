@@ -3259,7 +3259,7 @@ mod tests {
         assert_eq!(shape.kind, FailureKind::TunersBusy);
         assert_eq!(shape.readout, plx_os::i18n::msg::widgets_verdict_tuners_busy());
         for forced in [false, true] {
-            let cx = FailureContext { forced, can_retry: true, repair_idle: false };
+            let cx = FailureContext { forced, can_retry: true, repair_idle: false, quality_carriable: false };
             assert_eq!(failure_actions(shape.kind, cx), vec![FailureAction::TryAgain, FailureAction::Back]);
             assert_eq!(failure_actions(shape.kind, FailureContext { can_retry: false, ..cx }), vec![FailureAction::Back]);
         }

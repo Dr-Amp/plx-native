@@ -283,6 +283,7 @@ impl plx_screens::registry::ScreenInputsLike for AppHost {
 impl HomeLike for AppHost {
     fn clock_facts<'a>(cx: &Cx<'a, Self>) -> Option<&'a plx_plex::plex::ClockFacts> { Some(cx.views.clock) }
     fn hubs<'a>(cx: &Cx<'a, Self>) -> plx_data::pms::HubsView<'a> {
+        if !cx.views.inputs.backends.feed { return cx.views.hubs; }
         let live = cx.views.livetv;
         cx.views.hubs.with_shelf(plx_data::livetv::LIVE_TV_HUB,
             plx_os::i18n::msg::browse_home_live_tv(), live.tiles, live.revision())
@@ -2159,11 +2160,12 @@ impl Bridge<'_> {
     }
 
     pub(crate) fn livetv_available(&self) -> bool {
-        !self.livetv_view().channels.is_empty()
+        self.retained.screen_inputs.backends.feed && !self.livetv_view().channels.is_empty()
     }
 
     /// Capture time and clients at the boundary, then drain every request this step emits.
     pub(crate) fn livetv_pump(&mut self) -> bool {
+        if !self.retained.screen_inputs.backends.feed { return false; }
         super::adapters::stores::refill_client_keys(&mut self.retained.client_keys);
         let now = super::clock::unix_ms().unwrap_or(0) / 1_000;
         let changed = self.stores.livetv_pump(&self.retained.client_keys, now);
@@ -2172,6 +2174,7 @@ impl Bridge<'_> {
     }
 
     pub(crate) fn livetv_run(&mut self, cmd: plx_data::livetv::LiveTvCmd) -> bool {
+        if !self.retained.screen_inputs.backends.feed { return false; }
         super::adapters::stores::refill_client_keys(&mut self.retained.client_keys);
         let now = super::clock::unix_ms().unwrap_or(0) / 1_000;
         let changed = self.stores.livetv_run(cmd, &self.retained.client_keys, now);

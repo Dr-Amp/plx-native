@@ -1043,7 +1043,7 @@ mod backend_offer_session_tests {
         let request = PlaybackRequest {
             sid: ServerId::UNSET, rk: "42".into(), part: "/library/parts/7".into(),
             vcodec: "h264".into(), acodec: "ac3".into(), title: "Film".into(),
-            ctx: String::new(), preview: false, version: None, show_rk: String::new(),
+            ctx: String::new(), preview: false, live: None, version: None, show_rk: String::new(),
         };
         // The session the bug needs: a playing URI attempt, a held request, a bound source selection and a playing
         // item that lists the picked streams, so that without the gate every pick below re-plans (retiring the
@@ -1145,7 +1145,7 @@ mod backend_offer_session_tests {
         session.install_uri_preflight_port(ResolvePort::new(evidence, std::sync::Arc::new(DefaultStreamOnly)));
         session.request = Some(PlaybackRequest { sid: ServerId::UNSET, rk: "42".into(),
             part: "/library/parts/7".into(), vcodec: "h264".into(), acodec: "aac".into(),
-            title: "Film".into(), ctx: String::new(), preview: false, version: None,
+            title: "Film".into(), ctx: String::new(), preview: false, live: None, version: None,
             show_rk: String::new() });
         let mut policy = super::super::backend_policy::BackendPolicy::for_request(false);
         policy.qualify(BackendKind::Uri, OfferId::URI_ORIGINAL, Qualification::Qualified);
@@ -7470,6 +7470,7 @@ pub fn seed_request_for_test(ps: &mut PlaybackSession, rk: &str) {
         title: String::new(),
         ctx: String::new(),
         preview: false,
+        live: None,
         version: None,
         show_rk: String::new(),
     });
@@ -10954,6 +10955,7 @@ pub fn request_live(
     channel: &str,
     title: &str,
 ) -> bool {
+    if !ps.backends().feed { return false; }
     request_play_inner(
         ps,
         meta,
