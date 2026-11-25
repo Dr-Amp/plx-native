@@ -829,7 +829,7 @@ impl BridgeRetained {
             hubs: self.hubs.view(), listing: self.listing.view(), directory: self.directory.view(),
             section_hubs: self.section_hubs.view(), search: self.search.view(),
             metadata: stores.metadata_view(), person: stores.person_view(), collection: stores.collection_view(),
-            subtitle_search: stores.subtitle_search_view(), session: &self.playback,
+            subtitle_search: stores.subtitle_search_view(), livetv: stores.livetv_view(), session: &self.playback,
             transport_paused: self.transport_paused, today: self.today, beneath: None }
     }
 

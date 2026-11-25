@@ -32,12 +32,11 @@ impl Tap<AppHost> for Observed {
 fn step(app: &mut App, now: &mut u32, inputs: Vec<InputEvent<u32>>) -> Observed {
     *now += 16;
     let mut observed = Observed::default();
-    super::frame_with_tap(&mut app.pages, &mut app.bridge,
-        Tick { ms: *now, dt_us: 16_000 }, inputs, &mut observed);
-    let mut frame = Frame::begin(&app.player.session, app.bridge.metadata_view());
+    super::app_frame_with_tap(app, Tick { ms: *now, dt_us: 16_000 }, inputs, &mut observed);
+    let mut frame = Frame::begin(&app.player.session, app.runtime.metadata_view());
     frame.now = *now;
     crate::app::content::content_requests(app, &mut frame);
-    app.bridge.assert_no_store_jobs_left_for_test();
+    app.runtime.bridge(&mut app.bridge).assert_no_store_jobs_left_for_test();
     observed
 }
 
@@ -50,7 +49,7 @@ fn mounted(app: &App) -> MachineId {
 }
 
 fn open_live(app: &mut App, now: &mut u32) {
-    app.bridge.stores.livetv.install_for_test(vec![channel("101", "Family Channel"), channel("102", "Cartoons")]);
+    app.runtime.bridge(&mut app.bridge).stores.livetv.install_for_test(vec![channel("101", "Family Channel"), channel("102", "Cartoons")]);
     super::nav_root(&mut app.pages, AppArg::LiveTv);
     settle(app, now);
     assert!(app.route() == AppArg::LiveTv);
@@ -65,16 +64,17 @@ fn activate(app: &mut App, now: &mut u32, key: u32) {
 fn player_request(app: &mut App, now: u32, req: plx_screens::registry::PlayerReq) {
     crate::app::playback::player_requests(
         &mut app.player, &mut app.adapters.player, &mut app.repause_at, vec![req], now,
-        &mut app.refresh_hubs, &mut app.pages, &mut app.bridge, &mut app.ok_armed, &mut app.input.press,
+        &mut app.refresh_hubs, &mut app.pages, &mut app.runtime.bridge(&mut app.bridge),
     );
 }
 
 fn start_channel(app: &mut App, now: &mut u32) {
-    let ch = &app.bridge.livetv_view().channels[0];
+    let mut bridge = app.runtime.bridge(&mut app.bridge);
+    let ch = &bridge.livetv_view().channels[0];
     let intent = PlayIntent::Live { sid: ch.sid, dvr: ch.dvr.clone(), channel: ch.channel.clone(), title: ch.name.clone() };
-    assert!(crate::app::content::request_play_intent(&mut app.player.session, app.bridge.metadata_mut(), &intent));
+    assert!(crate::app::content::request_play_intent(&mut app.player.session, bridge.metadata_mut(), &intent));
     assert!(crate::app::playback::start_playback(&mut app.player.session, &mut app.adapters.player,
-        0, crate::app::playback::Origin::Here, 4_500, None, &mut app.pages, &mut app.bridge));
+        0, crate::app::playback::Origin::Here, 4_500, None, &mut app.pages, &mut bridge));
     settle(app, now);
     assert!(app.route() == AppArg::Player);
 }
@@ -90,7 +90,7 @@ fn channel_requests_wrap_the_lineup_and_keep_the_original_return_entry() {
     // An equal DVR/channel on a different server cannot steal the current channel's identity.
     let mut other = channel("101", "Other server");
     other.sid = plx_plex::plex::ServerId::from_raw(1);
-    app.bridge.stores.livetv.install_for_test(vec![channel("101", "Family Channel"), channel("102", "Cartoons"), other]);
+    app.runtime.bridge(&mut app.bridge).stores.livetv.install_for_test(vec![channel("101", "Family Channel"), channel("102", "Cartoons"), other]);
     let origin_entry = app.pages.nav.top_page().unwrap().id;
     start_channel(&mut app, &mut now);
     let player_entry = app.pages.nav.top_page().unwrap().id;
@@ -126,7 +126,7 @@ fn channel_request_on_nonlive_and_an_empty_or_single_lineup_keeps_the_session() 
     assert!(!plx_media::route::is_live(&app.player.session));
     start_channel(&mut app, &mut now);
     for channels in [vec![channel("101", "Family Channel")], Vec::new()] {
-        app.bridge.stores.livetv.install_for_test(channels);
+        app.runtime.bridge(&mut app.bridge).stores.livetv.install_for_test(channels);
         player_request(&mut app, now, plx_screens::registry::PlayerReq::Channel(1));
         assert_eq!(plx_media::route::live_request(&app.player.session).unwrap().1.channel, "C101.242.ersatztv.org");
     }
@@ -247,8 +247,9 @@ fn home_only_requests_from_live_tv_are_discarded() {
     let mut app = app();
     let mut now = 0;
     open_live(&mut app, &mut now);
-    app.bridge.stores.hubs.seed_for_test(1, plx_data::pms::HubState::Ready);
-    let snapshot = app.bridge.hubs_snapshot();
+    let bridge = app.runtime.bridge(&mut app.bridge);
+    bridge.stores.hubs.seed_for_test(1, plx_data::pms::HubState::Ready);
+    let snapshot = bridge.stores.hubs.snapshot();
     let item = snapshot.view().hub(0).expect("a seeded Home hub").items[0].clone();
     let source = mounted(&app);
     for request in [HomeReq::FoldToHero,
@@ -271,12 +272,12 @@ fn home_only_requests_from_live_tv_are_discarded() {
 fn a_library_pill_reopens_a_remembered_library_page_over_its_grid() {
     use plx_plex::plex::session::LibraryPage;
     let mut world = super::test_support::World::movies_library("livetv-remembered-library-page", false);
-    let key = world.bridge.directory.view().sections()[0].key;
-    world.bridge.remember_library_page("route-own", key, LibraryPage::Recommended);
+    let key = world.bridge.bridge().retained.directory.view().sections()[0].key;
+    world.bridge.bridge().remember_library_page("route-own", key, LibraryPage::Recommended);
     let mut app = app();
     app.pages = std::mem::take(&mut world.d);
-    std::mem::swap(&mut app.bridge, &mut world.bridge);
     let mut now = world.frame * 16;
+    world.bridge.swap_parts(&mut app.runtime, &mut app.bridge);
     open_live(&mut app, &mut now);
     activate(&mut app, &mut now, plx_ui::widgets::TAB_KEY_MOVIES);
     let want = AppArg::LibraryRecommended { section: u32::try_from(key).unwrap() };
@@ -298,16 +299,20 @@ fn the_live_tv_tab_tracks_the_store_and_an_open_empty_page_stays_open() {
     plx_plex::plex::reset_servers_for_test();
     let mut app = app();
     let mut now = 0;
-    assert!(!app.bridge.search_tab_available(HomeTab::LiveTv));
+    assert!(!app.runtime.bridge(&mut app.bridge).search_tab_available(HomeTab::LiveTv));
     open_live(&mut app, &mut now);
-    assert!(app.bridge.search_tab_available(HomeTab::LiveTv));
+    assert!(app.runtime.bridge(&mut app.bridge).search_tab_available(HomeTab::LiveTv));
     let instance = mounted(&app);
-    app.bridge.stores.livetv.install_for_test(Vec::new());
+    app.runtime.bridge(&mut app.bridge).stores.livetv.install_for_test(Vec::new());
     settle(&mut app, &mut now);
-    assert!(!app.bridge.search_tab_available(HomeTab::LiveTv));
-    assert_eq!(app.bridge.livetv_view().status, LiveTvStatus::Empty);
+    {
+        let bridge = app.runtime.bridge(&mut app.bridge);
+        assert!(!bridge.search_tab_available(HomeTab::LiveTv));
+        assert_eq!(bridge.livetv_view().status, LiveTvStatus::Empty);
+    }
     assert!(app.route() == AppArg::LiveTv);
     assert_eq!(mounted(&app), instance, "withdrawing the tab does not evict its open page");
-    app.bridge.livetv_run(plx_data::livetv::LiveTvCmd::Reset);
-    assert!(!app.bridge.search_tab_available(HomeTab::LiveTv));
+    let mut bridge = app.runtime.bridge(&mut app.bridge);
+    bridge.livetv_run(plx_data::livetv::LiveTvCmd::Reset);
+    assert!(!bridge.search_tab_available(HomeTab::LiveTv));
 }
