@@ -3583,9 +3583,9 @@ impl From<plx_playback_contract::adaptive::PhysicalFailure> for HlsExit {
 /// retry). A plain failure ends the segment the way any unexplained transport failure does.
 const UNLATCHED_STOP: HlsExit = HlsExit::Failed("HLS acquisition stopped without a latched reason");
 
-/// Lookahead of N+1 must not tear down a session that already fed N. Only teardown is fatal.
+/// Carry teardown and a terminal live stall out of lookahead. Ordinary misses can retry on demand.
 pub fn hls_prefetch_is_fatal(err: &HlsExit) -> bool {
-    matches!(err, HlsExit::Aborted)
+    matches!(err, HlsExit::Aborted | HlsExit::Failed(HLS_LIVE_STALLED))
 }
 
 pub fn classify_plaintext_open_failure(error: plx_net::stream::HttpOpenError) -> HlsExit {

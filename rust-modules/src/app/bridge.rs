@@ -3373,7 +3373,7 @@ impl Rig<AppHost> for Bridge<'_> {
         plx_ui::screen::NavPresentation::from_transition(
             nav.tabs.stack.page_alpha(), nav.tabs.stack.chrome_alpha(),
             nav.tabs.stack.pending_dest()
-                .and_then(|arg| pill_of_arg(arg, self.retained.directory.view()))
+                .and_then(|arg| pill_of_arg(arg, self.retained.directory.view(), self.livetv_available()))
                 .map(|tab| tab as u32),
             self.retained.blur_dissolve,
         )

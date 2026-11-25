@@ -318,6 +318,13 @@ fn a_live_playlist_that_stops_advancing_fails_the_read_instead_of_polling_foreve
         - live_stall_limit(cursor.target_duration_secs) - std::time::Duration::from_secs(1));
     let read = hls_cursor_next(&mut cursor, &mut *aq, &mut net, None);
     assert!(matches!(read, Err(HlsExit::Failed(HLS_LIVE_STALLED))), "{read:?}");
+    let timeline = crate::hls::SegmentTimeline::default();
+    let n_clock = timeline.begin(std::time::Duration::from_secs(2)).unwrap();
+    let lookahead = unsafe { hls_prefetch_same_encoder(
+        &mut cursor, &mut *aq, &mut net, "aac", timeline, n_clock, None,
+    ) };
+    assert!(matches!(lookahead, Err(HlsExit::Failed(HLS_LIVE_STALLED))),
+        "fixed HLS lookahead must pass the terminal stall to recovery");
     crate::aq::aq_destroy(&mut *aq);
 }
 
