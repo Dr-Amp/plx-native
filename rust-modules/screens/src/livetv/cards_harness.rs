@@ -28,6 +28,23 @@ struct Harness {
     n: usize,
 }
 pub(crate) fn mount(n: usize) -> Box<dyn CardHarness> { Box::new(Harness::new(n)) }
+
+pub(crate) fn livetv_conforms() -> plx_ui::a11y::Namespaces {
+    use plx_ui::a11y::{conform, A11yPath};
+    let _guard = plx_base::testlock::serial();
+    let h = Harness::new(3);
+    let cx = h.cx();
+    let namespace = conform::<LiveHost, _>(&h.screen, &cx);
+    for section in ["channels", "on_now"] {
+        let path = A11yPath::new().name(section).name("card").index(0);
+        let elem = h.screen.a11y_find(&path, &cx).expect("the first card in each shelf");
+        let card = h.screen.a11y(&elem, &cx).expect("the card projects accessibility attributes");
+        let subject = format!("{}:livetv:1:c0", plx_plex::plex::ServerId::UNSET.raw());
+        assert_eq!(card.subject.as_deref(), Some(subject.as_str()));
+    }
+    vec![namespace]
+}
+
 impl Harness {
     fn new(n: usize) -> Self {
         let mut store = plx_data::stores::livetv::LiveTvStore::default();
@@ -43,6 +60,7 @@ impl Harness {
     fn cx(&self) -> Cx<'_, LiveHost> {
         Cx { views: self.store.view(), tick: Tick { ms: self.ms, dt_us: 16_667 }, measure: &FixtureMeasure,
             press: PressRead { scale: self.press, owner: self.focus, ..Default::default() },
+            modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
             focus: FocusRead { current: self.focus, ..Default::default() }, owner: InputOwner::Entry(ENTRY) }
     }
     fn key(&self, elem: u32) -> FocusKey<u32> { FocusKey { entry: ENTRY, elem } }
@@ -52,6 +70,7 @@ impl Harness {
         let (_, moving) = plx_machine::motion::report::scoped_motion(|| {
             let cx = Cx { views: self.store.view(), tick: Tick { ms: self.ms, dt_us: 16_667 }, measure: &FixtureMeasure,
                 press: PressRead { scale: self.press, owner: self.focus, ..Default::default() },
+                modal: Default::default(), page_image: Default::default(), hold_hint: Default::default(),
                 focus: FocusRead { current: self.focus, ..Default::default() }, owner: InputOwner::Entry(ENTRY) };
             let mut fx = Effects::new(&mut out, plx_machine::machine::MachineId::Instance(plx_machine::machine::InstanceId(9)), &mut present);
             Machine::<LiveHost>::step(&mut self.screen, &ev, &cx, &mut fx);

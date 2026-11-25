@@ -125,6 +125,12 @@ impl<H: LiveTvLike> CardSource<H> for Cards<'_> {
         captions::label(&captions::live_tv_policy(), &facts,
             Some(plx_os::i18n::msg::browse_livetv_channel(&channel.name, &channel.vcn)))
     }
+
+    fn subject(&self, i: usize) -> Option<std::borrow::Cow<'_, str>> {
+        let tile = self.view.tiles.get(self.channel_index(i)?)?;
+        // Two servers may advertise the same DVR and channel. A press names the exact source.
+        Some(format!("{}:{}", tile.sid.raw(), tile.rk).into())
+    }
 }
 
 impl<H: LiveTvLike> StackPage<H> for Page {
@@ -133,10 +139,11 @@ impl<H: LiveTvLike> StackPage<H> for Page {
     fn revision(&self, cx: &Cx<'_, H>) -> u64 { u64::from(H::livetv(cx).revision()) }
     fn sections(&self, cx: &Cx<'_, H>, out: &mut Vec<SectionSpec<Sec>>) {
         out.push(SectionSpec::new(Sec::Head, Kind::Custom { height: HEAD_H, focusable: false }, HEAD_GROUP));
-        out.push(SectionSpec::new(Sec::Channels, Kind::Shelf { style: &STYLE, heading: SHELF_HEADING }, CHANNELS_GROUP).seated(plx_ui::page_regions::CONTENT_HEAD_SEAT));
-        out.push(SectionSpec::new(Sec::Now, Kind::Shelf { style: &STYLE, heading: SHELF_HEADING }, NOW_GROUP));
+        out.push(SectionSpec::new(Sec::Channels, Kind::Shelf { style: &STYLE, heading: SHELF_HEADING }, CHANNELS_GROUP)
+            .seated(plx_ui::page_regions::CONTENT_HEAD_SEAT).named("channels"));
+        out.push(SectionSpec::new(Sec::Now, Kind::Shelf { style: &STYLE, heading: SHELF_HEADING }, NOW_GROUP).named("on_now"));
         let retry = (self.status == LiveTvStatus::Failed).then(|| self.status_overlay(cx.tick.ms).action_frame_measured(cx.measure)).flatten();
-        out.push(SectionSpec::new(Sec::Status, Kind::Overlay { rect: retry.unwrap_or(STATUS_FRAME), focusable: retry.is_some() }, STATUS_GROUP));
+        out.push(SectionSpec::new(Sec::Status, Kind::Overlay { rect: retry.unwrap_or(STATUS_FRAME), focusable: retry.is_some() }, STATUS_GROUP).named("status"));
     }
     fn shelf_foot(&self, _cx: &Cx<'_, H>, k: Sec) -> f32 { if k == Sec::Channels && !self.airings.is_empty() { UNDER_LABEL_AIR } else { 0.0 } }
     fn fallback(&self, _cx: &Cx<'_, H>, out: &mut Vec<Sec>) { out.extend([Sec::Channels, Sec::Now, Sec::Status, Sec::Head]); }
@@ -149,6 +156,7 @@ impl<H: LiveTvLike> StackPage<H> for Page {
         matches!(k, Sec::Channels | Sec::Now).then(captions::live_tv_policy)
     }
     fn elem_of(&self, k: Sec) -> Option<u32> { (k == Sec::Status).then_some(RETRY_ELEM) }
+    fn plain_name(&self, k: Sec, i: usize) -> Option<&'static str> { (k == Sec::Status && i == 0).then_some("retry") }
     fn plain_group(&self, _cx: &Cx<'_, H>, _k: Sec, id: GroupId, extent: Rect) -> GroupSpec {
         GroupSpec { id, kind: GroupKind::Free, seat: Seat::First, reachable: AxisMask::VERTICAL,
             edge: [EdgeRule::Geometric, EdgeRule::Geometric, EdgeRule::Stop, EdgeRule::Stop], extent, len: 1, elem: ElemKind::Bare }
@@ -445,6 +453,9 @@ impl<H: LiveTvLike> Screen<H> for LiveTvScreen {
         self.stack.view(&self.page).opener_departing::<H>(key)
     }
     fn name(&self) -> &'static str {
+        Self::WORD
+    }
+    fn a11y_ns(&self) -> &'static str {
         Self::WORD
     }
     fn chrome_tuck(&self) -> f32 {

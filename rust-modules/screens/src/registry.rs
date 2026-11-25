@@ -3035,7 +3035,7 @@ pub const SCREEN_SHAPES: &[&str] = &[
 // through its closing morph. Previous pin: 0x7e36_4373_746a_c3dc.
 // Filmography's add-only menu adds WatchlistAdd{hex} to ARG_SHAPE (canonical kind tag 5).
 // Live TV adds its route and a screen shape for the store status, shelves and current airings.
-const SCREEN_SHAPES_PIN: u64 = 0x7ea5_4cf0_ce26_fa06;
+const SCREEN_SHAPES_PIN: u64 = 0x17bd_9205_2e59_cd6e;
 
 #[cfg(test)]
 mod arg_tests {
@@ -3426,6 +3426,7 @@ mod a11y_coverage_tests {
             AppArg::LibraryRecommended { .. } => Covered("LibraryRecommended", crate::library::cards_harness::recommended_conforms),
             AppArg::Search => Covered("Search", crate::search::cards_harness::search_conforms),
             AppArg::Watchlist => Covered("Watchlist", crate::watchlist::page_tests::watchlist_conforms),
+            AppArg::LiveTv => Covered("LiveTv", crate::livetv::cards_harness::livetv_conforms),
             AppArg::Player => Covered("Player", crate::player::step_ladder_tests::player_conforms),
             AppArg::Content(content) => match content {
                 ContentArg::Detail { .. } => Covered("Content::Detail", crate::detail::tests::detail_conforms),
@@ -3466,10 +3467,10 @@ mod a11y_coverage_tests {
         }
     }
 
-    /// How many leaf arms the table has: 21 flat `AppArg` arms, 5 `ContentArg`, 22 `SettingsPage` and
+    /// How many leaf arms the table has: 22 flat `AppArg` arms, 5 `ContentArg`, 22 `SettingsPage` and
     /// `FirstRunConsent`. A new arm fails [`coverage`] to compile, and then this to pass until the census
     /// below holds it too.
-    const ARMS: usize = 49;
+    const ARMS: usize = 50;
 
     /// **A value of every leaf arm** the table names: the registry's own page and surface censuses, plus
     /// the arms those leave out (Filmography and every Settings page).

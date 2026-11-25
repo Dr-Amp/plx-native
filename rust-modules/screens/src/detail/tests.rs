@@ -5901,6 +5901,7 @@ fn a_hero_controls_subject_is_the_rating_key_its_activation_acts_on() {
     let played = match play_item(&effects) {
         Some((PlayIntent::Item { rk, .. }, _)) => rk.clone(),
         Some((PlayIntent::Movie { item, .. }, _)) => item.rk.clone(),
+        Some((PlayIntent::Live { .. }, _)) => panic!("Detail cannot tune a channel"),
         None => panic!("Play pushes a play request"),
     };
     assert_eq!(subject(&screen, "hero.play").as_deref(), Some(played.as_str()));
@@ -5924,6 +5925,7 @@ fn a_hero_controls_subject_is_the_rating_key_its_activation_acts_on() {
     let played = match play_item(&effects) {
         Some((PlayIntent::Movie { item, .. }, _)) => item.rk.clone(),
         Some((PlayIntent::Item { rk, .. }, _)) => rk.clone(),
+        Some((PlayIntent::Live { .. }, _)) => panic!("Detail cannot tune a channel"),
         None => panic!("Play pushes a play request"),
     };
     assert_eq!(played, "card");
